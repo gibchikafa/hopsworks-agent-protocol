@@ -50,6 +50,20 @@ The SDK is precisely the thing that decouples them: any framework in, one wire p
 
 `@app.chat` (returns a `ChatResponse`/str) and `@app.stream` (async generator of text deltas, optional final `ChatResponse` for citations/usage/media). Registering `@stream` flips the manifest's `streaming` capability automatically. Each endpoint degrades gracefully to the other handler: `/v1/chat` collects a stream into one response; `/v1/chat/stream` emits a single `message.completed` when only `@chat` exists. Authors implement whichever fits; both endpoints always work.
 
+### 3a. Optional handler context
+
+Handlers may declare a second parameter (`def chat(request, ctx)`); the SDK inspects the signature and injects a `HandlerContext` only when present, so the one-arg form keeps working. The context bundles per-turn conveniences (`conversation_id`, `history` from memory, `memory`, `logger`, `deployment_id`, `framework`, correlation ids) and `emit_event`. This adds ergonomics without a new wire protocol — the context is a server-side object, not part of the contract.
+
+`ctx.emit_event(name, status, message, data)` surfaces intermediate progress (retrieval, tool calls, code runs). While streaming it is interleaved as a `tool_event` SSE frame via a queue the streaming route drains alongside the handler's own yields (the handler runs as a task so `await ctx.emit_event(...)` and `yield delta` compose); otherwise it buffers into the response metadata. Gated by `AgentApp(tool_events=True)` so existing manifests are unchanged; panel-side rendering is separate frontend work.
+
+### 3b. Operational surface
+
+`/health` stays a bare liveness probe. `/ready` reports operational readiness — a handler is registered and the configured memory backend is reachable (`ChatMemory.healthcheck()`) — returning `503` with per-check detail otherwise, so "running but not chat-ready" is distinguishable. When memory is configured, `GET /v1/conversations/{id}/messages` and `DELETE /v1/conversations/{id}` let clients inspect the history the agent sees and drop server-side memory (the review noted that "new session" otherwise left SQL memory behind). Both are registered only when memory exists and advertised via `capabilities.conversation_management`.
+
+### 3c. Correlation, not evaluation
+
+The SDK guarantees stable `response_id` / `message_id` (generated up front so `ctx.response_id` matches the response the client receives) and, when tracing is active, stamps `conversation_id` / `response_id` / `message_id` / `deployment_id` / framework on the current span and surfaces `trace_id` in the response metadata. This makes it *possible* for a separate evaluation system to join chat turns, feedback, and traces — but feedback/ratings/scores are deliberately **not** in the SDK (see non-goals). The SDK's job ends at emitting correlatable ids.
+
 ### 4. Conversation memory is opt-in, keyed by `conversation_id`
 
 The protocol makes history server-side (clients send only the new message + a `conversation_id`), so the SDK can own storage. `ChatMemory` has two backends: `InMemoryChatMemory` (dev — documented as unfit for production since deployments scale to zero and replicas don't share it) and `SqlChatMemory` (any SQLAlchemy URL; zero-config inside a deployment, resolving the project MySQL from injected `MYSQL_*` env vars + the password secret, table name from `DEPLOYMENT_ID`).
@@ -78,13 +92,15 @@ Optional dependencies (OTel SDK, instrumentation packages, SQLAlchemy) are impor
 ## Non-goals (deliberate)
 
 - **No per-framework wire protocols.** The framework is an implementation detail the client must not see (§2).
+- **No feedback/ratings in the SDK.** Thumbs, scores, labels, eval runs, and their storage belong to the Agent Evaluation system, not the serving SDK. The SDK's contribution is reliable correlation ids (§3c); a chat client submits feedback to the evaluation API keyed by `conversation_id` / `response_id` / `trace_id`. Adding a `/v1/feedback` here would couple serving to evaluation and duplicate storage.
 - **No live/bidirectional voice.** Audio *attachments* fit as content parts; real-time spoken conversation is a different transport (WebSocket/WebRTC) and would be a separate capability, not bolted onto request/response.
-- **No large-artifact storage in v1.** Binary content is inline base64 with a size cap; a `file_id` upload/download endpoint pair is reserved for when agents need to exchange artifacts larger than chat scale.
+- **No large-artifact storage yet.** Binary content is inline base64 with a size cap; a `file_id` upload/download endpoint pair (§roadmap) is reserved for when agents need to exchange artifacts larger than chat scale.
 - **The SDK does not own the client.** It emits a protocol; the chat panel (and any other consumer) is independent.
 
-## Open items / future work
+## Roadmap
 
-- Publish to internal PyPI or bake into the agent base image.
-- Tool-event streaming (`capabilities.tool_events`) — surface intermediate tool calls in the panel as they happen.
-- File upload/download endpoints for large artifacts.
-- A cookbook of framework recipes (LangGraph checkpointer + `conversation_id`, LlamaIndex chat engine, plain-Anthropic streaming) so authors copy the right integration for their framework.
+- **Publish** to internal PyPI or bake into the agent base image so `from hopsworks_agent_protocol import AgentApp` works without a git dependency.
+- **File upload/download** (`POST /v1/files`, `GET /v1/files/{id}`) — the upgrade path from inline base64 for large generated artifacts (reports, PDFs, audio). Needs a storage abstraction (HopsFS/dataset path or object store) and a manifest capability. Deferred as the largest of the reviewed suggestions.
+- **Panel-side tool-event rendering** — the SDK already emits `tool_event` frames; the chat panel needs to render retrieval/tool/code progress rows.
+- **Framework recipe cookbook** — LangGraph checkpointer + `conversation_id`, LlamaIndex chat engine, plain-Anthropic streaming — so authors copy the right integration for their framework.
+- **Richer trace correlation** — a typed `trace_id`/`span_id` field on `ChatResponse` rather than only `metadata`, once the evaluation join is designed.

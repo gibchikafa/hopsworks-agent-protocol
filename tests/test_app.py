@@ -51,7 +51,7 @@ class TestManifestAndHealth:
         client = TestClient(build_basic_app())
         manifest = client.get("/.well-known/hopsworks-agent.json").json()
         assert manifest["protocol"] == "hopsworks-agent"
-        assert manifest["protocol_version"] == "1.1"
+        assert manifest["protocol_version"] == "1.2"
         assert manifest["agent"]["name"] == "Test agent"
         assert manifest["endpoints"] == {"chat": "/v1/chat"}
         assert manifest["capabilities"]["streaming"] is False
@@ -427,3 +427,180 @@ class TestSqlMemoryResilience:
         monkeypatch.delenv("MYSQL_USER", raising=False)
         memory = SqlChatMemory()
         assert memory.get("c1") == []
+
+
+class TestContextObject:
+    def test_two_param_handler_receives_context(self):
+        from hopsworks_agent_protocol import AgentApp, InMemoryChatMemory
+
+        app = AgentApp(memory=InMemoryChatMemory())
+        seen = {}
+
+        @app.chat
+        async def chat(request, ctx):
+            seen["cid"] = ctx.conversation_id
+            seen["history_len"] = len(ctx.history)
+            seen["framework"] = ctx.framework
+            seen["response_id"] = ctx.response_id
+            return f"turn {len(ctx.history)}"
+
+        client = TestClient(app)
+        first = client.post("/v1/chat", json=make_request("hi")).json()
+        assert seen["cid"] == first["conversation_id"]
+        assert seen["history_len"] == 0
+        assert seen["framework"] == "custom"
+        # ctx.response_id matches the id on the response the client received
+        assert first["id"] == seen["response_id"]
+        # second turn sees prior history via ctx.history
+        client.post("/v1/chat", json=make_request("again", first["conversation_id"]))
+        assert seen["history_len"] == 2
+
+    def test_one_param_handler_still_works(self):
+        from hopsworks_agent_protocol import AgentApp
+
+        app = AgentApp()
+
+        @app.chat
+        async def chat(request):
+            return "ok"
+
+        assert (
+            TestClient(app)
+            .post("/v1/chat", json=make_request("x"))
+            .json()["message"]["content"][0]["text"]
+            == "ok"
+        )
+
+
+class TestReadiness:
+    def test_ready_ok(self):
+        app = build_basic_app()
+        result = TestClient(app).get("/ready")
+        assert result.status_code == 200
+        assert result.json()["status"] == "ready"
+
+    def test_not_ready_without_handler(self):
+        from hopsworks_agent_protocol import AgentApp
+
+        result = TestClient(AgentApp()).get("/ready")
+        assert result.status_code == 503
+        assert result.json()["checks"]["handler"] is False
+
+    def test_not_ready_when_memory_unreachable(self):
+        from hopsworks_agent_protocol import AgentApp, SqlChatMemory
+
+        app = AgentApp(memory=SqlChatMemory(url="mysql+pymysql://x:y@127.0.0.1:1/no"))
+
+        @app.chat
+        async def chat(request):
+            return "ok"
+
+        result = TestClient(app).get("/ready")
+        assert result.status_code == 503
+        assert result.json()["checks"]["memory"] is False
+
+
+class TestConversationEndpoints:
+    def test_history_and_clear(self):
+        from hopsworks_agent_protocol import AgentApp, InMemoryChatMemory
+
+        app = AgentApp(memory=InMemoryChatMemory())
+
+        @app.chat
+        async def chat(request):
+            return "reply"
+
+        client = TestClient(app)
+        cid = client.post("/v1/chat", json=make_request("hello")).json()[
+            "conversation_id"
+        ]
+        messages = client.get(f"/v1/conversations/{cid}/messages").json()["messages"]
+        assert messages == [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "reply"},
+        ]
+        assert client.delete(f"/v1/conversations/{cid}").status_code == 204
+        assert client.get(f"/v1/conversations/{cid}/messages").json()["messages"] == []
+
+    def test_endpoints_absent_without_memory(self):
+        from hopsworks_agent_protocol import AgentApp
+
+        app = AgentApp()
+
+        @app.chat
+        async def chat(request):
+            return "ok"
+
+        client = TestClient(app)
+        assert client.get("/v1/conversations/x/messages").status_code == 404
+        manifest = client.get("/.well-known/hopsworks-agent.json").json()
+        assert manifest["capabilities"]["conversation_management"] is False
+        assert "conversations" not in manifest["endpoints"]
+
+    def test_manifest_advertises_conversations_with_memory(self):
+        from hopsworks_agent_protocol import AgentApp, InMemoryChatMemory
+
+        app = AgentApp(memory=InMemoryChatMemory())
+
+        @app.chat
+        async def chat(request):
+            return "ok"
+
+        manifest = TestClient(app).get("/.well-known/hopsworks-agent.json").json()
+        assert manifest["capabilities"]["conversation_management"] is True
+        assert manifest["endpoints"]["conversations"] == "/v1/conversations"
+
+
+class TestToolEvents:
+    def test_tool_events_capability_flag(self):
+        from hopsworks_agent_protocol import AgentApp
+
+        off = TestClient(AgentApp()).get("/.well-known/hopsworks-agent.json").json()
+        assert off["capabilities"]["tool_events"] is False
+        on = (
+            TestClient(AgentApp(tool_events=True))
+            .get("/.well-known/hopsworks-agent.json")
+            .json()
+        )
+        assert on["capabilities"]["tool_events"] is True
+
+    def test_emit_event_interleaves_in_stream(self):
+        from hopsworks_agent_protocol import AgentApp
+
+        app = AgentApp(tool_events=True)
+
+        @app.stream
+        async def stream(request, ctx):
+            await ctx.emit_event("retrieve", status="running", message="searching")
+            yield "answer "
+            await ctx.emit_event("retrieve", status="done")
+            yield "text"
+
+        events = parse_sse(
+            TestClient(app).post("/v1/chat/stream", json=make_request("q")).text
+        )
+        kinds = [e[0] for e in events]
+        assert "tool_event" in kinds
+        assert kinds[0] == "tool_event"
+        assert events[0][1] == {
+            "name": "retrieve",
+            "status": "running",
+            "message": "searching",
+        }
+        assert kinds[-1] == "message.completed"
+        assert events[-1][1]["message"]["content"][0]["text"] == "answer text"
+
+    def test_emit_event_buffered_in_non_streaming(self):
+        from hopsworks_agent_protocol import AgentApp
+
+        app = AgentApp()
+
+        @app.chat
+        async def chat(request, ctx):
+            await ctx.emit_event("tool", status="done")
+            return "ok"
+
+        response = TestClient(app).post("/v1/chat", json=make_request("x")).json()
+        assert response["metadata"]["tool_events"] == [
+            {"name": "tool", "status": "done"}
+        ]

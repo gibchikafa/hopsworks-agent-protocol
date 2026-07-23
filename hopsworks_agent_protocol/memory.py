@@ -90,6 +90,11 @@ class ChatMemory(ABC):
     def clear(self, conversation_id: str) -> None:
         """Drop a conversation."""
 
+    def healthcheck(self) -> bool:
+        """Whether the store is currently usable. Used by the readiness probe;
+        default assumes always ready."""
+        return True
+
 
 class InMemoryChatMemory(ChatMemory):
     """Process-local store for development: lost on restart (agent
@@ -268,3 +273,7 @@ class SqlChatMemory(ChatMemory):
                 log.exception("SqlChatMemory clear failed")
         with self._lock:
             self._cache.pop(conversation_id, None)
+
+    def healthcheck(self) -> bool:
+        # ready once the engine + table are established (lazily) and reachable
+        return self._ensure_engine()

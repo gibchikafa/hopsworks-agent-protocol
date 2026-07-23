@@ -1,4 +1,5 @@
 from .app import AgentApp
+from .context import HandlerContext
 from .memory import (
     ChatMemory,
     InMemoryChatMemory,
@@ -27,6 +28,7 @@ __all__ = [
     "ChatRequest",
     "ChatResponse",
     "FileContent",
+    "HandlerContext",
     "ImageContent",
     "InMemoryChatMemory",
     "SqlChatMemory",

@@ -13,7 +13,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, Field
 
 PROTOCOL = "hopsworks-agent"
-PROTOCOL_VERSION = "1.1"
+PROTOCOL_VERSION = "1.2"
 
 
 def new_conversation_id() -> str:

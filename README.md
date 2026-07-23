@@ -139,6 +139,40 @@ async def chat(request):
   LlamaIndex chat store), key it by `conversation_id` and skip `memory=` —
   keep one source of truth for history.
 
+## Handler context (optional)
+
+Declare a second parameter and the SDK passes a `HandlerContext` with per-turn
+conveniences — `def chat(request)` and `def chat(request, ctx)` both work:
+
+```python
+@agent_app.chat
+async def chat(request, ctx):
+    history = ctx.history                       # from configured memory
+    ctx.logger.info("turn for %s", ctx.conversation_id)
+    await ctx.emit_event("retrieve", status="running", message="searching")
+    ...
+```
+
+`ctx` exposes `conversation_id`, `request`, `history`, `memory`, `logger`,
+`deployment_id`, `framework`, `response_id`/`message_id`, and `emit_event`.
+
+## Progress (tool) events
+
+With `AgentApp(tool_events=True)`, `ctx.emit_event(name, status, message, data)`
+surfaces intermediate work. While streaming it is sent immediately as a
+`tool_event` SSE frame interleaved with the reply; otherwise it is buffered into
+the response `metadata`. The manifest advertises `tool_events` so the chat panel
+can render retrieval / tool-call / code-execution progress.
+
+## Operational endpoints
+
+- `GET /health` — liveness (process up).
+- `GET /ready` — readiness: a handler is registered and the memory backend (if
+  configured) is reachable; `503` otherwise, with per-check detail.
+- With memory configured, `GET /v1/conversations/{id}/messages` (inspect the
+  history the agent sees) and `DELETE /v1/conversations/{id}` (what a client's
+  "new session" calls to also drop server-side memory).
+
 ## Extra routes
 
 `AgentApp` is a `FastAPI` — add anything else the usual way:

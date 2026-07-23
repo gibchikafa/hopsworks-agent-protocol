@@ -16,6 +16,7 @@ directly through the Istio ingress.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -25,6 +26,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .context import HandlerContext
 from .models import (
     PROTOCOL,
     PROTOCOL_VERSION,
@@ -32,17 +34,34 @@ from .models import (
     ChatRequest,
     ChatResponse,
     new_conversation_id,
+    new_response_id,
 )
 from .memory import ChatMemory
 from .tracing import resolve_framework, setup_tracing
 
-ChatHandler = Callable[[ChatRequest], Awaitable[ChatResponse | str] | ChatResponse | str]
-StreamHandler = Callable[[ChatRequest], AsyncIterator["str | ChatResponse"]]
+ChatHandler = Callable[..., Awaitable[ChatResponse | str] | ChatResponse | str]
+StreamHandler = Callable[..., AsyncIterator["str | ChatResponse"]]
 
 
 def _sse(event: str, data: Any) -> str:
     payload = data if isinstance(data, str) else json.dumps(data)
     return f"event: {event}\ndata: {payload}\n\n"
+
+
+def _wants_context(handler: Callable[..., Any]) -> bool:
+    """True when the handler declares a second positional parameter (the
+    HandlerContext), so ``def chat(request)`` and ``def chat(request, ctx)``
+    both work."""
+    try:
+        params = [
+            p
+            for p in inspect.signature(handler).parameters.values()
+            if p.kind
+            in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
+        return len(params) >= 2
+    except (ValueError, TypeError):
+        return False
 
 
 class AgentApp(FastAPI):
@@ -59,6 +78,7 @@ class AgentApp(FastAPI):
         framework: str | None = None,
         tracing: bool | None = None,
         memory: ChatMemory | None = None,
+        tool_events: bool = False,
         allow_cors: bool = True,
         **fastapi_kwargs: Any,
     ):
@@ -71,6 +91,9 @@ class AgentApp(FastAPI):
         self._placeholder = placeholder
         self._input_modalities = input_modalities or ["text"]
         self._output_modalities = output_modalities or ["text"]
+        # advertise tool_event SSE frames (emitted via ctx.emit_event); off by
+        # default so existing manifests are unchanged
+        self._tool_events = tool_events
 
         # framework: explicit arg > AGENT_FRAMEWORK env (platform-injected) >
         # 'custom'. Drives which OpenInference instrumentor tracing activates.
@@ -128,6 +151,9 @@ class AgentApp(FastAPI):
         endpoints: dict[str, str] = {"chat": "/v1/chat"}
         if streaming:
             endpoints["stream"] = "/v1/chat/stream"
+        if self.memory is not None:
+            # server-managed history is available: clients can list/clear it
+            endpoints["conversations"] = "/v1/conversations"
         return {
             "protocol": PROTOCOL,
             "protocol_version": PROTOCOL_VERSION,
@@ -141,11 +167,13 @@ class AgentApp(FastAPI):
             "capabilities": {
                 "streaming": streaming,
                 "conversation_history": True,
+                # server-side history is inspectable/clearable via the endpoints
+                "conversation_management": self.memory is not None,
                 "attachments": any(m != "text" for m in self._input_modalities),
                 "input_modalities": self._input_modalities,
                 "output_modalities": self._output_modalities,
                 "citations": False,
-                "tool_events": False,
+                "tool_events": self._tool_events,
             },
             "ui": {
                 "welcome_message": self._welcome_message,
@@ -179,34 +207,50 @@ class AgentApp(FastAPI):
                 "Failed to record conversation turn"
             )
 
-    @staticmethod
-    def _prepare(request: ChatRequest) -> ChatRequest:
+    def _prepare(self, request: ChatRequest) -> HandlerContext:
         # handlers can always rely on conversation_id being present
         if not request.conversation_id:
             request.conversation_id = new_conversation_id()
-        return request
+        if request.message.id is None:
+            from .models import new_message_id
 
-    @staticmethod
-    def _finalize(result: ChatResponse | str, request: ChatRequest) -> ChatResponse:
+            request.message.id = new_message_id()
+        # the response id is generated up front so ctx.response_id matches the
+        # id on the response the client ultimately receives (correlation)
+        return HandlerContext(
+            request=request,
+            memory=self.memory,
+            framework=self.framework,
+            response_id=new_response_id(),
+        )
+
+    def _finalize(
+        self, result: ChatResponse | str, ctx: HandlerContext
+    ) -> ChatResponse:
         from .models import AgentResponse
 
         response = (
             AgentResponse.text(result) if isinstance(result, str) else result
         )
         if not response.conversation_id:
-            response.conversation_id = request.conversation_id or ""
+            response.conversation_id = ctx.conversation_id
+        response.id = ctx.response_id
+        # non-streaming tool events (buffered on the context) ride on metadata
+        if ctx._event_buffer:
+            response.metadata.setdefault("tool_events", ctx._event_buffer)
+        _annotate_span(ctx, response)
         return response
 
     def _merge_stream_result(
         self,
         chunks: list[str],
         final: ChatResponse | None,
-        request: ChatRequest,
+        ctx: HandlerContext,
     ) -> ChatResponse:
         """A final ChatResponse yielded by a stream handler may carry only
         citations/usage; fill its text from the streamed chunks when empty."""
         if final is None:
-            return self._finalize("".join(chunks), request)
+            return self._finalize("".join(chunks), ctx)
         if contentful(final):
             streamed = "".join(chunks)
             has_text = any(
@@ -217,29 +261,39 @@ class AgentApp(FastAPI):
                 from .models import TextContent
 
                 final.message.content.insert(0, TextContent(text=streamed))
-            return self._finalize(final, request)
-        response = self._finalize("".join(chunks), request)
+            return self._finalize(final, ctx)
+        response = self._finalize("".join(chunks), ctx)
         response.citations = final.citations
         response.usage = final.usage
         response.metadata = final.metadata
         return response
 
-    async def _run_chat(self, request: ChatRequest) -> ChatResponse:
+    def _invoke_stream(
+        self, ctx: HandlerContext
+    ) -> AsyncIterator["str | ChatResponse"]:
+        assert self._stream_handler is not None
+        if _wants_context(self._stream_handler):
+            return self._stream_handler(ctx.request, ctx)
+        return self._stream_handler(ctx.request)
+
+    async def _run_chat(self, ctx: HandlerContext) -> ChatResponse:
         if self._chat_handler is not None:
-            result = self._chat_handler(request)
+            if _wants_context(self._chat_handler):
+                result = self._chat_handler(ctx.request, ctx)
+            else:
+                result = self._chat_handler(ctx.request)
             if inspect.isawaitable(result):
                 result = await result
-            return self._finalize(result, request)
+            return self._finalize(result, ctx)
         # collect the stream into a single response
-        assert self._stream_handler is not None
         chunks: list[str] = []
         final: ChatResponse | None = None
-        async for item in self._stream_handler(request):
+        async for item in self._invoke_stream(ctx):
             if isinstance(item, ChatResponse):
                 final = item
             else:
                 chunks.append(item)
-        return self._merge_stream_result(chunks, final, request)
+        return self._merge_stream_result(chunks, final, ctx)
 
     def _register_routes(self) -> None:
         @self.get("/.well-known/hopsworks-agent.json")
@@ -248,7 +302,22 @@ class AgentApp(FastAPI):
 
         @self.get("/health")
         async def health() -> dict[str, str]:
+            # lightweight liveness: the process is up
             return {"status": "ok"}
+
+        @self.get("/ready")
+        async def ready() -> JSONResponse:
+            # operational readiness: everything needed to actually serve chat
+            checks = {
+                "handler": self._chat_handler is not None
+                or self._stream_handler is not None,
+                "memory": self.memory is None or self.memory.healthcheck(),
+            }
+            ok = all(checks.values())
+            return JSONResponse(
+                {"status": "ready" if ok else "not_ready", "checks": checks},
+                status_code=200 if ok else 503,
+            )
 
         @self.post("/v1/chat")
         async def chat_route(request: ChatRequest) -> JSONResponse:
@@ -256,55 +325,104 @@ class AgentApp(FastAPI):
                 return _error_response(
                     AgentError("No chat handler registered.", "not_implemented", 501)
                 )
-            prepared = self._prepare(request)
+            ctx = self._prepare(request)
             try:
-                response = await self._run_chat(prepared)
+                response = await self._run_chat(ctx)
             except AgentError as err:
                 return _error_response(err)
-            self._record_turn(prepared, response)
+            self._record_turn(ctx.request, response)
             return JSONResponse(response.model_dump())
 
         @self.post("/v1/chat/stream")
         async def stream_route(request: ChatRequest, raw: Request) -> StreamingResponse:
-            prepared = self._prepare(request)
+            ctx = self._prepare(request)
+            return StreamingResponse(
+                self._stream_events(ctx, raw), media_type="text/event-stream"
+            )
 
-            async def events() -> AsyncIterator[str]:
-                if self._stream_handler is None:
-                    # graceful degradation: run the chat handler and emit the
-                    # result as a single completed event
-                    try:
-                        response = await self._run_chat(prepared)
-                    except AgentError as err:
-                        yield _sse("error", err.detail())
-                        return
-                    self._record_turn(prepared, response)
-                    yield _sse("message.completed", response.model_dump())
-                    return
-                chunks: list[str] = []
-                final: ChatResponse | None = None
-                try:
-                    async for item in self._stream_handler(prepared):
-                        if await raw.is_disconnected():
-                            return
-                        if isinstance(item, ChatResponse):
-                            final = item
-                        else:
-                            chunks.append(item)
-                            yield _sse("message.delta", {"delta": {"text": item}})
-                except AgentError as err:
-                    yield _sse("error", err.detail())
-                    return
-                except Exception as err:  # noqa: BLE001 — surfaced to the client
-                    yield _sse(
+        if self.memory is not None:
+            self._register_conversation_routes()
+
+    def _register_conversation_routes(self) -> None:
+        @self.get("/v1/conversations/{conversation_id}/messages")
+        async def list_messages(conversation_id: str) -> dict[str, Any]:
+            # inspect the SDK-managed history the agent actually sees
+            assert self.memory is not None
+            return {
+                "conversation_id": conversation_id,
+                "messages": self.memory.get(conversation_id),
+            }
+
+        @self.delete("/v1/conversations/{conversation_id}")
+        async def clear_conversation(conversation_id: str) -> JSONResponse:
+            # "new session" on the client can drop server-side memory too
+            assert self.memory is not None
+            self.memory.clear(conversation_id)
+            return JSONResponse(status_code=204, content=None)
+
+    async def _stream_events(
+        self, ctx: HandlerContext, raw: Request
+    ) -> AsyncIterator[str]:
+        # graceful degradation: no stream handler -> run chat, emit one event
+        if self._stream_handler is None:
+            try:
+                response = await self._run_chat(ctx)
+            except AgentError as err:
+                yield _sse("error", err.detail())
+                return
+            self._record_turn(ctx.request, response)
+            yield _sse("message.completed", response.model_dump())
+            return
+
+        # Run the handler as a task that feeds a queue, so ctx.emit_event
+        # (tool_event frames) interleaves with the handler's own yields.
+        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+        ctx._event_queue = queue
+
+        async def pump() -> None:
+            try:
+                async for item in self._invoke_stream(ctx):
+                    await queue.put(("item", item))
+            except AgentError as err:
+                await queue.put(("error", err.detail()))
+            except Exception as err:  # noqa: BLE001 — surfaced to the client
+                await queue.put(
+                    (
                         "error",
                         {"code": "agent_error", "message": str(err), "retryable": False},
                     )
-                    return
-                response = self._merge_stream_result(chunks, final, prepared)
-                self._record_turn(prepared, response)
-                yield _sse("message.completed", response.model_dump())
+                )
+            finally:
+                await queue.put(("done", None))
 
-            return StreamingResponse(events(), media_type="text/event-stream")
+        task = asyncio.create_task(pump())
+        chunks: list[str] = []
+        final: ChatResponse | None = None
+        try:
+            while True:
+                kind, payload = await queue.get()
+                if kind == "done":
+                    break
+                if await raw.is_disconnected():
+                    task.cancel()
+                    return
+                if kind == "error":
+                    yield _sse("error", payload)
+                    return
+                if kind == "tool_event":
+                    yield _sse("tool_event", payload)
+                elif isinstance(payload, ChatResponse):
+                    final = payload
+                else:
+                    chunks.append(payload)
+                    yield _sse("message.delta", {"delta": {"text": payload}})
+        finally:
+            if not task.done():
+                task.cancel()
+
+        response = self._merge_stream_result(chunks, final, ctx)
+        self._record_turn(ctx.request, response)
+        yield _sse("message.completed", response.model_dump())
 
 
 def contentful(response: ChatResponse) -> bool:
@@ -316,3 +434,29 @@ def contentful(response: ChatResponse) -> bool:
 
 def _error_response(err: AgentError) -> JSONResponse:
     return JSONResponse({"detail": err.detail()}, status_code=err.status_code)
+
+
+def _annotate_span(ctx: HandlerContext, response: ChatResponse) -> None:
+    """Best-effort correlation: stamp conversation/message/response ids on the
+    active OTel span and surface the trace id in the response metadata, so
+    downstream evaluation can join chat turns to traces. No-op when tracing is
+    not active."""
+    try:
+        from opentelemetry import trace
+    except ImportError:
+        return
+    span = trace.get_current_span()
+    ctxt = span.get_span_context()
+    if not getattr(ctxt, "is_valid", False):
+        return
+    try:
+        span.set_attribute("hopsworks.conversation_id", ctx.conversation_id)
+        span.set_attribute("hopsworks.response_id", response.id)
+        if ctx.message_id:
+            span.set_attribute("hopsworks.message_id", ctx.message_id)
+        if ctx.deployment_id:
+            span.set_attribute("hopsworks.deployment_id", ctx.deployment_id)
+        span.set_attribute("hopsworks.framework", ctx.framework)
+        response.metadata.setdefault("trace_id", format(ctxt.trace_id, "032x"))
+    except Exception:  # noqa: BLE001 — correlation is best-effort
+        pass
