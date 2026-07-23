@@ -269,3 +269,48 @@ class TestMultimodal:
         parts = completed["message"]["content"]
         assert parts[0] == {"type": "text", "text": "Here is the chart"}
         assert parts[1]["type"] == "image"
+
+
+class TestFrameworkAndTracing:
+    def test_framework_defaults_to_custom(self, monkeypatch):
+        monkeypatch.delenv("AGENT_FRAMEWORK", raising=False)
+        app = AgentApp()
+        assert app.framework == "custom"
+        assert app.tracer_provider is None
+
+    def test_framework_from_env(self, monkeypatch):
+        monkeypatch.setenv("AGENT_FRAMEWORK", "langgraph")
+        app = AgentApp()
+        assert app.framework == "langgraph"
+        manifest = TestClient(app).get("/.well-known/hopsworks-agent.json").json()
+        assert manifest["agent"]["framework"] == "langgraph"
+
+    def test_explicit_framework_wins_over_env(self, monkeypatch):
+        monkeypatch.setenv("AGENT_FRAMEWORK", "langgraph")
+        app = AgentApp(framework="llamaindex")
+        assert app.framework == "llamaindex"
+
+    def test_unknown_framework_falls_back(self, monkeypatch):
+        monkeypatch.delenv("AGENT_FRAMEWORK", raising=False)
+        app = AgentApp(framework="prolog")
+        assert app.framework == "custom"
+
+    def test_tracing_off_without_endpoint_env(self, monkeypatch):
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+        assert AgentApp(tracing=True).tracer_provider is None
+
+    def test_tracing_disabled_explicitly(self, monkeypatch):
+        monkeypatch.setenv(
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://localhost:4318/v1/traces"
+        )
+        assert AgentApp(tracing=False).tracer_provider is None
+
+    def test_tracing_graceful_without_otel_sdk(self, monkeypatch):
+        # the test venv has no opentelemetry installed: the endpoint being set
+        # must not crash the app, just leave it untraced
+        monkeypatch.setenv(
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://localhost:4318/v1/traces"
+        )
+        app = AgentApp()
+        assert app.tracer_provider is None
+        assert TestClient(app).get("/health").json() == {"status": "ok"}

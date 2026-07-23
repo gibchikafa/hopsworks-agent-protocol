@@ -33,6 +33,7 @@ from .models import (
     ChatResponse,
     new_conversation_id,
 )
+from .tracing import resolve_framework, setup_tracing
 
 ChatHandler = Callable[[ChatRequest], Awaitable[ChatResponse | str] | ChatResponse | str]
 StreamHandler = Callable[[ChatRequest], AsyncIterator["str | ChatResponse"]]
@@ -54,6 +55,8 @@ class AgentApp(FastAPI):
         placeholder: str | None = None,
         input_modalities: list[str] | None = None,
         output_modalities: list[str] | None = None,
+        framework: str | None = None,
+        tracing: bool | None = None,
         allow_cors: bool = True,
         **fastapi_kwargs: Any,
     ):
@@ -66,6 +69,13 @@ class AgentApp(FastAPI):
         self._placeholder = placeholder
         self._input_modalities = input_modalities or ["text"]
         self._output_modalities = output_modalities or ["text"]
+
+        # framework: explicit arg > AGENT_FRAMEWORK env (platform-injected) >
+        # 'custom'. Drives which OpenInference instrumentor tracing activates.
+        self.framework = resolve_framework(framework)
+        # tracing: None auto-detects from the platform-injected OTLP endpoint
+        # env var (set iff tracing is enabled on the deployment)
+        self.tracer_provider = setup_tracing(self.framework, enabled=tracing)
         self._chat_handler: ChatHandler | None = None
         self._stream_handler: StreamHandler | None = None
 
@@ -117,6 +127,7 @@ class AgentApp(FastAPI):
                 "name": self._agent_name,
                 "description": self._agent_description,
                 "version": self._agent_version,
+                "framework": self.framework,
             },
             "endpoints": endpoints,
             "capabilities": {

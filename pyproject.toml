@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hopsworks-agent-protocol"
-version = "0.2.0"
+version = "0.3.0"
 description = "Server helpers for the Hopsworks Agent Protocol: make any Python agent chat-ready in the Hopsworks UI"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,6 +14,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+tracing = [
+    "opentelemetry-sdk>=1.0.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.0.0",
+]
+langgraph = [
+    "hopsworks-agent-protocol[tracing]",
+    "openinference-instrumentation-langchain>=0.1.0",
+]
+llamaindex = [
+    "hopsworks-agent-protocol[tracing]",
+    "openinference-instrumentation-llama-index>=2.0.0",
+]
 dev = [
     "pytest",
     "httpx",

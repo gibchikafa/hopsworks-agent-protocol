@@ -87,6 +87,24 @@ async def chat(request):
 
 `request.images` / `request.files` / `request.audio_clips` expose non-text parts; the manifest advertises the modalities so the Hopsworks chat panel enables the matching attachment pickers and renders returned images/files/audio inline. Binary parts don't stream — they arrive in the final `message.completed` response.
 
+## Tracing (automatic)
+
+When tracing is enabled on the Hopsworks deployment, the platform injects
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and runs an OTLP collector sidecar. The
+library detects this and wires OTel automatically — no tracing code in the
+agent. Declare the framework so the right OpenInference instrumentor is used
+(or let the platform-injected `AGENT_FRAMEWORK` env var decide):
+
+```python
+agent_app = AgentApp(name="My agent", framework="langgraph")  # or "llamaindex" / "custom"
+```
+
+- `framework="langgraph"` → LangChain/LangGraph instrumentation (`pip install 'hopsworks-agent-protocol[langgraph]'`)
+- `framework="llamaindex"` → LlamaIndex instrumentation (`[llamaindex]` extra)
+- `framework="custom"` → provider only; instrument manually via `agent_app.tracer_provider`
+- `tracing=False` opts out; `tracing=True` warns if the deployment has no tracing endpoint
+- Missing instrumentation packages never crash the agent — it runs untraced with a warning
+
 ## Extra routes
 
 `AgentApp` is a `FastAPI` — add anything else the usual way:
