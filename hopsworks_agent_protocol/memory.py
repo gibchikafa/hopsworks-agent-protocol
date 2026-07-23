@@ -22,12 +22,57 @@ NOT pass a memory store — one source of truth for history is enough.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from abc import ABC, abstractmethod
 
 log = logging.getLogger(__name__)
 
 Turn = dict[str, str]  # {"role": "user"|"assistant", "content": str}
+
+
+def deployment_mysql_url() -> str:
+    """Build the SQLAlchemy URL of the project MySQL from the env vars the
+    platform injects into Hopsworks agent deployments (MYSQL_USER, MYSQL_HOST,
+    MYSQL_PORT, MYSQL_DB, and the password via MYSQL_PASSWORD or the
+    MYSQL_PASSWORD_SECRET_NAME Hopsworks secret)."""
+    try:
+        user = os.environ["MYSQL_USER"]
+        host = os.environ["MYSQL_HOST"]
+        db = os.environ["MYSQL_DB"]
+    except KeyError as err:
+        raise RuntimeError(
+            f"MySQL env var {err.args[0]} is not set — not running in a "
+            "Hopsworks agent deployment? Pass an explicit url= to "
+            "SqlChatMemory instead."
+        ) from err
+    port = os.environ.get("MYSQL_PORT", "3306")
+
+    password = os.environ.get("MYSQL_PASSWORD")
+    if password is None:
+        secret_name = os.environ.get("MYSQL_PASSWORD_SECRET_NAME")
+        if secret_name is None:
+            raise RuntimeError(
+                "Neither MYSQL_PASSWORD nor MYSQL_PASSWORD_SECRET_NAME is set."
+            )
+        password = _read_hopsworks_secret(secret_name)
+
+    return f"mysql+pymysql://{user}:{password}@{host}:{port}/{db}"
+
+
+def _read_hopsworks_secret(secret_name: str) -> str:
+    try:
+        import hopsworks
+    except ImportError as err:
+        raise RuntimeError(
+            "Reading the MySQL password secret requires the hopsworks "
+            "package (available in Hopsworks deployment environments)."
+        ) from err
+    try:
+        return hopsworks.get_secrets_api().get(secret_name)
+    except Exception:  # noqa: BLE001 — not logged in yet
+        hopsworks.login()
+        return hopsworks.get_secrets_api().get(secret_name)
 
 
 class ChatMemory(ABC):
@@ -76,16 +121,26 @@ class SqlChatMemory(ChatMemory):
 
     ``pip install 'hopsworks-agent-protocol[memory-sql]'``
 
+    Inside a Hopsworks agent deployment both arguments are optional:
+    ``SqlChatMemory()`` connects to the project MySQL using the
+    platform-injected env vars and derives a per-deployment table name from
+    ``DEPLOYMENT_ID``.
+
     A per-conversation cache avoids a read round-trip on every turn for the
     lifetime of the process.
     """
 
     def __init__(
         self,
-        url: str,
-        table_name: str = "agent_chat_memory",
+        url: str | None = None,
+        table_name: str | None = None,
         max_messages: int = 50,
     ):
+        if url is None:
+            url = deployment_mysql_url()
+        if table_name is None:
+            deployment_id = os.environ.get("DEPLOYMENT_ID", "default")
+            table_name = f"agent_chat_memory_{deployment_id}"
         try:
             from sqlalchemy import (
                 Column,

@@ -117,7 +117,7 @@ from hopsworks_agent_protocol import AgentApp, SqlChatMemory
 
 agent_app = AgentApp(
     name="My agent",
-    memory=SqlChatMemory("mysql+pymysql://user:pw@host:3306/db"),  # or InMemoryChatMemory()
+    memory=SqlChatMemory(),  # zero-config in a deployment; or InMemoryChatMemory()
 )
 
 @agent_app.chat
@@ -128,8 +128,12 @@ async def chat(request):
 
 - `InMemoryChatMemory()` — zero-config for development. Lost on restart and
   per-replica; agent deployments can scale to zero, so not for production.
-- `SqlChatMemory(url)` — any SQLAlchemy URL (`[memory-sql]` extra), e.g. the
-  project MySQL. Survives restarts, shared across replicas.
+- `SqlChatMemory()` — inside a Hopsworks agent deployment this is
+  zero-config: the project MySQL URL is built from the platform-injected
+  `MYSQL_*` env vars (password via the `MYSQL_PASSWORD_SECRET_NAME` secret)
+  and the table name is derived from `DEPLOYMENT_ID`. Outside a deployment
+  pass any SQLAlchemy URL (`[memory-sql]` extra). Survives restarts, shared
+  across replicas.
 - Memory failures never break the chat — they log and the reply still goes out.
 - **If your framework persists state itself** (LangGraph checkpointer,
   LlamaIndex chat store), key it by `conversation_id` and skip `memory=` —

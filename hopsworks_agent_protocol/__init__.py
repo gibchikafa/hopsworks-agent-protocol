@@ -1,5 +1,10 @@
 from .app import AgentApp
-from .memory import ChatMemory, InMemoryChatMemory, SqlChatMemory
+from .memory import (
+    ChatMemory,
+    InMemoryChatMemory,
+    SqlChatMemory,
+    deployment_mysql_url,
+)
 from .models import (
     AgentError,
     AgentResponse,
@@ -26,4 +31,5 @@ __all__ = [
     "InMemoryChatMemory",
     "SqlChatMemory",
     "TextContent",
+    "deployment_mysql_url",
 ]

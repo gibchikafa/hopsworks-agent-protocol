@@ -384,3 +384,28 @@ class TestMemory:
         client = TestClient(self.build_memory_app(BrokenMemory()))
         result = client.post("/v1/chat", json=make_request("hello"))
         assert result.status_code == 200
+
+
+class TestDeploymentMysqlUrl:
+    def test_builds_url_from_envs(self, monkeypatch):
+        from hopsworks_agent_protocol.memory import deployment_mysql_url
+
+        monkeypatch.setenv("MYSQL_USER", "u")
+        monkeypatch.setenv("MYSQL_HOST", "mysql.svc")
+        monkeypatch.setenv("MYSQL_DB", "agents")
+        monkeypatch.setenv("MYSQL_PASSWORD", "pw")
+        monkeypatch.delenv("MYSQL_PORT", raising=False)
+        assert (
+            deployment_mysql_url() == "mysql+pymysql://u:pw@mysql.svc:3306/agents"
+        )
+
+    def test_missing_env_has_helpful_error(self, monkeypatch):
+        from hopsworks_agent_protocol.memory import deployment_mysql_url
+
+        monkeypatch.delenv("MYSQL_USER", raising=False)
+        try:
+            deployment_mysql_url()
+            raise AssertionError("expected RuntimeError")
+        except RuntimeError as err:
+            assert "MYSQL_USER" in str(err)
+            assert "url=" in str(err)
