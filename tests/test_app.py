@@ -314,3 +314,73 @@ class TestFrameworkAndTracing:
         app = AgentApp()
         assert app.tracer_provider is None
         assert TestClient(app).get("/health").json() == {"status": "ok"}
+
+
+class TestMemory:
+    def build_memory_app(self, memory):
+        app = AgentApp(memory=memory)
+
+        @app.chat
+        async def chat(request):
+            history = app.memory.get(request.conversation_id)
+            return AgentResponse.text(
+                text=f"history={len(history)}: {request.text}",
+                conversation_id=request.conversation_id,
+            )
+
+        return app
+
+    def test_in_memory_auto_records_and_serves_history(self):
+        from hopsworks_agent_protocol import InMemoryChatMemory
+
+        memory = InMemoryChatMemory()
+        client = TestClient(self.build_memory_app(memory))
+        first = client.post("/v1/chat", json=make_request("hello")).json()
+        cid = first["conversation_id"]
+        assert first["message"]["content"][0]["text"] == "history=0: hello"
+        assert memory.get(cid) == [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "history=0: hello"},
+        ]
+        second = client.post("/v1/chat", json=make_request("again", cid)).json()
+        assert second["message"]["content"][0]["text"] == "history=2: again"
+
+    def test_in_memory_trims_to_max(self):
+        from hopsworks_agent_protocol import InMemoryChatMemory
+
+        memory = InMemoryChatMemory(max_messages=2)
+        for i in range(4):
+            memory.append("c1", "user", f"m{i}")
+        assert memory.get("c1") == [
+            {"role": "user", "content": "m2"},
+            {"role": "user", "content": "m3"},
+        ]
+
+    def test_sql_memory_roundtrip(self, tmp_path):
+        from hopsworks_agent_protocol import SqlChatMemory
+
+        url = f"sqlite:///{tmp_path}/memory.db"
+        memory = SqlChatMemory(url)
+        client = TestClient(self.build_memory_app(memory))
+        cid = client.post("/v1/chat", json=make_request("hi")).json()[
+            "conversation_id"
+        ]
+        # a fresh store over the same db sees the persisted turns (no cache)
+        fresh = SqlChatMemory(url)
+        assert fresh.get(cid) == [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "history=0: hi"},
+        ]
+        fresh.clear(cid)
+        assert fresh.get(cid) == []
+
+    def test_memory_failure_does_not_break_chat(self):
+        from hopsworks_agent_protocol import InMemoryChatMemory
+
+        class BrokenMemory(InMemoryChatMemory):
+            def append(self, *a, **k):
+                raise RuntimeError("db down")
+
+        client = TestClient(self.build_memory_app(BrokenMemory()))
+        result = client.post("/v1/chat", json=make_request("hello"))
+        assert result.status_code == 200

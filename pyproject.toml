@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hopsworks-agent-protocol"
-version = "0.3.0"
+version = "0.4.0"
 description = "Server helpers for the Hopsworks Agent Protocol: make any Python agent chat-ready in the Hopsworks UI"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,10 +26,14 @@ llamaindex = [
     "hopsworks-agent-protocol[tracing]",
     "openinference-instrumentation-llama-index>=2.0.0",
 ]
+memory-sql = [
+    "sqlalchemy>=2.0.0",
+]
 dev = [
     "pytest",
     "httpx",
     "uvicorn",
+    "sqlalchemy>=2.0.0",
 ]
 
 [tool.hatch.build.targets.wheel]

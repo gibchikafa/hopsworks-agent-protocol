@@ -105,6 +105,36 @@ agent_app = AgentApp(name="My agent", framework="langgraph")  # or "llamaindex" 
 - `tracing=False` opts out; `tracing=True` warns if the deployment has no tracing endpoint
 - Missing instrumentation packages never crash the agent — it runs untraced with a warning
 
+## Conversation memory
+
+The protocol keeps history server-side (`conversation_id`); the library can
+store it for you. Pass a memory store and turns are recorded automatically
+after each successful exchange; read history in the handler — it comes back
+as `{"role", "content"}` dicts that LangChain/LangGraph/LlamaIndex accept:
+
+```python
+from hopsworks_agent_protocol import AgentApp, SqlChatMemory
+
+agent_app = AgentApp(
+    name="My agent",
+    memory=SqlChatMemory("mysql+pymysql://user:pw@host:3306/db"),  # or InMemoryChatMemory()
+)
+
+@agent_app.chat
+async def chat(request):
+    history = agent_app.memory.get(request.conversation_id)
+    ...
+```
+
+- `InMemoryChatMemory()` — zero-config for development. Lost on restart and
+  per-replica; agent deployments can scale to zero, so not for production.
+- `SqlChatMemory(url)` — any SQLAlchemy URL (`[memory-sql]` extra), e.g. the
+  project MySQL. Survives restarts, shared across replicas.
+- Memory failures never break the chat — they log and the reply still goes out.
+- **If your framework persists state itself** (LangGraph checkpointer,
+  LlamaIndex chat store), key it by `conversation_id` and skip `memory=` —
+  keep one source of truth for history.
+
 ## Extra routes
 
 `AgentApp` is a `FastAPI` — add anything else the usual way:

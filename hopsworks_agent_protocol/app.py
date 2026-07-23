@@ -33,6 +33,7 @@ from .models import (
     ChatResponse,
     new_conversation_id,
 )
+from .memory import ChatMemory
 from .tracing import resolve_framework, setup_tracing
 
 ChatHandler = Callable[[ChatRequest], Awaitable[ChatResponse | str] | ChatResponse | str]
@@ -57,6 +58,7 @@ class AgentApp(FastAPI):
         output_modalities: list[str] | None = None,
         framework: str | None = None,
         tracing: bool | None = None,
+        memory: ChatMemory | None = None,
         allow_cors: bool = True,
         **fastapi_kwargs: Any,
     ):
@@ -76,6 +78,12 @@ class AgentApp(FastAPI):
         # tracing: None auto-detects from the platform-injected OTLP endpoint
         # env var (set iff tracing is enabled on the deployment)
         self.tracer_provider = setup_tracing(self.framework, enabled=tracing)
+
+        # optional conversation memory: turns are recorded automatically after
+        # each successful exchange; handlers read history with
+        # self.memory.get(request.conversation_id). Skip it if your framework
+        # persists state itself (e.g. a LangGraph checkpointer).
+        self.memory = memory
         self._chat_handler: ChatHandler | None = None
         self._stream_handler: StreamHandler | None = None
 
@@ -146,6 +154,30 @@ class AgentApp(FastAPI):
                 "allow_markdown": True,
             },
         }
+
+    def _record_turn(self, request: ChatRequest, response: ChatResponse) -> None:
+        """Auto-record the exchange when a memory store is configured."""
+        if self.memory is None or response.status != "completed":
+            return
+        conversation_id = response.conversation_id or request.conversation_id
+        if not conversation_id:
+            return
+        try:
+            if request.text:
+                self.memory.append(conversation_id, "user", request.text)
+            answer = "".join(
+                part.text
+                for part in response.message.content
+                if part.type == "text"
+            )
+            if answer:
+                self.memory.append(conversation_id, "assistant", answer)
+        except Exception:  # noqa: BLE001 — memory failures must not break chat
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "Failed to record conversation turn"
+            )
 
     @staticmethod
     def _prepare(request: ChatRequest) -> ChatRequest:
@@ -229,6 +261,7 @@ class AgentApp(FastAPI):
                 response = await self._run_chat(prepared)
             except AgentError as err:
                 return _error_response(err)
+            self._record_turn(prepared, response)
             return JSONResponse(response.model_dump())
 
         @self.post("/v1/chat/stream")
@@ -244,6 +277,7 @@ class AgentApp(FastAPI):
                     except AgentError as err:
                         yield _sse("error", err.detail())
                         return
+                    self._record_turn(prepared, response)
                     yield _sse("message.completed", response.model_dump())
                     return
                 chunks: list[str] = []
@@ -267,6 +301,7 @@ class AgentApp(FastAPI):
                     )
                     return
                 response = self._merge_stream_result(chunks, final, prepared)
+                self._record_turn(prepared, response)
                 yield _sse("message.completed", response.model_dump())
 
             return StreamingResponse(events(), media_type="text/event-stream")
