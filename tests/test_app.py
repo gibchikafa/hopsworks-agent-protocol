@@ -51,7 +51,7 @@ class TestManifestAndHealth:
         client = TestClient(build_basic_app())
         manifest = client.get("/.well-known/hopsworks-agent.json").json()
         assert manifest["protocol"] == "hopsworks-agent"
-        assert manifest["protocol_version"] == "1.0"
+        assert manifest["protocol_version"] == "1.1"
         assert manifest["agent"]["name"] == "Test agent"
         assert manifest["endpoints"] == {"chat": "/v1/chat"}
         assert manifest["capabilities"]["streaming"] is False
@@ -182,3 +182,90 @@ class TestRequestHelpers:
         client = TestClient(app)
         client.post("/v1/chat", json=make_request("hello world"))
         assert captured["messages"] == [{"role": "user", "content": "hello world"}]
+
+
+class TestMultimodal:
+    def build_vision_app(self):
+        from hopsworks_agent_protocol import ImageContent, TextContent
+
+        app = AgentApp(
+            name="Vision agent",
+            input_modalities=["text", "image"],
+            output_modalities=["text", "image"],
+        )
+
+        @app.chat
+        async def chat(request):
+            n_images = len(request.images)
+            return AgentResponse.parts(
+                TextContent(text=f"got {n_images} image(s): {request.text}"),
+                ImageContent(media_type="image/png", data="aGVsbG8="),
+                conversation_id=request.conversation_id,
+            )
+
+        return app
+
+    def test_manifest_modalities(self):
+        client = TestClient(self.build_vision_app())
+        caps = client.get("/.well-known/hopsworks-agent.json").json()["capabilities"]
+        assert caps["input_modalities"] == ["text", "image"]
+        assert caps["output_modalities"] == ["text", "image"]
+        assert caps["attachments"] is True
+
+    def test_text_only_manifest_defaults(self):
+        client = TestClient(build_basic_app())
+        caps = client.get("/.well-known/hopsworks-agent.json").json()["capabilities"]
+        assert caps["input_modalities"] == ["text"]
+        assert caps["attachments"] is False
+
+    def test_image_request_and_response(self):
+        client = TestClient(self.build_vision_app())
+        response = client.post(
+            "/v1/chat",
+            json={
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this?"},
+                        {"type": "image", "media_type": "image/png", "data": "aW1n"},
+                    ],
+                }
+            },
+        ).json()
+        parts = response["message"]["content"]
+        assert parts[0] == {"type": "text", "text": "got 1 image(s): what is this?"}
+        assert parts[1] == {"type": "image", "media_type": "image/png", "data": "aGVsbG8="}
+
+    def test_unknown_part_type_is_422(self):
+        client = TestClient(self.build_vision_app())
+        result = client.post(
+            "/v1/chat",
+            json={
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "hologram", "data": "x"}],
+                }
+            },
+        )
+        assert result.status_code == 422
+
+    def test_stream_final_with_image_keeps_streamed_text(self):
+        from hopsworks_agent_protocol import ImageContent
+
+        app = AgentApp(output_modalities=["text", "image"])
+
+        @app.stream
+        async def stream(request):
+            yield "Here is the chart"
+            yield AgentResponse.parts(
+                ImageContent(media_type="image/png", data="cGxvdA=="),
+                conversation_id=request.conversation_id,
+            )
+
+        client = TestClient(app)
+        events = parse_sse(client.post("/v1/chat/stream", json=make_request("chart")).text)
+        event, completed = events[-1]
+        assert event == "message.completed"
+        parts = completed["message"]["content"]
+        assert parts[0] == {"type": "text", "text": "Here is the chart"}
+        assert parts[1]["type"] == "image"

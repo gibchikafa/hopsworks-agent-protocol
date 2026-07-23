@@ -8,12 +8,12 @@ server-side via conversation_id.
 from __future__ import annotations
 
 import uuid
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
 
 PROTOCOL = "hopsworks-agent"
-PROTOCOL_VERSION = "1.0"
+PROTOCOL_VERSION = "1.1"
 
 
 def new_conversation_id() -> str:
@@ -33,10 +33,35 @@ class TextContent(BaseModel):
     text: str
 
 
+class ImageContent(BaseModel):
+    type: Literal["image"] = "image"
+    media_type: str
+    data: str  # base64
+
+
+class FileContent(BaseModel):
+    type: Literal["file"] = "file"
+    name: str | None = None
+    media_type: str
+    data: str  # base64
+
+
+class AudioContent(BaseModel):
+    type: Literal["audio"] = "audio"
+    media_type: str
+    data: str  # base64
+
+
+ContentPart = Annotated[
+    TextContent | ImageContent | FileContent | AudioContent,
+    Field(discriminator="type"),
+]
+
+
 class ChatMessage(BaseModel):
     id: str | None = None
     role: Literal["system", "user", "assistant"]
-    content: list[TextContent]
+    content: list[ContentPart]
 
 
 class ChatRequest(BaseModel):
@@ -51,6 +76,18 @@ class ChatRequest(BaseModel):
         return "\n".join(
             part.text for part in self.message.content if part.type == "text"
         ).strip()
+
+    @property
+    def images(self) -> list[ImageContent]:
+        return [p for p in self.message.content if p.type == "image"]
+
+    @property
+    def files(self) -> list[FileContent]:
+        return [p for p in self.message.content if p.type == "file"]
+
+    @property
+    def audio_clips(self) -> list[AudioContent]:
+        return [p for p in self.message.content if p.type == "audio"]
 
     def to_framework_messages(self) -> list[dict[str, str]]:
         """The new message in the `{"role", "content"}` dict shape that
@@ -84,6 +121,26 @@ class AgentResponse:
         usage: dict[str, int] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> ChatResponse:
+        return AgentResponse.parts(
+            TextContent(text=text),
+            conversation_id=conversation_id,
+            citations=citations,
+            usage=usage,
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def parts(
+        *parts: TextContent | ImageContent | FileContent | AudioContent,
+        conversation_id: str | None = None,
+        citations: list[dict[str, Any]] | None = None,
+        usage: dict[str, int] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> ChatResponse:
+        """Multimodal response: mix text/image/file/audio content parts.
+
+        Only return part types declared in the agent's ``output_modalities``.
+        """
         return ChatResponse(
             # a missing conversation_id is filled in by AgentApp from the
             # request before the response is returned
@@ -91,7 +148,7 @@ class AgentResponse:
             message=ChatMessage(
                 id=new_message_id(),
                 role="assistant",
-                content=[TextContent(text=text)],
+                content=list(parts),
             ),
             citations=citations or [],
             usage=usage,

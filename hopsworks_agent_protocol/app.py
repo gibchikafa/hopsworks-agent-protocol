@@ -52,6 +52,8 @@ class AgentApp(FastAPI):
         welcome_message: str | None = None,
         suggested_prompts: list[str] | None = None,
         placeholder: str | None = None,
+        input_modalities: list[str] | None = None,
+        output_modalities: list[str] | None = None,
         allow_cors: bool = True,
         **fastapi_kwargs: Any,
     ):
@@ -62,6 +64,8 @@ class AgentApp(FastAPI):
         self._welcome_message = welcome_message
         self._suggested_prompts = suggested_prompts or []
         self._placeholder = placeholder
+        self._input_modalities = input_modalities or ["text"]
+        self._output_modalities = output_modalities or ["text"]
         self._chat_handler: ChatHandler | None = None
         self._stream_handler: StreamHandler | None = None
 
@@ -118,7 +122,9 @@ class AgentApp(FastAPI):
             "capabilities": {
                 "streaming": streaming,
                 "conversation_history": True,
-                "attachments": False,
+                "attachments": any(m != "text" for m in self._input_modalities),
+                "input_modalities": self._input_modalities,
+                "output_modalities": self._output_modalities,
                 "citations": False,
                 "tool_events": False,
             },
@@ -159,6 +165,15 @@ class AgentApp(FastAPI):
         if final is None:
             return self._finalize("".join(chunks), request)
         if contentful(final):
+            streamed = "".join(chunks)
+            has_text = any(
+                part.type == "text" and part.text for part in final.message.content
+            )
+            if streamed and not has_text:
+                # final carried only non-text parts: keep the streamed text too
+                from .models import TextContent
+
+                final.message.content.insert(0, TextContent(text=streamed))
             return self._finalize(final, request)
         response = self._finalize("".join(chunks), request)
         response.citations = final.citations
@@ -247,7 +262,10 @@ class AgentApp(FastAPI):
 
 
 def contentful(response: ChatResponse) -> bool:
-    return any(part.text for part in response.message.content)
+    # any non-text part counts as content; text parts count when non-empty
+    return any(
+        part.type != "text" or part.text for part in response.message.content
+    )
 
 
 def _error_response(err: AgentError) -> JSONResponse:

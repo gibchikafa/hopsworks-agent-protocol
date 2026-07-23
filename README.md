@@ -61,6 +61,32 @@ async def stream(request):
 
 If only a `@chat` handler exists, `/v1/chat/stream` degrades gracefully to a single `message.completed` event.
 
+## Multimodal (v1.1)
+
+Declare what your agent accepts/returns and use content parts:
+
+```python
+from hopsworks_agent_protocol import AgentApp, AgentResponse, ImageContent, TextContent
+
+agent_app = AgentApp(
+    name="Vision agent",
+    input_modalities=["text", "image"],
+    output_modalities=["text", "image"],
+)
+
+@agent_app.chat
+async def chat(request):
+    for image in request.images:          # base64 in image.data, image.media_type
+        ...
+    return AgentResponse.parts(
+        TextContent(text="Here's the chart:"),
+        ImageContent(media_type="image/png", data=chart_base64),
+        conversation_id=request.conversation_id,
+    )
+```
+
+`request.images` / `request.files` / `request.audio_clips` expose non-text parts; the manifest advertises the modalities so the Hopsworks chat panel enables the matching attachment pickers and renders returned images/files/audio inline. Binary parts don't stream — they arrive in the final `message.completed` response.
+
 ## Extra routes
 
 `AgentApp` is a `FastAPI` — add anything else the usual way:
