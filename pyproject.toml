@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hopsworks-agent-protocol"
+version = "0.1.0"
+description = "Server helpers for the Hopsworks Agent Protocol: make any Python agent chat-ready in the Hopsworks UI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.100",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "httpx",
+    "uvicorn",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["hopsworks_agent_protocol"]
