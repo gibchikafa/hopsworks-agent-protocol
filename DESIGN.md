@@ -58,7 +58,8 @@ Design choices:
 
 - **Auto-recording**: the SDK appends both turns after each *successful* exchange (`status == completed`), so handlers only read. History returns as `{"role", "content"}` dicts — the shape LangChain/LangGraph/LlamaIndex all accept, so it drops straight into a framework call.
 - **Opt-in, not default**: many frameworks already persist state (LangGraph checkpointers, LlamaIndex chat stores). Defaulting memory on would create two competing sources of truth. The rule, documented at the call site: if your framework persists state, key it by `conversation_id` and skip `memory=`.
-- **Never fatal**: a memory failure logs and the reply still goes out. A dead MySQL degrades to statelessness, it doesn't 500 the chat.
+- **Never fatal, including at startup**: `SqlChatMemory` construction never touches the database — the engine and table are created lazily on first use. If the database is unreachable at startup or on any turn, the store degrades to statelessness (reads return empty, writes are dropped, both logged) rather than crashing the pod or 500-ing the chat. Only a missing `[memory-sql]` dependency is a hard error, and only at construction.
+- **Text-only history**: memory records the *text* of each turn (see the multimodal note below). Non-text content parts (images, files) are not persisted — a design choice, not an oversight: agents rarely re-feed prior images, and inline base64 in a history table is a poor fit. Agents that need multimodal history should carry it in their own store or framework state.
 
 ### 5. Tracing is env-gated, zero-config
 

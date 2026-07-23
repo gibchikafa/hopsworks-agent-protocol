@@ -409,3 +409,21 @@ class TestDeploymentMysqlUrl:
         except RuntimeError as err:
             assert "MYSQL_USER" in str(err)
             assert "url=" in str(err)
+
+
+class TestSqlMemoryResilience:
+    def test_unreachable_db_does_not_crash_construction_or_turns(self):
+        from hopsworks_agent_protocol import SqlChatMemory
+
+        memory = SqlChatMemory(url="mysql+pymysql://x:y@127.0.0.1:1/nope")
+        assert memory.get("c1") == []
+        memory.append("c1", "user", "hi")
+        assert memory.get("c1") == []
+        memory.clear("c1")
+
+    def test_lazy_url_resolution_defers_env_errors(self, monkeypatch):
+        from hopsworks_agent_protocol import SqlChatMemory
+
+        monkeypatch.delenv("MYSQL_USER", raising=False)
+        memory = SqlChatMemory()
+        assert memory.get("c1") == []
