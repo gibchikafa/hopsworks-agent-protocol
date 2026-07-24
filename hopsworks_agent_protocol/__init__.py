@@ -3,6 +3,7 @@ from .context import HandlerContext
 from .memory import (
     ChatMemory,
     InMemoryChatMemory,
+    PersistentAgentMemory,
     SqlChatMemory,
     deployment_mysql_url,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "HandlerContext",
     "ImageContent",
     "InMemoryChatMemory",
+    "PersistentAgentMemory",
     "SqlChatMemory",
     "TextContent",
     "deployment_mysql_url",

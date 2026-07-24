@@ -357,16 +357,16 @@ class TestMemory:
         ]
 
     def test_sql_memory_roundtrip(self, tmp_path):
-        from hopsworks_agent_protocol import SqlChatMemory
+        from hopsworks_agent_protocol import PersistentAgentMemory
 
         url = f"sqlite:///{tmp_path}/memory.db"
-        memory = SqlChatMemory(url)
+        memory = PersistentAgentMemory(url)
         client = TestClient(self.build_memory_app(memory))
         cid = client.post("/v1/chat", json=make_request("hi")).json()[
             "conversation_id"
         ]
         # a fresh store over the same db sees the persisted turns (no cache)
-        fresh = SqlChatMemory(url)
+        fresh = PersistentAgentMemory(url)
         assert fresh.get(cid) == [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "history=0: hi"},
@@ -413,19 +413,19 @@ class TestDeploymentMysqlUrl:
 
 class TestSqlMemoryResilience:
     def test_unreachable_db_does_not_crash_construction_or_turns(self):
-        from hopsworks_agent_protocol import SqlChatMemory
+        from hopsworks_agent_protocol import PersistentAgentMemory
 
-        memory = SqlChatMemory(url="mysql+pymysql://x:y@127.0.0.1:1/nope")
+        memory = PersistentAgentMemory(url="mysql+pymysql://x:y@127.0.0.1:1/nope")
         assert memory.get("c1") == []
         memory.append("c1", "user", "hi")
         assert memory.get("c1") == []
         memory.clear("c1")
 
     def test_lazy_url_resolution_defers_env_errors(self, monkeypatch):
-        from hopsworks_agent_protocol import SqlChatMemory
+        from hopsworks_agent_protocol import PersistentAgentMemory
 
         monkeypatch.delenv("MYSQL_USER", raising=False)
-        memory = SqlChatMemory()
+        memory = PersistentAgentMemory()
         assert memory.get("c1") == []
 
 
@@ -487,9 +487,9 @@ class TestReadiness:
         assert result.json()["checks"]["handler"] is False
 
     def test_not_ready_when_memory_unreachable(self):
-        from hopsworks_agent_protocol import AgentApp, SqlChatMemory
+        from hopsworks_agent_protocol import AgentApp, PersistentAgentMemory
 
-        app = AgentApp(memory=SqlChatMemory(url="mysql+pymysql://x:y@127.0.0.1:1/no"))
+        app = AgentApp(memory=PersistentAgentMemory(url="mysql+pymysql://x:y@127.0.0.1:1/no"))
 
         @app.chat
         async def chat(request):

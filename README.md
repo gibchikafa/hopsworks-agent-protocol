@@ -113,11 +113,11 @@ after each successful exchange; read history in the handler — it comes back
 as `{"role", "content"}` dicts that LangChain/LangGraph/LlamaIndex accept:
 
 ```python
-from hopsworks_agent_protocol import AgentApp, SqlChatMemory
+from hopsworks_agent_protocol import AgentApp, PersistentAgentMemory
 
 agent_app = AgentApp(
     name="My agent",
-    memory=SqlChatMemory(),  # zero-config in a deployment; or InMemoryChatMemory()
+    memory=PersistentAgentMemory(),  # zero-config in a deployment; or InMemoryChatMemory()
 )
 
 @agent_app.chat
@@ -128,7 +128,7 @@ async def chat(request):
 
 - `InMemoryChatMemory()` — zero-config for development. Lost on restart and
   per-replica; agent deployments can scale to zero, so not for production.
-- `SqlChatMemory()` — inside a Hopsworks agent deployment this is
+- `PersistentAgentMemory()` — inside a Hopsworks agent deployment this is
   zero-config: the project MySQL URL is built from the platform-injected
   `MYSQL_*` env vars (password via the `MYSQL_PASSWORD_SECRET_NAME` secret)
   and the table name is derived from `DEPLOYMENT_ID`. Outside a deployment

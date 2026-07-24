@@ -121,13 +121,13 @@ class InMemoryChatMemory(ChatMemory):
             self._conversations.pop(conversation_id, None)
 
 
-class SqlChatMemory(ChatMemory):
+class PersistentAgentMemory(ChatMemory):
     """SQLAlchemy-backed store (MySQL, Postgres, SQLite, ...).
 
     ``pip install 'hopsworks-agent-protocol[memory-sql]'``
 
     Inside a Hopsworks agent deployment both arguments are optional:
-    ``SqlChatMemory()`` connects to the project MySQL using the
+    ``PersistentAgentMemory()`` connects to the project MySQL using the
     platform-injected env vars and derives a per-deployment table name from
     ``DEPLOYMENT_ID``.
 
@@ -152,7 +152,7 @@ class SqlChatMemory(ChatMemory):
             import sqlalchemy  # noqa: F401 — fail fast if the extra is missing
         except ImportError as err:
             raise ImportError(
-                "SqlChatMemory requires SQLAlchemy: "
+                "PersistentAgentMemory requires SQLAlchemy: "
                 "pip install 'hopsworks-agent-protocol[memory-sql]'"
             ) from err
 
@@ -277,3 +277,7 @@ class SqlChatMemory(ChatMemory):
     def healthcheck(self) -> bool:
         # ready once the engine + table are established (lazily) and reachable
         return self._ensure_engine()
+
+
+# Backwards-compatible alias (renamed from SqlChatMemory).
+SqlChatMemory = PersistentAgentMemory
