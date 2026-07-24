@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -90,6 +91,61 @@ class HandlerContext:
             payload["message"] = message
         if data is not None:
             payload["data"] = data
+        self._dispatch(payload)
+
+    async def stream_langchain(
+        self, events: AsyncIterator[dict[str, Any]]
+    ) -> AsyncIterator[str]:
+        """Pipe a LangChain/LangGraph ``astream_events(version="v2")`` stream
+        through, yielding assistant text deltas and turning tool calls into
+        ``tool_event`` chips automatically — no manual ``emit_event`` and no
+        dependency on tracing:
+
+            async for delta in ctx.stream_langchain(agent.astream_events(...)):
+                yield delta
+
+        ``on_tool_start`` / ``on_tool_end`` / ``on_tool_error`` become
+        running / done / failed events keyed by the tool's ``run_id`` so start
+        and end collapse into one chip.
+        """
+        async for event in events:
+            kind = event.get("event")
+            if kind == "on_chat_model_stream":
+                chunk = (event.get("data") or {}).get("chunk")
+                content = getattr(chunk, "content", None)
+                if isinstance(content, str):
+                    if content:
+                        yield content
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "")
+                            if text:
+                                yield text
+            elif kind == "on_tool_start":
+                tool_input = (event.get("data") or {}).get("input")
+                await self.emit_event(
+                    event.get("name", "tool"),
+                    status="running",
+                    message=str(tool_input) if tool_input else None,
+                    event_id=event.get("run_id"),
+                )
+            elif kind == "on_tool_end":
+                await self.emit_event(
+                    event.get("name", "tool"),
+                    status="done",
+                    event_id=event.get("run_id"),
+                )
+            elif kind == "on_tool_error":
+                err = (event.get("data") or {}).get("error")
+                await self.emit_event(
+                    event.get("name", "tool"),
+                    status="failed",
+                    message=str(err) if err else None,
+                    event_id=event.get("run_id"),
+                )
+
+    def _dispatch(self, payload: dict[str, Any]) -> None:
         queue = self._event_queue
         loop = self._loop
         if queue is None or loop is None:

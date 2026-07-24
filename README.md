@@ -171,6 +171,17 @@ otherwise), which the chat panel renders as progress chips.
 - **Manual** — `await ctx.emit_event(name, status, message, data, event_id)`
   for custom progress; pass the same `event_id` for a call's start and end so
   the client shows one updating chip.
+- **LangChain/LangGraph helper** — pipe `astream_events(version="v2")` through
+  `ctx.stream_langchain(...)`: it yields the assistant text deltas and turns
+  `on_tool_start`/`on_tool_end`/`on_tool_error` into tool-event chips
+  automatically, with no `emit_event` calls and no dependency on tracing:
+
+  ```python
+  @agent_app.stream
+  async def stream(request, ctx):
+      async for delta in ctx.stream_langchain(agent.astream_events(inputs, version="v2")):
+          yield delta
+  ```
 
 ## Operational endpoints
 

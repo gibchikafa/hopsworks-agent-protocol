@@ -659,3 +659,42 @@ class TestAutoToolEvents:
         tool_events = [e[1] for e in events if e[0] == "tool_event"]
         assert tool_events[0] == {"name": "t", "status": "running", "id": "e1"}
         assert tool_events[1] == {"name": "t", "status": "done", "id": "e1"}
+
+
+class TestStreamLangchainHelper:
+    def _fake_events(self):
+        # a langgraph astream_events(v2) sequence with a tool call
+        async def gen():
+            yield {"event": "on_chat_model_stream",
+                   "data": {"chunk": type("C", (), {"content": "Let me search "})()}}
+            yield {"event": "on_tool_start", "name": "search_papers",
+                   "run_id": "r1", "data": {"input": {"query": "CoT"}}}
+            yield {"event": "on_tool_end", "name": "search_papers",
+                   "run_id": "r1", "data": {}}
+            yield {"event": "on_chat_model_stream",
+                   "data": {"chunk": type("C", (), {"content": "done."})()}}
+        return gen()
+
+    def test_helper_yields_text_and_emits_tool_events(self):
+        from hopsworks_agent_protocol import AgentApp
+
+        app = AgentApp(tool_events=True)
+        helper = self
+
+        @app.stream
+        async def stream(request, ctx):
+            async for delta in ctx.stream_langchain(helper._fake_events()):
+                yield delta
+
+        events = parse_sse(
+            TestClient(app).post("/v1/chat/stream", json=make_request("q")).text
+        )
+        deltas = [e[1]["delta"]["text"] for e in events if e[0] == "message.delta"]
+        tools = [e[1] for e in events if e[0] == "tool_event"]
+        assert "".join(deltas) == "Let me search done."
+        assert tools == [
+            {"name": "search_papers", "status": "running", "id": "r1",
+             "message": "{'query': 'CoT'}"},
+            {"name": "search_papers", "status": "done", "id": "r1"},
+        ]
+        assert events[-1][1]["message"]["content"][0]["text"] == "Let me search done."
