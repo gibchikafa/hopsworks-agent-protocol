@@ -698,3 +698,94 @@ class TestStreamLangchainHelper:
             {"name": "search_papers", "status": "done", "id": "r1"},
         ]
         assert events[-1][1]["message"]["content"][0]["text"] == "Let me search done."
+
+
+class TestGraph:
+    class _Node:
+        def __init__(self, nid, name=None):
+            self.id = nid
+            self.name = name or nid
+
+    class _Edge:
+        def __init__(self, source, target, data=None, conditional=False):
+            self.source = source
+            self.target = target
+            self.data = data
+            self.conditional = conditional
+
+    class _Drawable:
+        def __init__(self, nodes, edges):
+            self.nodes = nodes
+            self.edges = edges
+
+    class _Compiled:
+        def __init__(self, drawable):
+            self._d = drawable
+
+        def get_graph(self):
+            return self._d
+
+    def _langgraph_like(self):
+        # mirrors agent.get_graph(): __start__ -> agent -> action/__end__
+        nodes = {
+            "__start__": self._Node("__start__"),
+            "agent": self._Node("agent"),
+            "action": self._Node("action"),
+            "__end__": self._Node("__end__"),
+        }
+        edges = [
+            self._Edge("__start__", "agent"),
+            self._Edge("agent", "action", data="continue", conditional=True),
+            self._Edge("agent", "__end__", data="end", conditional=True),
+            self._Edge("action", "agent"),
+        ]
+        return self._Compiled(self._Drawable(nodes, edges))
+
+    def test_manifest_and_endpoint(self):
+        from hopsworks_agent_protocol import AgentApp
+
+        app = AgentApp(graph=self._langgraph_like())
+
+        @app.chat
+        async def chat(request):
+            return "ok"
+
+        client = TestClient(app)
+        manifest = client.get("/.well-known/hopsworks-agent.json").json()
+        assert manifest["capabilities"]["graph"] is True
+        assert manifest["endpoints"]["graph"] == "/v1/graph"
+
+        graph = client.get("/v1/graph").json()
+        assert {n["id"] for n in graph["nodes"]} == {
+            "__start__", "agent", "action", "__end__"
+        }
+        cont = next(e for e in graph["edges"] if e.get("label") == "continue")
+        assert cont["source"] == "agent" and cont["target"] == "action"
+        assert cont["conditional"] is True
+
+    def test_no_graph_capability_off(self):
+        app = build_basic_app()
+        m = TestClient(app).get("/.well-known/hopsworks-agent.json").json()
+        assert m["capabilities"]["graph"] is False
+        assert "graph" not in m["endpoints"]
+        assert TestClient(app).get("/v1/graph").status_code == 404
+
+    def test_accepts_plain_dict(self):
+        from hopsworks_agent_protocol import AgentApp
+        from hopsworks_agent_protocol.graph import to_graph_spec
+
+        spec = {"nodes": [{"id": "a", "label": "a"}], "edges": []}
+        assert to_graph_spec(spec) == spec
+        app = AgentApp(graph=spec)
+
+        @app.chat
+        async def chat(request):
+            return "ok"
+
+        assert TestClient(app).get("/v1/graph").json() == spec
+
+    def test_unreadable_graph_is_ignored(self):
+        from hopsworks_agent_protocol.graph import to_graph_spec
+
+        assert to_graph_spec(object()) is None
+        assert to_graph_spec(None) is None

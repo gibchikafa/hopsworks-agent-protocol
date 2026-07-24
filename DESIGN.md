@@ -104,5 +104,6 @@ Optional dependencies (OTel SDK, instrumentation packages, SQLAlchemy) are impor
 - **Publish** to internal PyPI or bake into the agent base image so `from hopsworks_agent_protocol import AgentApp` works without a git dependency.
 - **File upload/download** (`POST /v1/files`, `GET /v1/files/{id}`) — the upgrade path from inline base64 for large generated artifacts (reports, PDFs, audio). Needs a storage abstraction (HopsFS/dataset path or object store) and a manifest capability. Deferred as the largest of the reviewed suggestions.
 - **Panel-side tool-event rendering** — the SDK already emits `tool_event` frames; the chat panel needs to render retrieval/tool/code progress rows.
+- **Agent graph** (`graph=` + `GET /v1/graph`, `capabilities.graph`) — normalises a LangGraph/LlamaIndex/dict graph to `{nodes, edges}` for the panel's Graph tab (static topology). Live node/path highlighting is a phase 2 on the tool-event stream.
 - **Framework recipe cookbook** — LangGraph checkpointer + `conversation_id`, LlamaIndex chat engine, plain-Anthropic streaming — so authors copy the right integration for their framework.
 - **Richer trace correlation** — a typed `trace_id`/`span_id` field on `ChatResponse` rather than only `metadata`, once the evaluation join is designed.

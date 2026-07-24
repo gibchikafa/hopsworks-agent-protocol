@@ -192,6 +192,20 @@ otherwise), which the chat panel renders as progress chips.
   history the agent sees) and `DELETE /v1/conversations/{id}` (what a client's
   "new session" calls to also drop server-side memory).
 
+## Agent structure graph
+
+Expose the agent's structure and the chat panel shows a **Graph** tab. For a
+compiled LangGraph, pass it straight in:
+
+```python
+graph = build_graph()            # a compiled LangGraph
+agent_app = AgentApp(name="My agent", graph=graph)  # or graph=graph.get_graph()
+```
+
+The SDK serves `{nodes, edges}` at `GET /v1/graph` and advertises the `graph`
+capability. A LlamaIndex workflow or a plain `{"nodes", "edges"}` dict work
+too; an unreadable object is ignored (the tab just won't appear).
+
 ## Extra routes
 
 `AgentApp` is a `FastAPI` — add anything else the usual way:

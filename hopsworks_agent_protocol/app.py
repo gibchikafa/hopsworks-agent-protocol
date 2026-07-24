@@ -79,6 +79,7 @@ class AgentApp(FastAPI):
         tracing: bool | None = None,
         memory: ChatMemory | None = None,
         tool_events: bool = False,
+        graph: Any = None,
         allow_cors: bool = True,
         **fastapi_kwargs: Any,
     ):
@@ -95,6 +96,12 @@ class AgentApp(FastAPI):
         # default so existing manifests are unchanged
         self._tool_events = tool_events
         self._auto_tool_events = False
+
+        # optional agent structure graph (e.g. agent.get_graph() for a compiled
+        # LangGraph) served at /v1/graph for the chat panel's Graph tab
+        from .graph import to_graph_spec
+
+        self._graph_spec = to_graph_spec(graph)
 
         # framework: explicit arg > AGENT_FRAMEWORK env (platform-injected) >
         # 'custom'. Drives which OpenInference instrumentor tracing activates.
@@ -162,6 +169,8 @@ class AgentApp(FastAPI):
         if self.memory is not None:
             # server-managed history is available: clients can list/clear it
             endpoints["conversations"] = "/v1/conversations"
+        if self._graph_spec is not None:
+            endpoints["graph"] = "/v1/graph"
         return {
             "protocol": PROTOCOL,
             "protocol_version": PROTOCOL_VERSION,
@@ -182,6 +191,8 @@ class AgentApp(FastAPI):
                 "output_modalities": self._output_modalities,
                 "citations": False,
                 "tool_events": self._tool_events,
+                # a structure graph is available to visualize the agent
+                "graph": self._graph_spec is not None,
             },
             "ui": {
                 "welcome_message": self._welcome_message,
@@ -356,6 +367,12 @@ class AgentApp(FastAPI):
 
         if self.memory is not None:
             self._register_conversation_routes()
+
+        if self._graph_spec is not None:
+
+            @self.get("/v1/graph")
+            async def graph() -> dict[str, Any]:
+                return self._graph_spec
 
     def _register_conversation_routes(self) -> None:
         @self.get("/v1/conversations/{conversation_id}/messages")
