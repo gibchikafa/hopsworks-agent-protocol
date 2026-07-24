@@ -604,3 +604,58 @@ class TestToolEvents:
         assert response["metadata"]["tool_events"] == [
             {"name": "tool", "status": "done"}
         ]
+
+
+class TestAutoToolEvents:
+    def test_span_processor_emits_from_tool_span(self):
+        # simulate the OTel span processor path directly: a HandlerContext with
+        # a queue receives running/done events keyed by span id
+        import asyncio
+
+        from hopsworks_agent_protocol.autoevents import current_context
+        from hopsworks_agent_protocol.context import HandlerContext
+        from hopsworks_agent_protocol.models import ChatMessage, ChatRequest, TextContent
+
+        async def run():
+            req = ChatRequest(
+                conversation_id="c1",
+                message=ChatMessage(role="user", content=[TextContent(text="hi")]),
+            )
+            ctx = HandlerContext(req, None, "langgraph", "response_1")
+            q: asyncio.Queue = asyncio.Queue()
+            ctx._event_queue = q
+            ctx._loop = asyncio.get_running_loop()
+            token = current_context.set(ctx)
+            try:
+                # _emit_sync is what the span processor calls
+                ctx._emit_sync("search_papers", "running", None, None, "span-abc")
+                ctx._emit_sync("search_papers", "done", None, None, "span-abc")
+            finally:
+                current_context.reset(token)
+            await asyncio.sleep(0)  # let call_soon_threadsafe run
+            events = []
+            while not q.empty():
+                events.append(q.get_nowait())
+            return events
+
+        events = asyncio.run(run())
+        assert events[0] == ("tool_event", {"name": "search_papers", "status": "running", "id": "span-abc"})
+        assert events[1] == ("tool_event", {"name": "search_papers", "status": "done", "id": "span-abc"})
+
+    def test_emit_event_id_collapses(self):
+        from hopsworks_agent_protocol import AgentApp
+
+        app = AgentApp(tool_events=True)
+
+        @app.stream
+        async def stream(request, ctx):
+            await ctx.emit_event("t", status="running", event_id="e1")
+            yield "x"
+            await ctx.emit_event("t", status="done", event_id="e1")
+
+        events = parse_sse(
+            TestClient(app).post("/v1/chat/stream", json=make_request("q")).text
+        )
+        tool_events = [e[1] for e in events if e[0] == "tool_event"]
+        assert tool_events[0] == {"name": "t", "status": "running", "id": "e1"}
+        assert tool_events[1] == {"name": "t", "status": "done", "id": "e1"}

@@ -158,11 +158,19 @@ async def chat(request, ctx):
 
 ## Progress (tool) events
 
-With `AgentApp(tool_events=True)`, `ctx.emit_event(name, status, message, data)`
-surfaces intermediate work. While streaming it is sent immediately as a
-`tool_event` SSE frame interleaved with the reply; otherwise it is buffered into
-the response `metadata`. The manifest advertises `tool_events` so the chat panel
-can render retrieval / tool-call / code-execution progress.
+With `AgentApp(tool_events=True)`, tool calls surface as `tool_event` SSE frames
+(interleaved with the reply while streaming; buffered into response `metadata`
+otherwise), which the chat panel renders as progress chips.
+
+- **Automatic** — when tracing is active, the SDK taps the framework
+  instrumentation it already runs (LangChain/LangGraph, LlamaIndex) and emits a
+  `running`/`done` event per tool span, keyed by span id. Zero code in the
+  agent. (Requires the framework to propagate context into worker threads;
+  LangChain does. Frameworks that don't will not auto-emit — use manual events
+  or the trace view.)
+- **Manual** — `await ctx.emit_event(name, status, message, data, event_id)`
+  for custom progress; pass the same `event_id` for a call's start and end so
+  the client shows one updating chip.
 
 ## Operational endpoints
 

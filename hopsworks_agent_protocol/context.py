@@ -43,6 +43,7 @@ class HandlerContext:
         # emit plumbing, wired by the route: a queue while streaming, else a
         # buffer surfaced in the response metadata
         self._event_queue: asyncio.Queue[Any] | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._event_buffer: list[dict[str, Any]] = []
 
     @property
@@ -59,19 +60,50 @@ class HandlerContext:
         status: str = "running",
         message: str | None = None,
         data: dict[str, Any] | None = None,
+        event_id: str | None = None,
     ) -> None:
         """Surface an intermediate progress event (a tool call, a retrieval, a
         code run). While streaming it is sent immediately as a ``tool_event``
         SSE frame; otherwise it is buffered into the response metadata.
 
-        No-op unless the agent enabled ``tool_events`` on the app.
+        ``event_id`` ties a ``running`` event to its later ``done``/``failed``
+        so a client renders one chip that updates rather than several. Pass the
+        same id for the start and end of one call (the SDK's auto-emit uses the
+        span id); omit it and each event stands alone.
         """
+        self._emit_sync(name, status, message, data, event_id)
+
+    def _emit_sync(
+        self,
+        name: str,
+        status: str,
+        message: str | None,
+        data: dict[str, Any] | None,
+        event_id: str | None,
+    ) -> None:
+        """Non-async emit used by both ``emit_event`` and the auto-emit span
+        processor (which runs in sync OTel callbacks, possibly off-thread)."""
         payload: dict[str, Any] = {"name": name, "status": status}
+        if event_id is not None:
+            payload["id"] = event_id
         if message is not None:
             payload["message"] = message
         if data is not None:
             payload["data"] = data
-        if self._event_queue is not None:
-            await self._event_queue.put(("tool_event", payload))
-        else:
+        queue = self._event_queue
+        loop = self._loop
+        if queue is None or loop is None:
             self._event_buffer.append(payload)
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            # already on the request's event loop (handler called emit_event):
+            # enqueue directly so ordering vs. yielded deltas is preserved
+            queue.put_nowait(("tool_event", payload))
+        else:
+            # off-thread (a framework tool running in a threadpool): hop back
+            # onto the loop safely
+            loop.call_soon_threadsafe(queue.put_nowait, ("tool_event", payload))

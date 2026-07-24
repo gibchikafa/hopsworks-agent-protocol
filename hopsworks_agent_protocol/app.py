@@ -94,6 +94,7 @@ class AgentApp(FastAPI):
         # advertise tool_event SSE frames (emitted via ctx.emit_event); off by
         # default so existing manifests are unchanged
         self._tool_events = tool_events
+        self._auto_tool_events = False
 
         # framework: explicit arg > AGENT_FRAMEWORK env (platform-injected) >
         # 'custom'. Drives which OpenInference instrumentor tracing activates.
@@ -109,6 +110,13 @@ class AgentApp(FastAPI):
         self.memory = memory
         self._chat_handler: ChatHandler | None = None
         self._stream_handler: StreamHandler | None = None
+
+        # when tool events are on and tracing is active, auto-emit tool events
+        # from the framework's spans so tool calls show up with zero agent code
+        if self._tool_events and self.tracer_provider is not None:
+            from .autoevents import install_auto_tool_events
+
+            self._auto_tool_events = install_auto_tool_events(self.tracer_provider)
 
         if allow_cors:
             self.add_middleware(
@@ -277,23 +285,29 @@ class AgentApp(FastAPI):
         return self._stream_handler(ctx.request)
 
     async def _run_chat(self, ctx: HandlerContext) -> ChatResponse:
-        if self._chat_handler is not None:
-            if _wants_context(self._chat_handler):
-                result = self._chat_handler(ctx.request, ctx)
-            else:
-                result = self._chat_handler(ctx.request)
-            if inspect.isawaitable(result):
-                result = await result
-            return self._finalize(result, ctx)
-        # collect the stream into a single response
-        chunks: list[str] = []
-        final: ChatResponse | None = None
-        async for item in self._invoke_stream(ctx):
-            if isinstance(item, ChatResponse):
-                final = item
-            else:
-                chunks.append(item)
-        return self._merge_stream_result(chunks, final, ctx)
+        from .autoevents import current_context
+
+        token = current_context.set(ctx)
+        try:
+            if self._chat_handler is not None:
+                if _wants_context(self._chat_handler):
+                    result = self._chat_handler(ctx.request, ctx)
+                else:
+                    result = self._chat_handler(ctx.request)
+                if inspect.isawaitable(result):
+                    result = await result
+                return self._finalize(result, ctx)
+            # collect the stream into a single response
+            chunks: list[str] = []
+            final: ChatResponse | None = None
+            async for item in self._invoke_stream(ctx):
+                if isinstance(item, ChatResponse):
+                    final = item
+                else:
+                    chunks.append(item)
+            return self._merge_stream_result(chunks, final, ctx)
+        finally:
+            current_context.reset(token)
 
     def _register_routes(self) -> None:
         @self.get("/.well-known/hopsworks-agent.json")
@@ -376,10 +390,14 @@ class AgentApp(FastAPI):
 
         # Run the handler as a task that feeds a queue, so ctx.emit_event
         # (tool_event frames) interleaves with the handler's own yields.
+        from .autoevents import current_context
+
         queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
         ctx._event_queue = queue
+        ctx._loop = asyncio.get_running_loop()
 
         async def pump() -> None:
+            token = current_context.set(ctx)
             try:
                 async for item in self._invoke_stream(ctx):
                     await queue.put(("item", item))
@@ -393,6 +411,7 @@ class AgentApp(FastAPI):
                     )
                 )
             finally:
+                current_context.reset(token)
                 await queue.put(("done", None))
 
         task = asyncio.create_task(pump())
