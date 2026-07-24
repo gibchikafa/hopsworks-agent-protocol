@@ -789,3 +789,55 @@ class TestGraph:
 
         assert to_graph_spec(object()) is None
         assert to_graph_spec(None) is None
+
+
+class TestStreamLlamaindexHelper:
+    def _handler(self):
+        # duck-typed llama-index workflow events
+        AgentStream = type("AgentStream", (), {})
+        ToolCall = type("ToolCall", (), {})
+        ToolCallResult = type("ToolCallResult", (), {})
+
+        def ev(cls, **attrs):
+            e = cls()
+            for k, v in attrs.items():
+                setattr(e, k, v)
+            return e
+
+        events = [
+            ev(AgentStream, delta="Let me search "),
+            ev(ToolCall, tool_name="search_papers", tool_id="t1",
+               tool_kwargs={"query": "CoT"}),
+            ev(ToolCallResult, tool_name="search_papers", tool_id="t1"),
+            ev(AgentStream, delta="done."),
+        ]
+
+        class Handler:
+            async def stream_events(self):
+                for e in events:
+                    yield e
+
+        return Handler()
+
+    def test_yields_text_and_emits_tool_events(self):
+        from hopsworks_agent_protocol import AgentApp
+
+        app = AgentApp(tool_events=True)
+        helper = self
+
+        @app.stream
+        async def stream(request, ctx):
+            async for delta in ctx.stream_llamaindex(helper._handler()):
+                yield delta
+
+        events = parse_sse(
+            TestClient(app).post("/v1/chat/stream", json=make_request("q")).text
+        )
+        deltas = [e[1]["delta"]["text"] for e in events if e[0] == "message.delta"]
+        tools = [e[1] for e in events if e[0] == "tool_event"]
+        assert "".join(deltas) == "Let me search done."
+        assert tools == [
+            {"name": "search_papers", "status": "running", "id": "t1",
+             "message": "{'query': 'CoT'}"},
+            {"name": "search_papers", "status": "done", "id": "t1"},
+        ]

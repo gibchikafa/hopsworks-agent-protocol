@@ -182,6 +182,16 @@ otherwise), which the chat panel renders as progress chips.
       async for delta in ctx.stream_langchain(agent.astream_events(inputs, version="v2")):
           yield delta
   ```
+- **LlamaIndex helper** — `ctx.stream_llamaindex(handler)` does the same for a
+  LlamaIndex workflow agent's run handler (`AgentStream` deltas + `ToolCall` /
+  `ToolCallResult` chips):
+
+  ```python
+  @agent_app.stream
+  async def stream(request, ctx):
+      async for delta in ctx.stream_llamaindex(agent.run(msg)):
+          yield delta
+  ```
 
 ## Operational endpoints
 

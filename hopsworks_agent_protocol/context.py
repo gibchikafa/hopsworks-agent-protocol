@@ -145,6 +145,39 @@ class HandlerContext:
                     event_id=event.get("run_id"),
                 )
 
+    async def stream_llamaindex(self, handler: Any) -> AsyncIterator[str]:
+        """Pipe a LlamaIndex workflow agent run through, yielding assistant
+        text deltas and turning tool calls into ``tool_event`` chips:
+
+            handler = agent.run(msg)          # a WorkflowHandler
+            async for delta in ctx.stream_llamaindex(handler):
+                yield delta
+
+        Duck-typed on the workflow event class names (``AgentStream`` →
+        deltas, ``ToolCall`` / ``ToolCallResult`` → running / done, keyed by
+        ``tool_id``) so it works across LlamaIndex versions.
+        """
+        async for event in handler.stream_events():
+            cls = type(event).__name__
+            if cls == "AgentStream":
+                delta = getattr(event, "delta", None)
+                if isinstance(delta, str) and delta:
+                    yield delta
+            elif cls == "ToolCall":
+                kwargs = getattr(event, "tool_kwargs", None)
+                await self.emit_event(
+                    getattr(event, "tool_name", "tool"),
+                    status="running",
+                    message=str(kwargs) if kwargs else None,
+                    event_id=getattr(event, "tool_id", None),
+                )
+            elif cls == "ToolCallResult":
+                await self.emit_event(
+                    getattr(event, "tool_name", "tool"),
+                    status="done",
+                    event_id=getattr(event, "tool_id", None),
+                )
+
     def _dispatch(self, payload: dict[str, Any]) -> None:
         queue = self._event_queue
         loop = self._loop
