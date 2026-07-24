@@ -213,8 +213,11 @@ agent_app = AgentApp(name="My agent", graph=graph)  # or graph=graph.get_graph()
 ```
 
 The SDK serves `{nodes, edges}` at `GET /v1/graph` and advertises the `graph`
-capability. A LlamaIndex workflow or a plain `{"nodes", "edges"}` dict work
-too; an unreadable object is ignored (the tab just won't appear).
+capability. A **LlamaIndex `Workflow`** works too — its graph is derived from
+the `@step` methods' consumed/produced event types (event nodes collapsed into
+labeled edges, `StartEvent`/`StopEvent` → `__start__`/`__end__`), so a custom
+workflow renders as cleanly as a LangGraph. A plain `{"nodes", "edges"}` dict
+works as well; an unreadable object is ignored (the tab just won't appear).
 
 ## Extra routes
 

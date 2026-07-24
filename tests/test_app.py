@@ -841,3 +841,77 @@ class TestStreamLlamaindexHelper:
              "message": "{'query': 'CoT'}"},
             {"name": "search_papers", "status": "done", "id": "t1"},
         ]
+
+
+class TestLlamaIndexWorkflowGraph:
+    def _workflow(self):
+        # duck-typed LlamaIndex Workflow: _get_steps() -> {name: fn with __step_config}
+        Start = type("StartEvent", (), {})
+        Stop = type("StopEvent", (), {})
+        Search = type("SearchEvent", (), {})
+        Answer = type("AnswerEvent", (), {})
+
+        def step(fn, accepted, returns):
+            cfg = type("Cfg", (), {})()
+            cfg.accepted_events = accepted
+            cfg.return_types = returns
+            setattr(fn, "__step_config", cfg)
+            return fn
+
+        def plan():
+            pass
+
+        def search():
+            pass
+
+        def answer():
+            pass
+
+        step(plan, [Start], [Search, Stop])   # branches: search or stop
+        step(search, [Search], [Answer])
+        step(answer, [Answer], [Stop])
+
+        class WF:
+            def _get_steps(self):
+                return {"plan": plan, "search": search, "answer": answer}
+
+        return WF()
+
+    def test_workflow_graph_from_steps(self):
+        from hopsworks_agent_protocol.graph import to_graph_spec
+
+        spec = to_graph_spec(self._workflow())
+        assert spec is not None
+        ids = {n["id"] for n in spec["nodes"]}
+        assert ids == {"plan", "search", "answer", "__start__", "__end__"}
+        edges = {(e["source"], e["target"]) for e in spec["edges"]}
+        assert ("__start__", "plan") in edges
+        assert ("plan", "search") in edges       # via SearchEvent
+        assert ("search", "answer") in edges     # via AnswerEvent
+        assert ("answer", "__end__") in edges     # via StopEvent
+        assert ("plan", "__end__") in edges       # plan can also stop
+        # plan branches (SearchEvent | StopEvent) -> conditional edges
+        plan_search = next(
+            e for e in spec["edges"]
+            if e["source"] == "plan" and e["target"] == "search"
+        )
+        assert plan_search["conditional"] is True
+        assert plan_search["label"] == "SearchEvent"
+
+    def test_served_via_agentapp(self):
+        from hopsworks_agent_protocol import AgentApp
+
+        app = AgentApp(graph=self._workflow())
+
+        @app.chat
+        async def chat(request):
+            return "ok"
+
+        client = TestClient(app)
+        assert (
+            client.get("/.well-known/hopsworks-agent.json").json()["capabilities"][
+                "graph"
+            ]
+            is True
+        )
+        assert "plan" in {n["id"] for n in client.get("/v1/graph").json()["nodes"]}
