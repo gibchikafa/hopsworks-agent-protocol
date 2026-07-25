@@ -22,6 +22,9 @@ Everything else — HTTP surface, session identity, tracing, memory, CORS, the m
 models.py    protocol Pydantic models + AgentResponse/AgentError helpers
 app.py       AgentApp (FastAPI subclass): routes, handler decorators, streaming
 memory.py    ChatMemory abstraction + InMemory/Sql backends + MySQL URL resolver
+tools.py     model-callable remember/recall/forget/search + framework wrapping
+summarizers.py  anthropic_summarizer + the default local embedder
+vectorstore.py  embedding feature group behind a VectorStore seam
 tracing.py   env-gated OTel setup + per-framework OpenInference instrumentation
 ```
 
@@ -52,7 +55,7 @@ The SDK is precisely the thing that decouples them: any framework in, one wire p
 
 ### 3a. Optional handler context
 
-Handlers may declare a second parameter (`def chat(request, ctx)`); the SDK inspects the signature and injects a `HandlerContext` only when present, so the one-arg form keeps working. The context bundles per-turn conveniences (`conversation_id`, `history` from memory, `memory`, `logger`, `deployment_id`, `framework`, correlation ids) and `emit_event`. This adds ergonomics without a new wire protocol — the context is a server-side object, not part of the contract.
+Handlers may declare a second parameter (`def chat(request, ctx)`); the SDK inspects the signature and injects a `HandlerContext` only when present, so the one-arg form keeps working. The context bundles per-turn conveniences (`conversation_id`, `history`/`summary`/`state()`/`system_context()` from memory, `memory`, `logger`, `deployment_id`, `framework`, `subject`, correlation ids) and `emit_event`. This adds ergonomics without a new wire protocol — the context is a server-side object, not part of the contract.
 
 `ctx.emit_event(name, status, message, data, event_id)` surfaces intermediate progress (retrieval, tool calls, code runs). While streaming it is interleaved as a `tool_event` SSE frame via a queue the streaming route drains alongside the handler's own yields (the handler runs as a task so `await ctx.emit_event(...)` and `yield delta` compose); otherwise it buffers into the response metadata. `event_id` ties a `running` event to its `done`/`failed` so the client renders one updating chip. Gated by `AgentApp(tool_events=True)`.
 
@@ -60,13 +63,21 @@ Handlers may declare a second parameter (`def chat(request, ctx)`); the SDK insp
 
 ### 3b. Operational surface
 
-`/health` stays a bare liveness probe. `/ready` reports operational readiness — a handler is registered and the configured memory backend is reachable (`ChatMemory.healthcheck()`) — returning `503` with per-check detail otherwise, so "running but not chat-ready" is distinguishable. When memory is configured, `GET /v1/conversations/{id}/messages` and `DELETE /v1/conversations/{id}` let clients inspect the history the agent sees and drop server-side memory (the review noted that "new session" otherwise left SQL memory behind). Both are registered only when memory exists and advertised via `capabilities.conversation_management`.
+`/health` stays a bare liveness probe. `/ready` reports operational readiness — a handler is registered and the configured memory backend is reachable (`ChatMemory.healthcheck()`) — returning `503` with per-check detail otherwise, so "running but not chat-ready" is distinguishable. When memory is configured, `GET /v1/conversations/{id}/messages` and `DELETE /v1/conversations/{id}` let clients read the human-facing transcript (deliberately *not* the agent's window — folded turns stay, with `summary`/`summarized_through` marking the divergence) and drop server-side memory (the review noted that "new session" otherwise left SQL memory behind). Both are registered only when memory exists and advertised via `capabilities.conversation_management`.
 
 ### 3c. Correlation, not evaluation
 
 The SDK guarantees stable `response_id` / `message_id` (generated up front so `ctx.response_id` matches the response the client receives) and, when tracing is active, stamps `conversation_id` / `response_id` / `message_id` / `deployment_id` / framework on the current span and surfaces `trace_id` in the response metadata. This makes it *possible* for a separate evaluation system to join chat turns, feedback, and traces — but feedback/ratings/scores are deliberately **not** in the SDK (see non-goals). The SDK's job ends at emitting correlatable ids.
 
-### 4. Conversation memory is opt-in, keyed by `conversation_id`
+### 4. Memory is opt-in, keyed by `conversation_id`, and tiered
+
+Three tiers behind one store: the conversation buffer, a rolling summary that
+compacts old turns instead of dropping them, and durable per-subject state the
+agent writes through model-callable tools. Full rationale — the turn lifecycle,
+the three-phase fold and why the summarizer cannot run inside the transaction,
+retention split by row type, and why the `app` scope is not model-writable —
+lives in `~/Work/hopsworks-agent-memory-design.md`.
+
 
 The protocol makes history server-side (clients send only the new message + a `conversation_id`), so the SDK can own storage. `ChatMemory` has two backends: `InMemoryChatMemory` (dev — documented as unfit for production since deployments scale to zero and replicas don't share it) and `PersistentAgentMemory` (any SQLAlchemy URL; zero-config inside a deployment, resolving the project MySQL from injected `MYSQL_*` env vars + the password secret, table name from `DEPLOYMENT_ID`).
 
@@ -88,7 +99,7 @@ Optional dependencies (OTel SDK, instrumentation packages, SQLAlchemy) are impor
 ## Versioning & packaging
 
 - Package version tracks capability additions; protocol version (`protocol_version` in the manifest, currently `1.1`) tracks the wire contract and evolves additively — clients accept any `1.x` and ignore unknown fields.
-- Optional extras keep the base install thin: `[tracing]`, `[langgraph]`, `[llamaindex]`, `[memory-sql]`. Base install is FastAPI + Pydantic only.
+- Optional extras keep the base install thin: `[tracing]`, `[langgraph]`, `[llamaindex]`, `[memory-sql]`, `[memory-search]`. Base install is FastAPI + Pydantic only.
 - Distributed as a git dependency today (`hopsworks-agent-protocol @ git+...`); the intended path is an internal PyPI publish or vendoring into the agent base image so `from hopsworks_agent_protocol import AgentApp` works out of the box in every deployment.
 
 ## Non-goals (deliberate)

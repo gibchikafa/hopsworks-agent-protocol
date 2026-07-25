@@ -105,39 +105,112 @@ agent_app = AgentApp(name="My agent", framework="langgraph")  # or "llamaindex" 
 - `tracing=False` opts out; `tracing=True` warns if the deployment has no tracing endpoint
 - Missing instrumentation packages never crash the agent — it runs untraced with a warning
 
-## Conversation memory
+## Memory
 
-The protocol keeps history server-side (`conversation_id`); the library can
-store it for you. Pass a memory store and turns are recorded automatically
-after each successful exchange; read history in the handler — it comes back
-as `{"role", "content"}` dicts that LangChain/LangGraph/LlamaIndex accept:
+The protocol keeps history server-side (`conversation_id`), so the SDK can own
+storage. One store, three tiers — each opt-in, all served by the same object:
 
 ```python
-from hopsworks_agent_protocol import AgentApp, PersistentAgentMemory
+from hopsworks_agent_protocol import (
+    AgentApp, PersistentAgentMemory, anthropic_summarizer,
+)
 
 agent_app = AgentApp(
     name="My agent",
-    memory=PersistentAgentMemory(),  # zero-config in a deployment; or InMemoryChatMemory()
+    memory=PersistentAgentMemory(          # zero-config in a deployment
+        summarize=anthropic_summarizer(),  # tier 2
+        long_term=True,                    # tier 3
+    ),
 )
+```
 
+| Tier | Holds | Turn on with |
+|---|---|---|
+| 1. Conversation buffer | this conversation's turns | `memory=` alone |
+| 2. Rolling summary | older turns, compacted instead of dropped | `summarize=` |
+| 3. Durable memory | facts about the user, across conversations | `long_term=True` |
+
+### Reading it in a handler
+
+```python
 @agent_app.chat
-async def chat(request):
-    history = agent_app.memory.get(request.conversation_id)
+async def chat(request, ctx):
+    system = MY_PROMPT + ctx.system_context()   # summary + what you know
+    messages = ctx.history + [{"role": "user", "content": request.text}]
     ...
 ```
 
+> **`ctx.history` stops meaning "the conversation" once tier 2 is on.** It is
+> the turns *since the last fold*; everything older is in `ctx.summary`. Passing
+> `ctx.history` alone silently drops the compacted part.
+> `ctx.system_context()` assembles the summary and this user's stored facts into
+> a block for your system prompt, and returns `""` when there is nothing yet, so
+> it is safe to concatenate unconditionally. The SDK builds it every turn but
+> never places it — where context belongs is a property of your prompt.
+
+Summarizing runs *after* the response has streamed and is awaited before the
+route returns, so it costs request duration every Nth turn and never
+time-to-answer. `summarize` is any callable
+`(previous_summary, turns) -> str`, sync or async — `anthropic_summarizer()` is
+a convenience, not a requirement.
+
+### Agent-callable memory tools
+
+Tier 3 adds `remember` / `recall` / `forget` / `search`, which the agent's own
+LLM calls when it decides to — so there is no extraction model in the SDK
+guessing what is worth keeping. Register them in your agent's tool list; the SDK
+cannot reach into an arbitrary framework's tools, and appending to yours behind
+your back would be worse than asking:
+
+```python
+from hopsworks_agent_protocol import memory_tools
+
+agent = create_react_agent(llm, [*my_tools, *memory_tools("langgraph")])
+# or memory_tools("llamaindex") -> [FunctionTool]; memory_tools("plain") -> bare functions
+```
+
+They take no store or user argument — those resolve from the request context, so
+the signature the model sees carries no plumbing.
+
+`search` looks over the user's own past conversations. It works as soon as tier 3
+is on, using keyword matching; add an `embedder` and a `vector_store` to upgrade
+it to semantic search over a Hopsworks embedding feature group, with no prompt
+change:
+
+```python
+from hopsworks_agent_protocol import sentence_transformer_embedder, vector_store_for
+
+embedder = sentence_transformer_embedder()          # [memory-search] extra
+PersistentAgentMemory(long_term=True, embedder=embedder,
+                      vector_store=vector_store_for(embedder))
+```
+
+### Backends and behaviour
+
 - `InMemoryChatMemory()` — zero-config for development. Lost on restart and
   per-replica; agent deployments can scale to zero, so not for production.
+  Tiers 2 and 3 are no-ops on it.
 - `PersistentAgentMemory()` — inside a Hopsworks agent deployment this is
   zero-config: the project MySQL URL is built from the platform-injected
   `MYSQL_*` env vars (password via the `MYSQL_PASSWORD_SECRET_NAME` secret)
-  and the table name is derived from `DEPLOYMENT_ID`. Outside a deployment
-  pass any SQLAlchemy URL (`[memory-sql]` extra). Survives restarts, shared
-  across replicas.
+  and table names are derived from `DEPLOYMENT_ID`. Outside a deployment pass
+  any SQLAlchemy URL (`[memory-sql]` extra). Survives restarts, shared across
+  replicas.
+- **A turn is recorded as it happens, not after it succeeds.** The user message
+  is written when the turn opens — that is what lets a handler read back the
+  message it is answering, and lets anything the agent remembers point at the
+  turn that caused it. An open turn is invisible to `ctx.history` until it
+  closes, and a turn that fails (handler error, client disconnect) is marked
+  *abandoned* rather than left as a question whose answer never arrived.
 - Memory failures never break the chat — they log and the reply still goes out.
 - **If your framework persists state itself** (LangGraph checkpointer,
   LlamaIndex chat store), key it by `conversation_id` and skip `memory=` —
   keep one source of truth for history.
+- **`subject` is client-asserted.** Tier 3 keys durable memory by
+  `ChatRequest.subject`; the ingress authenticates a project-wide serving key,
+  not a person, so the agent cannot verify it. Without one it falls back to the
+  conversation id (memory degrades to per-conversation durability). Fine between
+  project members; not a security boundary.
 
 ## Handler context (optional)
 
@@ -147,14 +220,16 @@ conveniences — `def chat(request)` and `def chat(request, ctx)` both work:
 ```python
 @agent_app.chat
 async def chat(request, ctx):
-    history = ctx.history                       # from configured memory
+    history = ctx.history                       # turns since the last fold
     ctx.logger.info("turn for %s", ctx.conversation_id)
     await ctx.emit_event("retrieve", status="running", message="searching")
     ...
 ```
 
-`ctx` exposes `conversation_id`, `request`, `history`, `memory`, `logger`,
-`deployment_id`, `framework`, `response_id`/`message_id`, and `emit_event`.
+`ctx` exposes `conversation_id`, `request`, `memory`, `logger`, `deployment_id`,
+`framework`, `response_id`/`message_id`/`turn_id`, and `emit_event`, plus the
+memory accessors: `history`, `summary`, `state(scope=...)`, `system_context()`,
+and `subject` (see [Memory](#memory)).
 
 ## Progress (tool) events
 
@@ -198,9 +273,20 @@ otherwise), which the chat panel renders as progress chips.
 - `GET /health` — liveness (process up).
 - `GET /ready` — readiness: a handler is registered and the memory backend (if
   configured) is reachable; `503` otherwise, with per-check detail.
-- With memory configured, `GET /v1/conversations/{id}/messages` (inspect the
-  history the agent sees) and `DELETE /v1/conversations/{id}` (what a client's
-  "new session" calls to also drop server-side memory).
+- With memory configured:
+  - `GET /v1/conversations/{id}/messages` — the **human-facing transcript**,
+    which is deliberately not what the model sees: once turns are folded they
+    leave `ctx.history` but stay here, with `summary` and `summarized_through`
+    marking where the two diverge. `?include=events` adds tool/event rows and
+    abandoned turns.
+  - `DELETE /v1/conversations/{id}` — what a client's "new session" calls to
+    also drop server-side memory. Clears the conversation and its
+    session-scoped state; leaves durable per-user memory alone, because
+    starting a new chat must not erase what the agent knows about the person.
+- With `long_term=True`, `GET`/`DELETE /v1/subjects/{subject}/state` let a user
+  see every durable value held about them — with its provenance and whether the
+  agent or an operator wrote it — and delete any of them. Caps and TTLs bound a
+  false memory; being able to see and delete it is what fixes it.
 
 ## Agent structure graph
 
@@ -235,3 +321,6 @@ def custom():
 pip install -e '.[dev]'
 pytest
 ```
+
+Optional extras keep the base install thin (FastAPI + Pydantic only):
+`[tracing]`, `[langgraph]`, `[llamaindex]`, `[memory-sql]`, `[memory-search]`.
