@@ -36,7 +36,7 @@ from .models import (
     new_conversation_id,
     new_response_id,
 )
-from .memory import ChatMemory
+from .memory import TURN_ABANDONED, TURN_CLOSED, ChatMemory
 from .tracing import resolve_framework, setup_tracing
 
 ChatHandler = Callable[..., Awaitable[ChatResponse | str] | ChatResponse | str]
@@ -110,10 +110,11 @@ class AgentApp(FastAPI):
         # env var (set iff tracing is enabled on the deployment)
         self.tracer_provider = setup_tracing(self.framework, enabled=tracing)
 
-        # optional conversation memory: turns are recorded automatically after
-        # each successful exchange; handlers read history with
-        # self.memory.get(request.conversation_id). Skip it if your framework
-        # persists state itself (e.g. a LangGraph checkpointer).
+        # optional conversation memory: the user message is recorded when the
+        # turn opens and the reply when it closes, so a failed turn is marked
+        # abandoned rather than leaving a question with no answer. Handlers read
+        # history with self.memory.get(request.conversation_id). Skip it if your
+        # framework persists state itself (e.g. a LangGraph checkpointer).
         self.memory = memory
         self._chat_handler: ChatHandler | None = None
         self._stream_handler: StreamHandler | None = None
@@ -159,7 +160,39 @@ class AgentApp(FastAPI):
         self._stream_handler = handler
         return handler
 
+    def memory_tools(self, framework: str | None = None) -> list[Any]:
+        """Framework-native ``remember`` / ``recall`` / ``forget`` tools.
+
+        Add them to your agent's tool list yourself — the SDK cannot reach into
+        an arbitrary framework's tools, and appending to them behind your back
+        would be worse than asking::
+
+            agent = create_react_agent(llm, [*tools, *app.memory_tools()])
+
+        Defaults to the app's detected framework.
+        """
+        from .tools import memory_tools as _memory_tools
+
+        return _memory_tools(framework or self.framework)
+
     # ── internals ─────────────────────────────────────────────────────────
+
+    def _memory_capabilities(self) -> dict[str, bool]:
+        """Which memory tiers this agent actually has, so the panel can light up
+        the right inspector views instead of guessing."""
+        if self.memory is None:
+            return {
+                "conversation_history": False,
+                "summary": False,
+                "state": False,
+                "search": False,
+            }
+        return {
+            "conversation_history": True,
+            "summary": getattr(self.memory, "_summarize", None) is not None,
+            "state": bool(getattr(self.memory, "_long_term", False)),
+            "search": False,  # phase 3
+        }
 
     def _manifest(self) -> dict[str, Any]:
         streaming = self._stream_handler is not None
@@ -183,7 +216,11 @@ class AgentApp(FastAPI):
             "endpoints": endpoints,
             "capabilities": {
                 "streaming": streaming,
-                "conversation_history": True,
+                # protocol-level statement that history is server-side. The
+                # per-tier detail is under "memory" below; this was previously
+                # hardcoded True even with no store configured, which was wrong.
+                "conversation_history": self.memory is not None,
+                "memory": self._memory_capabilities(),
                 # server-side history is inspectable/clearable via the endpoints
                 "conversation_management": self.memory is not None,
                 "attachments": any(m != "text" for m in self._input_modalities),
@@ -202,30 +239,6 @@ class AgentApp(FastAPI):
             },
         }
 
-    def _record_turn(self, request: ChatRequest, response: ChatResponse) -> None:
-        """Auto-record the exchange when a memory store is configured."""
-        if self.memory is None or response.status != "completed":
-            return
-        conversation_id = response.conversation_id or request.conversation_id
-        if not conversation_id:
-            return
-        try:
-            if request.text:
-                self.memory.append(conversation_id, "user", request.text)
-            answer = "".join(
-                part.text
-                for part in response.message.content
-                if part.type == "text"
-            )
-            if answer:
-                self.memory.append(conversation_id, "assistant", answer)
-        except Exception:  # noqa: BLE001 — memory failures must not break chat
-            import logging
-
-            logging.getLogger(__name__).exception(
-                "Failed to record conversation turn"
-            )
-
     def _prepare(self, request: ChatRequest) -> HandlerContext:
         # handlers can always rely on conversation_id being present
         if not request.conversation_id:
@@ -234,6 +247,8 @@ class AgentApp(FastAPI):
             from .models import new_message_id
 
             request.message.id = new_message_id()
+        from .memory import new_turn_id
+
         # the response id is generated up front so ctx.response_id matches the
         # id on the response the client ultimately receives (correlation)
         return HandlerContext(
@@ -241,7 +256,97 @@ class AgentApp(FastAPI):
             memory=self.memory,
             framework=self.framework,
             response_id=new_response_id(),
+            turn_id=new_turn_id(),
+            subject=getattr(request, "subject", None),
         )
+
+    async def _open_turn(self, ctx: HandlerContext) -> None:
+        """Record the user message and open the turn, before the handler runs.
+
+        Writing it up front is what lets a handler read back the message it is
+        answering, and (from Phase 2) lets anything the agent remembers point at
+        the turn that caused it. The row is invisible to ``get()`` until the
+        turn closes, so an in-flight turn never shows up as a question with no
+        answer.
+        """
+        if self.memory is None or not ctx.request.text:
+            return
+        try:
+            await asyncio.to_thread(
+                self.memory.begin_turn,
+                ctx.conversation_id,
+                ctx.turn_id,
+                "user",
+                ctx.request.text,
+                message_id=ctx.message_id,
+                subject=ctx.subject,
+            )
+            ctx._turn_open = True
+        except Exception:  # noqa: BLE001 — memory must never break a turn
+            import logging
+
+            logging.getLogger(__name__).exception("Failed to open memory turn")
+
+    async def _finalize_turn(
+        self, ctx: HandlerContext, response: ChatResponse | None
+    ) -> None:
+        """Close the turn. Must run on every exit path, including failures.
+
+        The pre-inserted user message makes this obligatory rather than
+        housekeeping: skip it and the store keeps a question whose answer never
+        arrived, which then reappears as history on the next turn.
+        """
+        if self.memory is None or not ctx._turn_open:
+            return
+        ctx._turn_open = False
+        try:
+            completed = response is not None and response.status == "completed"
+            if completed:
+                await asyncio.to_thread(self._write_turn_items, ctx, response)
+            await asyncio.to_thread(
+                self.memory.end_turn,
+                ctx.conversation_id,
+                ctx.turn_id,
+                status=TURN_CLOSED if completed else TURN_ABANDONED,
+            )
+            # After the last token: summarizing costs request duration every
+            # Nth turn, never time-to-answer.
+            if completed:
+                await self.memory.maybe_summarize(ctx.conversation_id)
+            await asyncio.to_thread(self.memory.maybe_reap)
+        except Exception:  # noqa: BLE001 — memory failures must not break chat
+            import logging
+
+            logging.getLogger(__name__).exception("Failed to finalize memory turn")
+
+    def _write_turn_items(
+        self, ctx: HandlerContext, response: ChatResponse
+    ) -> None:
+        """Assistant reply + any tool events, in emission order."""
+        import json
+
+        for event in ctx._recorded_events:
+            self.memory.record_item(
+                ctx.conversation_id,
+                ctx.turn_id,
+                "tool",
+                json.dumps(event),
+                memory_type="event",
+                message_id=ctx.message_id,
+                subject=ctx.subject,
+            )
+        answer = "".join(
+            part.text for part in response.message.content if part.type == "text"
+        )
+        if answer:
+            self.memory.record_item(
+                ctx.conversation_id,
+                ctx.turn_id,
+                "assistant",
+                answer,
+                message_id=ctx.message_id,
+                subject=ctx.subject,
+            )
 
     def _finalize(
         self, result: ChatResponse | str, ctx: HandlerContext
@@ -351,16 +456,22 @@ class AgentApp(FastAPI):
                     AgentError("No chat handler registered.", "not_implemented", 501)
                 )
             ctx = self._prepare(request)
+            await self._open_turn(ctx)
+            response: ChatResponse | None = None
             try:
                 response = await self._run_chat(ctx)
             except AgentError as err:
                 return _error_response(err)
-            self._record_turn(ctx.request, response)
+            finally:
+                # in a finally because an AgentError must not leave the turn
+                # open: its user message is already recorded
+                await self._finalize_turn(ctx, response)
             return JSONResponse(response.model_dump())
 
         @self.post("/v1/chat/stream")
         async def stream_route(request: ChatRequest, raw: Request) -> StreamingResponse:
             ctx = self._prepare(request)
+            await self._open_turn(ctx)
             return StreamingResponse(
                 self._stream_events(ctx, raw), media_type="text/event-stream"
             )
@@ -376,89 +487,154 @@ class AgentApp(FastAPI):
 
     def _register_conversation_routes(self) -> None:
         @self.get("/v1/conversations/{conversation_id}/messages")
-        async def list_messages(conversation_id: str) -> dict[str, Any]:
-            # inspect the SDK-managed history the agent actually sees
+        async def list_messages(
+            conversation_id: str, include: str = ""
+        ) -> dict[str, Any]:
+            # The human-facing record, which is NOT the same as what the model
+            # reads: once turns are folded they leave ctx.history but stay here.
+            # `summary` carries the folded part and `summarized_through` marks
+            # where the two diverge, so a UI can render "older context,
+            # compacted" instead of appearing to have lost messages.
             assert self.memory is not None
+            include_events = "events" in {
+                part.strip() for part in include.split(",")
+            }
+            messages = await asyncio.to_thread(
+                self.memory.transcript,
+                conversation_id,
+                include_events=include_events,
+            )
+            summary = await asyncio.to_thread(
+                self.memory.get_summary, conversation_id
+            )
+            cutoff = await asyncio.to_thread(
+                self.memory.summarized_through, conversation_id
+            )
             return {
                 "conversation_id": conversation_id,
-                "messages": self.memory.get(conversation_id),
+                "messages": messages,
+                "summary": summary,
+                "summarized_through": cutoff,
             }
 
         @self.delete("/v1/conversations/{conversation_id}")
         async def clear_conversation(conversation_id: str) -> JSONResponse:
-            # "new session" on the client can drop server-side memory too
+            # "new session" on the client can drop server-side memory too.
+            # Session-scoped state goes with it; user- and app-scoped state does
+            # NOT — those are subject/agent-scoped, and starting a new chat must
+            # not erase what the agent knows about the person. Forgetting that
+            # is a separate, explicit action (the /subjects routes below).
             assert self.memory is not None
-            self.memory.clear(conversation_id)
+            await asyncio.to_thread(self.memory.clear, conversation_id)
+            await asyncio.to_thread(
+                self.memory.delete_state, "session", conversation_id
+            )
             return JSONResponse(status_code=204, content=None)
+
+        @self.get("/v1/subjects/{subject}/state")
+        async def list_subject_state(subject: str) -> dict[str, Any]:
+            # The audit half of durable memory. Model-written state is
+            # attacker-influenceable — a user can talk the agent into
+            # remembering something false about them, and it then loads into
+            # every later conversation. Caps and TTLs bound that; being able to
+            # see and delete it is what actually fixes it, so this ships with
+            # the feature rather than after it.
+            assert self.memory is not None
+            values = await asyncio.to_thread(
+                self.memory.list_state, "user", subject
+            )
+            return {"subject": subject, "state": values}
+
+        @self.delete("/v1/subjects/{subject}/state")
+        async def clear_subject_state(subject: str, key: str | None = None) -> JSONResponse:
+            assert self.memory is not None
+            removed = await asyncio.to_thread(
+                self.memory.delete_state, "user", subject, key
+            )
+            return JSONResponse({"removed": removed})
 
     async def _stream_events(
         self, ctx: HandlerContext, raw: Request
     ) -> AsyncIterator[str]:
         # graceful degradation: no stream handler -> run chat, emit one event
-        if self._stream_handler is None:
-            try:
-                response = await self._run_chat(ctx)
-            except AgentError as err:
-                yield _sse("error", err.detail())
-                return
-            self._record_turn(ctx.request, response)
-            yield _sse("message.completed", response.model_dump())
-            return
-
-        # Run the handler as a task that feeds a queue, so ctx.emit_event
-        # (tool_event frames) interleaves with the handler's own yields.
-        from .autoevents import current_context
-
-        queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
-        ctx._event_queue = queue
-        ctx._loop = asyncio.get_running_loop()
-
-        async def pump() -> None:
-            token = current_context.set(ctx)
-            try:
-                async for item in self._invoke_stream(ctx):
-                    await queue.put(("item", item))
-            except AgentError as err:
-                await queue.put(("error", err.detail()))
-            except Exception as err:  # noqa: BLE001 — surfaced to the client
-                await queue.put(
-                    (
-                        "error",
-                        {"code": "agent_error", "message": str(err), "retryable": False},
-                    )
-                )
-            finally:
-                current_context.reset(token)
-                await queue.put(("done", None))
-
-        task = asyncio.create_task(pump())
-        chunks: list[str] = []
-        final: ChatResponse | None = None
+        # Every exit below — normal completion, AgentError, handler crash,
+        # client disconnect — has to end the turn, because its user message is
+        # already in the store. Hence one finally around the whole generator.
+        completed: ChatResponse | None = None
         try:
-            while True:
-                kind, payload = await queue.get()
-                if kind == "done":
-                    break
-                if await raw.is_disconnected():
-                    task.cancel()
+            if self._stream_handler is None:
+                try:
+                    response = await self._run_chat(ctx)
+                except AgentError as err:
+                    yield _sse("error", err.detail())
                     return
-                if kind == "error":
-                    yield _sse("error", payload)
-                    return
-                if kind == "tool_event":
-                    yield _sse("tool_event", payload)
-                elif isinstance(payload, ChatResponse):
-                    final = payload
-                else:
-                    chunks.append(payload)
-                    yield _sse("message.delta", {"delta": {"text": payload}})
-        finally:
-            if not task.done():
-                task.cancel()
+                completed = response
+                yield _sse("message.completed", response.model_dump())
+                return
 
-        response = self._merge_stream_result(chunks, final, ctx)
-        self._record_turn(ctx.request, response)
-        yield _sse("message.completed", response.model_dump())
+            # Run the handler as a task that feeds a queue, so ctx.emit_event
+            # (tool_event frames) interleaves with the handler's own yields.
+            from .autoevents import current_context
+
+            queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+            ctx._event_queue = queue
+            ctx._loop = asyncio.get_running_loop()
+
+            async def pump() -> None:
+                token = current_context.set(ctx)
+                try:
+                    async for item in self._invoke_stream(ctx):
+                        await queue.put(("item", item))
+                except AgentError as err:
+                    await queue.put(("error", err.detail()))
+                except Exception as err:  # noqa: BLE001 — surfaced to the client
+                    await queue.put(
+                        (
+                            "error",
+                            {
+                                "code": "agent_error",
+                                "message": str(err),
+                                "retryable": False,
+                            },
+                        )
+                    )
+                finally:
+                    current_context.reset(token)
+                    await queue.put(("done", None))
+
+            task = asyncio.create_task(pump())
+            chunks: list[str] = []
+            final: ChatResponse | None = None
+            try:
+                while True:
+                    kind, payload = await queue.get()
+                    if kind == "done":
+                        break
+                    if await raw.is_disconnected():
+                        task.cancel()
+                        return
+                    if kind == "error":
+                        yield _sse("error", payload)
+                        return
+                    if kind == "tool_event":
+                        yield _sse("tool_event", payload)
+                    elif isinstance(payload, ChatResponse):
+                        final = payload
+                    else:
+                        chunks.append(payload)
+                        yield _sse("message.delta", {"delta": {"text": payload}})
+            finally:
+                if not task.done():
+                    task.cancel()
+
+            response = self._merge_stream_result(chunks, final, ctx)
+            completed = response
+            yield _sse("message.completed", response.model_dump())
+        finally:
+            # Best effort: if the whole task tree is being cancelled this may
+            # not get to run, which is what the store's stale-turn reaper is
+            # there to catch.
+            await self._finalize_turn(ctx, completed)
 
 
 def contentful(response: ChatResponse) -> bool:

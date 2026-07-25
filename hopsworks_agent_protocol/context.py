@@ -31,6 +31,8 @@ class HandlerContext:
         memory: "ChatMemory | None",
         framework: str,
         response_id: str,
+        turn_id: str = "",
+        subject: str | None = None,
     ):
         self.request = request
         self.conversation_id = request.conversation_id or ""
@@ -41,19 +43,102 @@ class HandlerContext:
         # correlation ids: stable for the life of this turn
         self.response_id = response_id
         self.message_id = request.message.id
+        # turn identity: groups every memory row this turn writes, so a reply,
+        # its tool calls, and anything derived from them stay linked
+        self.turn_id = turn_id
+        # whether the client actually named a subject. Kept separate from the
+        # resolved value below because "we know who this is" and "we fell back"
+        # are different security stories, and an audit view must not present a
+        # per-conversation fallback as a user identity.
+        self.has_subject = subject is not None
+        # durable per-user memory is keyed by this. Without a subject it falls
+        # back to the conversation, so memories degrade to per-conversation
+        # durability rather than leaking into a shared bucket.
+        self.subject = subject or self.conversation_id
+        # turn lifecycle bookkeeping, owned by AgentApp
+        self._turn_open = False
+        self._next_seq = 1
         # emit plumbing, wired by the route: a queue while streaming, else a
         # buffer surfaced in the response metadata
         self._event_queue: asyncio.Queue[Any] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._event_buffer: list[dict[str, Any]] = []
+        # every event this turn emitted, regardless of transport — the buffer
+        # above is drained into the response metadata and is empty while
+        # streaming, so it can't double as the record we persist
+        self._recorded_events: list[dict[str, Any]] = []
 
     @property
     def history(self) -> "list[Turn]":
         """Prior turns of this conversation from the configured memory store
-        (empty list when no memory is configured)."""
+        (empty list when no memory is configured).
+
+        With a summarizer configured this is the turns *since* the last fold —
+        everything older is in :attr:`summary`. Pass both to the model.
+        """
         if self.memory is None:
             return []
         return self.memory.get(self.conversation_id)
+
+    @property
+    def summary(self) -> str | None:
+        """Rolling summary of the turns folded out of :attr:`history`, or None.
+
+        None means nothing has been folded yet, so ``history`` is the whole
+        conversation.
+        """
+        if self.memory is None:
+            return None
+        return self.memory.get_summary(self.conversation_id)
+
+    def state(self, scope: str = "user") -> dict[str, str]:
+        """Scoped durable state as a plain ``{key: value}`` dict.
+
+        ``user`` is keyed by :attr:`subject` and outlives the conversation;
+        ``session`` is this conversation only; ``app`` is agent-wide.
+        """
+        if self.memory is None:
+            return {}
+        owner = self._state_owner(scope)
+        return {
+            row["key"]: row["value"] for row in self.memory.list_state(scope, owner)
+        }
+
+    def _state_owner(self, scope: str) -> str:
+        if scope == "session":
+            return self.conversation_id
+        if scope == "app":
+            return ""
+        return self.subject
+
+    def system_context(
+        self,
+        header: str = "Context from earlier:",
+        state_header: str = "What you know about this user:",
+    ) -> str:
+        """Memory assembled into a block to drop into your system prompt.
+
+        The SDK builds this every turn with no model round-trip, but it does not
+        place it: where context belongs is a property of your prompt, so you
+        decide. Returns ``""`` when there is nothing to add, which is safe to
+        concatenate unconditionally::
+
+            system = MY_PROMPT + ctx.system_context()
+
+        Carries the rolling summary (tier 2) and scoped durable state (tier 3),
+        each only once configured.
+        """
+        blocks = []
+        summary = self.summary
+        if summary:
+            blocks.append(f"{header}\n{summary}")
+        if self.memory is not None:
+            state = self.memory.state_block(self.subject, self.conversation_id)
+            if state:
+                blocks.append(f"{state_header}\n{state}")
+        if not blocks:
+            return ""
+        return "\n\n" + "\n\n".join(blocks) + "\n"
 
     async def emit_event(
         self,
@@ -179,6 +264,7 @@ class HandlerContext:
                 )
 
     def _dispatch(self, payload: dict[str, Any]) -> None:
+        self._recorded_events.append(payload)
         queue = self._event_queue
         loop = self._loop
         if queue is None or loop is None:

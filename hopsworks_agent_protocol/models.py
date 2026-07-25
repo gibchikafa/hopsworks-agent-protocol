@@ -67,6 +67,15 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     conversation_id: str | None = None
     message: ChatMessage
+    # End-user identity, used to key durable per-user memory. CLIENT-ASSERTED:
+    # the chat transport authenticates with a project-wide serving key, so
+    # anyone holding it can claim any subject — and because `subject` keys both
+    # state lookup and memory search, claiming another one reads and writes
+    # that user's memories. That matches the documented v1 trust boundary
+    # (everyone with the key is a project member) and nothing weaker should
+    # rely on it. Deriving it server-side from a per-user token is the intended
+    # replacement.
+    subject: str | None = None
     context: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
