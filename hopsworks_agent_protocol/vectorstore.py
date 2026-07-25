@@ -28,6 +28,7 @@ import logging
 import math
 import threading
 from abc import ABC, abstractmethod
+from datetime import timedelta
 
 log = logging.getLogger(__name__)
 
@@ -167,12 +168,14 @@ class HopsworksVectorStore(VectorStore):
         *,
         embedder_id: str = "unknown",
         version: int = 1,
+        ttl_days: int | None = 90,
         feature_store=None,
     ) -> None:
         self._name = f"agent_memory_{deployment_id}"
         self._dimension = dimension
         self._embedder_id = embedder_id
         self._version = version
+        self._ttl_days = ttl_days
         self._fs = feature_store
         self._fg = None
         self._features: list[str] = []
@@ -206,14 +209,30 @@ class HopsworksVectorStore(VectorStore):
                     dimension=self._dimension,
                     similarity_function_type=SimilarityFunctionType.COSINE,
                 )
-                fg = fs.get_or_create_feature_group(
+                kwargs = dict(
                     name=self._name,
                     version=self._version,
                     description=self._description(),
                     primary_key=["item_id"],
+                    event_time="created_at",
                     online_enabled=True,
+                    # memory rows are many and cold; keep them off RonDB's
+                    # in-memory tier
+                    online_disk=True,
                     embedding_index=index,
                 )
+                if self._ttl_days is not None:
+                    # native row expiry, measured from event_time — the vector
+                    # tier's answer to retention, since there is no row-level
+                    # delete available from a Python pod (see purge)
+                    kwargs["ttl"] = timedelta(days=self._ttl_days)
+                try:
+                    fg = fs.get_or_create_feature_group(**kwargs)
+                except TypeError:
+                    # older hsfs without ttl / online_disk
+                    for opt in ("ttl", "online_disk"):
+                        kwargs.pop(opt, None)
+                    fg = fs.get_or_create_feature_group(**kwargs)
                 existing = (getattr(fg, "description", "") or "").strip()
                 if existing and existing != self._description():
                     # a different embedding model wrote this feature group;
@@ -230,6 +249,9 @@ class HopsworksVectorStore(VectorStore):
                     self._failed = True
                     return None
                 self._fg = fg
+                # NB: empty until the feature group has a schema, i.e. until
+                # the first insert. Re-read lazily in search() rather than
+                # trusting this snapshot.
                 self._features = [f.name for f in fg.features]
                 log.info("Agent memory vector store ready (%s)", self._name)
             except Exception:  # noqa: BLE001 — search is optional; never crash
@@ -248,8 +270,13 @@ class HopsworksVectorStore(VectorStore):
             import pandas as pd
 
             frame = pd.DataFrame(rows, columns=list(FEATURES))
-            # wait_for_job=False: the turn must not block on the write job
-            fg.insert(frame, write_options={"wait_for_job": False})
+            # storage="online" skips the offline Delta write, which needs
+            # HopsFS/Spark and fails outright from an agent pod. Memory is an
+            # online-only concern anyway: it is read by vector lookup, never
+            # by a training query.
+            fg.insert(
+                frame, storage="online", write_options={"wait_for_job": False}
+            )
         except Exception:  # noqa: BLE001
             log.exception("Vector ingest failed; memories stay searchable only in SQL")
 
@@ -264,18 +291,32 @@ class HopsworksVectorStore(VectorStore):
         fg = self._ensure_fg()
         if fg is None:
             return []
+
         try:
             condition = None
-            if subject is not None:
-                condition = getattr(fg, "subject") == subject
-            if conversation_id is not None:
-                extra = getattr(fg, "conversation_id") == conversation_id
-                condition = extra if condition is None else (condition & extra)
-            results = (
-                fg.find_neighbors(vector, col="embedding", k=k, filter=condition)
-                if condition is not None
-                else fg.find_neighbors(vector, col="embedding", k=k)
+            for column, value in (
+                ("subject", subject),
+                ("conversation_id", conversation_id),
+            ):
+                if value is None:
+                    continue
+                clause = self._feature_filter(fg, column, value)
+                condition = clause if condition is None else (condition & clause)
+        except Exception:  # noqa: BLE001 — never fall through to an unfiltered
+            # search: that is a cross-user read, not a degraded result
+            log.exception(
+                "Could not build the %r filter; refusing to search unfiltered",
+                "subject" if subject is not None else "conversation_id",
             )
+            return []
+
+        # The schema only exists after the first insert, so a snapshot taken at
+        # connect time can be empty; refresh before zipping values to names.
+        if not self._features:
+            self._features = [f.name for f in fg.features]
+
+        try:
+            results = self._find_neighbors(fg, vector, k, condition)
         except Exception:  # noqa: BLE001
             log.exception("Vector search failed; returning no hits")
             return []
@@ -286,6 +327,55 @@ class HopsworksVectorStore(VectorStore):
             row["score"] = score
             hits.append(row)
         return hits
+
+    @staticmethod
+    def _feature_filter(fg, column: str, value):
+        """A filter on one feature, via ``get_feature`` rather than attribute access.
+
+        ``getattr(fg, "subject")`` does **not** give you the feature: ``subject``
+        is a real FeatureGroup attribute (the Avro schema-registry subject), so
+        it shadows the column and ``fg.subject == "alice"`` evaluates to a plain
+        ``False``. hsfs then translates that to *no filter clauses* and returns
+        unfiltered neighbours — a silent cross-user read, on the one field the
+        whole isolation story rests on. Any feature whose name collides with a
+        FeatureGroup attribute fails the same way, so never use attribute access
+        to build these.
+        """
+        from hsfs.constructor.filter import Filter
+
+        condition = fg.get_feature(column) == value
+        if not isinstance(condition, Filter):
+            raise TypeError(
+                f"filter on {column!r} produced {type(condition).__name__}, "
+                "not a Filter"
+            )
+        return condition
+
+    def _find_neighbors(self, fg, vector, k, condition):
+        """``find_neighbors`` with a guard for its max-k discovery probe.
+
+        On a project-shared OpenSearch index (the default), asking for more
+        neighbours than exist makes hsfs re-query with ``k = 2**31 - 1`` to
+        discover the index limit from the resulting error. When that error text
+        is not in the shape hsfs parses, it propagates instead. A per-subject
+        filter almost always matches fewer rows than ``k``, so this is the
+        common case here, not an edge case: retry with progressively smaller k
+        and return what we can rather than nothing.
+        """
+        attempt = k
+        while attempt >= 1:
+            try:
+                if condition is not None:
+                    return fg.find_neighbors(
+                        vector, col="embedding", k=attempt, filter=condition
+                    )
+                return fg.find_neighbors(vector, col="embedding", k=attempt)
+            except Exception as err:  # noqa: BLE001
+                if "requires k to be in the range" not in str(err) or attempt == 1:
+                    raise
+                attempt //= 2
+                log.debug("kNN probe tripped; retrying with k=%d", attempt)
+        return []
 
     def purge(
         self, *, conversation_id: str | None = None, subject: str | None = None
