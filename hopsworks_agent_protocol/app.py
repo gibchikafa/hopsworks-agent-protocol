@@ -202,6 +202,9 @@ class AgentApp(FastAPI):
         if self.memory is not None:
             # server-managed history is available: clients can list/clear it
             endpoints["conversations"] = "/v1/conversations"
+            if getattr(self.memory, "_long_term", False):
+                # durable per-subject memory is inspectable and deletable
+                endpoints["subjects"] = "/v1/subjects"
         if self._graph_spec is not None:
             endpoints["graph"] = "/v1/graph"
         return {
