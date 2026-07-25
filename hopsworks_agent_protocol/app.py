@@ -161,7 +161,7 @@ class AgentApp(FastAPI):
         return handler
 
     def memory_tools(self, framework: str | None = None) -> list[Any]:
-        """Framework-native ``remember`` / ``recall`` / ``forget`` tools.
+        """Framework-native ``remember`` / ``recall`` / ``forget`` / ``search`` tools.
 
         Add them to your agent's tool list yourself — the SDK cannot reach into
         an arbitrary framework's tools, and appending to them behind your back
@@ -191,7 +191,7 @@ class AgentApp(FastAPI):
             "conversation_history": True,
             "summary": getattr(self.memory, "_summarize", None) is not None,
             "state": bool(getattr(self.memory, "_long_term", False)),
-            "search": False,  # phase 3
+            "search": getattr(self.memory, "_vector_store", None) is not None,
         }
 
     def _manifest(self) -> dict[str, Any]:
@@ -309,9 +309,12 @@ class AgentApp(FastAPI):
                 ctx.turn_id,
                 status=TURN_CLOSED if completed else TURN_ABANDONED,
             )
-            # After the last token: summarizing costs request duration every
-            # Nth turn, never time-to-answer.
+            # After the last token: summarizing and embedding cost request
+            # duration, never time-to-answer. Both are awaited rather than
+            # fired off, because a scale-to-zero pod would take an un-awaited
+            # task with it.
             if completed:
+                await self.memory.ingest_turn(ctx.conversation_id, ctx.turn_id)
                 await self.memory.maybe_summarize(ctx.conversation_id)
             await asyncio.to_thread(self.memory.maybe_reap)
         except Exception:  # noqa: BLE001 — memory failures must not break chat
@@ -529,6 +532,11 @@ class AgentApp(FastAPI):
             await asyncio.to_thread(
                 self.memory.delete_state, "session", conversation_id
             )
+            # the vector store holds a copy of the content, so deleting from
+            # SQL alone would leave it searchable
+            await asyncio.to_thread(
+                self.memory.purge_vectors, conversation_id=conversation_id
+            )
             return JSONResponse(status_code=204, content=None)
 
         @self.get("/v1/subjects/{subject}/state")
@@ -551,7 +559,13 @@ class AgentApp(FastAPI):
             removed = await asyncio.to_thread(
                 self.memory.delete_state, "user", subject, key
             )
-            return JSONResponse({"removed": removed})
+            vectors = 0
+            if key is None:
+                # forgetting a whole subject includes their embedded messages
+                vectors = await asyncio.to_thread(
+                    self.memory.purge_vectors, subject=subject
+                )
+            return JSONResponse({"removed": removed, "vectors_removed": vectors})
 
     async def _stream_events(
         self, ctx: HandlerContext, raw: Request

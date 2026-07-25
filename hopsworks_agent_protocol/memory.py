@@ -32,7 +32,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, List, Optional, Union
+from typing import TYPE_CHECKING, Awaitable, List, Optional, Union
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +45,14 @@ Turn = dict[str, str]  # {"role": "user"|"assistant", "content": str}
 Summarizer = Callable[
     [Optional[str], List[Turn]], Union[str, Awaitable[str]]
 ]
+
+#: Turns text into a vector. Query and stored content must come from the *same*
+#: model — vectors from different models are not comparable even at equal
+#: dimension, so a mismatch returns plausible nonsense rather than an error.
+Embedder = Callable[[str], List[float]]
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .vectorstore import VectorStore
 
 # A turn is open from the moment the user message is recorded until the handler
 # finishes. Rows of an open turn are invisible to reads: the reply does not
@@ -288,6 +296,28 @@ class ChatMemory(ABC):
         """Scoped state rendered for ``ctx.system_context()``."""
         return ""
 
+    # ── semantic search (tier 3) ─────────────────────────────────────────
+
+    def search(
+        self,
+        query: str,
+        *,
+        subject: str | None = None,
+        conversation_id: str | None = None,
+        k: int = 5,
+    ) -> list[dict]:
+        """Older messages relevant to ``query``, most relevant first."""
+        return []
+
+    async def ingest_turn(self, conversation_id: str, turn_id: str) -> int:
+        """Embed a completed turn into the vector store. Returns rows sent."""
+        return 0
+
+    def purge_vectors(
+        self, *, conversation_id: str | None = None, subject: str | None = None
+    ) -> int:
+        return 0
+
 
 class InMemoryChatMemory(ChatMemory):
     """Process-local store for development: lost on restart (agent
@@ -397,6 +427,8 @@ class PersistentAgentMemory(ChatMemory):
         tool_event_retention_days: int | None = 30,
         message_retention_days: int | None = None,
         long_term: bool = False,
+        embedder: Embedder | None = None,
+        vector_store: "VectorStore | None" = None,
         state_ttl_days: int | None = 90,
         max_state_value_chars: int = 4096,
         max_state_keys_written: int = 128,
@@ -419,6 +451,8 @@ class PersistentAgentMemory(ChatMemory):
         self._tool_event_retention = tool_event_retention_days
         self._message_retention = message_retention_days
         self._long_term = long_term
+        self._embedder = embedder
+        self._vector_store = vector_store
         self._state_ttl = state_ttl_days
         self._max_value_chars = max_state_value_chars
         self._max_keys_written = max_state_keys_written
@@ -1384,6 +1418,169 @@ class PersistentAgentMemory(ChatMemory):
             # and the model only needs to know its view is partial
             lines.append("- (older values not shown)")
         return "\n".join(lines)
+
+    # ── semantic search (tier 3) ─────────────────────────────────────────
+
+    def search(
+        self,
+        query: str,
+        *,
+        subject: str | None = None,
+        conversation_id: str | None = None,
+        k: int = 5,
+    ) -> list[dict]:
+        """Find older messages relevant to ``query``.
+
+        Vector search when an embedder and vector store are configured, keyword
+        matching over SQL otherwise. The fallback is deliberate: ``search``
+        should be registerable as a tool from day one, so an agent's prompt does
+        not have to change when semantic search is switched on later.
+
+        This is for *older* context. The current turn lives in the synchronous
+        SQL tier and may not have reached the vector index yet — see
+        ``vectorstore``.
+        """
+        if self._vector_store is not None and self._embedder is not None:
+            try:
+                vector = self._embedder(query)
+            except Exception:  # noqa: BLE001
+                log.exception("Embedding the query failed; falling back to keywords")
+            else:
+                return self._vector_store.search(
+                    vector, k=k, subject=subject, conversation_id=conversation_id
+                )
+        return self._keyword_search(
+            query, subject=subject, conversation_id=conversation_id, k=k
+        )
+
+    def _keyword_search(
+        self,
+        query: str,
+        *,
+        subject: str | None,
+        conversation_id: str | None,
+        k: int,
+    ) -> list[dict]:
+        if not self._ensure_engine():
+            return []
+        terms = [word for word in re.split(r"\W+", query) if len(word) > 2][:8]
+        if not terms:
+            return []
+        t = self._table
+        stmt = (
+            t.select()
+            .where(t.c.memory_type == ITEM_MESSAGE)
+            .where(t.c.status == TURN_CLOSED)
+        )
+        for term in terms:
+            stmt = stmt.where(t.c.content.ilike(f"%{term}%"))
+        # same isolation the vector filter gives: a user only searches their own
+        # past, never someone else's
+        if subject is not None:
+            stmt = stmt.where(t.c.subject == subject)
+        if conversation_id is not None:
+            stmt = stmt.where(t.c.conversation_id == conversation_id)
+        try:
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    stmt.order_by(t.c.id.desc()).limit(k)
+                ).fetchall()
+        except Exception:  # noqa: BLE001
+            log.exception("Keyword search failed")
+            return []
+        return [
+            {
+                "item_id": r.id,
+                "conversation_id": r.conversation_id,
+                "subject": r.subject,
+                "role": r.role,
+                "content": r.content,
+                "memory_type": r.memory_type,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "score": None,  # keyword match: no meaningful similarity
+            }
+            for r in rows
+        ]
+
+    async def ingest_turn(self, conversation_id: str, turn_id: str) -> int:
+        """Embed a completed turn's messages into the vector store.
+
+        Runs in the same awaited-after-streaming slot as summarization — never
+        a background thread, because the pod can scale to zero and take an
+        un-awaited task with it. Only ``message`` rows are ingested: every row
+        costs an embedding plus an insert, and tool/event rows are debug
+        telemetry nobody searches for.
+        """
+        if self._vector_store is None or self._embedder is None:
+            return 0
+        if not self._ensure_engine():
+            return 0
+        t = self._table
+        try:
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    t.select()
+                    .where(t.c.conversation_id == conversation_id)
+                    .where(t.c.turn_id == turn_id)
+                    .where(t.c.memory_type == ITEM_MESSAGE)
+                    .where(t.c.status == TURN_CLOSED)
+                    .order_by(t.c.seq)
+                ).fetchall()
+        except Exception:  # noqa: BLE001
+            log.exception("Could not read turn %s for ingest", turn_id)
+            return 0
+        if not rows:
+            return 0
+
+        def _embed_rows():
+            payload = []
+            for r in rows:
+                payload.append(
+                    {
+                        "item_id": r.id,
+                        "conversation_id": r.conversation_id,
+                        "subject": r.subject,
+                        "memory_type": r.memory_type,
+                        "role": r.role,
+                        "content": r.content,
+                        "created_at": (
+                            r.created_at.isoformat() if r.created_at else None
+                        ),
+                        "embedding": self._embedder(r.content),
+                    }
+                )
+            return payload
+
+        try:
+            # embedding is CPU-bound and the insert is I/O; neither belongs on
+            # the event loop
+            payload = await asyncio.to_thread(_embed_rows)
+            await asyncio.to_thread(self._vector_store.ingest, payload)
+        except Exception:  # noqa: BLE001 — search is best-effort; the SQL tier
+            # remains the source of truth
+            log.exception("Vector ingest failed for turn %s", turn_id)
+            return 0
+        return len(payload)
+
+    def purge_vectors(
+        self, *, conversation_id: str | None = None, subject: str | None = None
+    ) -> int:
+        """Remove a conversation's or subject's copies from the vector store.
+
+        The vector store holds a *copy* of the content, so deleting from SQL
+        alone would leave it searchable. Called from conversation delete.
+        """
+        if self._vector_store is None:
+            return 0
+        try:
+            return self._vector_store.purge(
+                conversation_id=conversation_id, subject=subject
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "Vector purge failed — deleted content may remain searchable"
+            )
+            return 0
 
     async def maybe_summarize(self, conversation_id: str) -> bool:
         """Fold old turns into the rolling summary.

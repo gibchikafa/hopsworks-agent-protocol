@@ -134,3 +134,39 @@ def anthropic_summarizer(
         ).strip()
 
     return summarize
+
+
+def sentence_transformer_embedder(
+    model_name: str = "all-MiniLM-L6-v2", *, normalize: bool = True
+):
+    """The shipped default embedder: a local sentence-transformers model.
+
+        memory = PersistentAgentMemory(embedder=sentence_transformer_embedder(), ...)
+
+    Requires ``pip install sentence-transformers``.
+
+    Local rather than hosted on purpose. Anthropic has no embeddings endpoint,
+    so unlike ``summarize`` there is no API counterpart to reach for — and
+    embedding every ingested message against a remote service would put a
+    network call on the write path of every turn.
+
+    The returned callable carries ``dimension`` and ``model_id``, which
+    :func:`hopsworks_agent_protocol.vectorstore.vector_store_for` uses to size
+    the feature group and to detect a swapped model later.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as err:
+        raise ImportError(
+            "sentence_transformer_embedder requires sentence-transformers: "
+            "pip install sentence-transformers"
+        ) from err
+
+    model = SentenceTransformer(model_name)
+
+    def embed(text: str) -> list[float]:
+        return model.encode(text, normalize_embeddings=normalize).tolist()
+
+    embed.dimension = model.get_sentence_embedding_dimension()
+    embed.model_id = model_name
+    return embed

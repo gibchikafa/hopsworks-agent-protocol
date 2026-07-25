@@ -1729,7 +1729,9 @@ class TestMemoryTools:
     def test_memory_tools_factory(self, tmp_path):
         app, _ = self._app(tmp_path)
         tools = app.memory_tools("plain")
-        assert [t.__name__ for t in tools] == ["remember", "recall", "forget"]
+        assert [t.__name__ for t in tools] == [
+            "remember", "recall", "forget", "search",
+        ]
         with pytest.raises(ValueError, match="Unknown framework"):
             app.memory_tools("nope")
 
@@ -1810,10 +1812,8 @@ class TestStateAuditEndpoints:
         assert body["state"][0]["written_by"] == "agent"
         assert any(row["source_ref"] for row in body["state"])
 
-        assert client.delete("/v1/subjects/alice/state?key=lang").json() == {
-            "removed": 1
-        }
-        assert client.delete("/v1/subjects/alice/state").json() == {"removed": 1}
+        assert client.delete("/v1/subjects/alice/state?key=lang").json()["removed"] == 1
+        assert client.delete("/v1/subjects/alice/state").json()["removed"] == 1
         assert client.get("/v1/subjects/alice/state").json()["state"] == []
 
     def test_clearing_a_conversation_spares_user_state(self, tmp_path):
@@ -1826,3 +1826,263 @@ class TestStateAuditEndpoints:
         # "new session" must not erase durable knowledge about the person
         assert memory.get_state("user", "alice", "lang") == "python"
         assert memory.get_state("session", "c1", "draft") is None
+
+
+def _toy_embedder(text: str):
+    """Deterministic bag-of-chars vector: enough for exact cosine ranking in
+    tests without pulling in a real embedding model."""
+    vec = [0.0] * 26
+    for ch in text.lower():
+        if "a" <= ch <= "z":
+            vec[ord(ch) - 97] += 1.0
+    return vec
+
+
+class TestVectorStoreContract:
+    """InMemoryVectorStore is the reference implementation; these pin the
+    semantics the Hopsworks backend has to match."""
+
+    def _store(self):
+        from hopsworks_agent_protocol import InMemoryVectorStore
+
+        store = InMemoryVectorStore()
+        store.ingest([
+            {"item_id": 1, "conversation_id": "c1", "subject": "alice",
+             "memory_type": "message", "role": "user", "content": "kayaking",
+             "created_at": "2026-01-01", "embedding": _toy_embedder("kayaking")},
+            {"item_id": 2, "conversation_id": "c2", "subject": "alice",
+             "memory_type": "message", "role": "user", "content": "gardening",
+             "created_at": "2026-01-02", "embedding": _toy_embedder("gardening")},
+            {"item_id": 3, "conversation_id": "c3", "subject": "bob",
+             "memory_type": "message", "role": "user", "content": "kayaking",
+             "created_at": "2026-01-03", "embedding": _toy_embedder("kayaking")},
+        ])
+        return store
+
+    def test_ranks_by_similarity(self):
+        store = self._store()
+        hits = store.search(_toy_embedder("kayaking"), k=2, subject="alice")
+        assert hits[0]["content"] == "kayaking"
+        assert hits[0]["score"] > hits[1]["score"]
+
+    def test_subject_filter_is_isolation_not_optimization(self):
+        store = self._store()
+        hits = store.search(_toy_embedder("kayaking"), k=5, subject="alice")
+        # bob's identical memory must not surface for alice
+        assert {h["subject"] for h in hits} == {"alice"}
+        assert 3 not in {h["item_id"] for h in hits}
+
+    def test_vectors_are_not_returned(self):
+        store = self._store()
+        hits = store.search(_toy_embedder("kayaking"), k=1, subject="alice")
+        assert "embedding" not in hits[0]
+
+    def test_purge_by_conversation_and_subject(self):
+        store = self._store()
+        assert store.purge(conversation_id="c1") == 1
+        assert store.purge(subject="alice") == 1
+        assert len(store.search(_toy_embedder("kayaking"), k=5)) == 1
+
+    def test_ingest_is_idempotent_on_item_id(self):
+        store = self._store()
+        store.ingest([
+            {"item_id": 1, "conversation_id": "c1", "subject": "alice",
+             "memory_type": "message", "role": "user", "content": "kayaking",
+             "created_at": "2026-01-01", "embedding": _toy_embedder("kayaking")},
+        ])
+        assert len(store.search(_toy_embedder("kayaking"), k=10, subject="alice")) == 2
+
+
+class TestSemanticSearch:
+    def _store(self, tmp_path, **kw):
+        from hopsworks_agent_protocol import InMemoryVectorStore, PersistentAgentMemory
+
+        kw.setdefault("long_term", True)
+        kw.setdefault("embedder", _toy_embedder)
+        kw.setdefault("vector_store", InMemoryVectorStore())
+        return PersistentAgentMemory(
+            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_items_t", **kw
+        )
+
+    def _turn(self, memory, cid, q, a, subject=None):
+        from hopsworks_agent_protocol.memory import new_turn_id
+
+        tid = new_turn_id()
+        memory.begin_turn(cid, tid, "user", q, subject=subject)
+        memory.record_item(cid, tid, "assistant", a, subject=subject)
+        memory.end_turn(cid, tid)
+        asyncio.run(memory.ingest_turn(cid, tid))
+        return tid
+
+    def test_ingest_then_search(self, tmp_path):
+        memory = self._store(tmp_path)
+        self._turn(memory, "c1", "I love kayaking", "noted", subject="alice")
+        self._turn(memory, "c2", "I hate gardening", "noted", subject="alice")
+
+        hits = memory.search("kayaking", subject="alice", k=1)
+        assert hits[0]["content"] == "I love kayaking"
+        assert hits[0]["score"] is not None
+
+    def test_search_is_isolated_by_subject(self, tmp_path):
+        memory = self._store(tmp_path)
+        self._turn(memory, "c1", "I love kayaking", "noted", subject="alice")
+        assert memory.search("kayaking", subject="bob") == []
+
+    def test_only_messages_are_ingested(self, tmp_path):
+        from hopsworks_agent_protocol.memory import new_turn_id
+
+        memory = self._store(tmp_path)
+        tid = new_turn_id()
+        memory.begin_turn("c1", tid, "user", "kayaking", subject="alice")
+        memory.record_item(
+            "c1", tid, "tool", '{"name": "kayaking"}', memory_type="event",
+            subject="alice",
+        )
+        memory.end_turn("c1", tid)
+        # tool/event rows cost an embedding each and nobody searches for them
+        assert asyncio.run(memory.ingest_turn("c1", tid)) == 1
+
+    def test_abandoned_turns_are_not_ingested(self, tmp_path):
+        from hopsworks_agent_protocol.memory import new_turn_id
+
+        memory = self._store(tmp_path)
+        tid = new_turn_id()
+        memory.begin_turn("c1", tid, "user", "kayaking", subject="alice")
+        memory.end_turn("c1", tid, status="abandoned")
+        assert asyncio.run(memory.ingest_turn("c1", tid)) == 0
+        assert memory.search("kayaking", subject="alice") == []
+
+    def test_keyword_fallback_without_embedder(self, tmp_path):
+        memory = self._store(tmp_path, embedder=None, vector_store=None)
+        self._turn(memory, "c1", "I love kayaking", "noted", subject="alice")
+        self._turn(memory, "c2", "I hate gardening", "noted", subject="alice")
+
+        # search is registerable as a tool from day one; turning on the vector
+        # store later must not require a prompt change
+        hits = memory.search("kayaking", subject="alice")
+        assert [h["content"] for h in hits] == ["I love kayaking"]
+        assert hits[0]["score"] is None
+
+    def test_keyword_fallback_is_also_isolated(self, tmp_path):
+        memory = self._store(tmp_path, embedder=None, vector_store=None)
+        self._turn(memory, "c1", "I love kayaking", "noted", subject="alice")
+        assert memory.search("kayaking", subject="bob") == []
+
+    def test_embedder_failure_falls_back_to_keywords(self, tmp_path):
+        def broken(text):
+            raise RuntimeError("model gone")
+
+        memory = self._store(tmp_path)
+        self._turn(memory, "c1", "I love kayaking", "noted", subject="alice")
+        memory._embedder = broken
+        hits = memory.search("kayaking", subject="alice")
+        assert [h["content"] for h in hits] == ["I love kayaking"]
+
+    def test_deleting_a_conversation_purges_vectors(self, tmp_path):
+        memory = self._store(tmp_path)
+        app = AgentApp(memory=memory)
+
+        @app.chat
+        async def chat(request):
+            return "noted"
+
+        client = TestClient(app)
+        body = make_request("I love kayaking", "c1")
+        body["subject"] = "alice"
+        client.post("/v1/chat", json=body)
+        assert memory.search("kayaking", subject="alice")
+
+        client.delete("/v1/conversations/c1")
+        # the vector store holds a copy; deleting only from SQL would leave
+        # "deleted" content searchable
+        assert memory.search("kayaking", subject="alice") == []
+
+    def test_forgetting_a_subject_purges_their_vectors(self, tmp_path):
+        memory = self._store(tmp_path)
+        app = AgentApp(memory=memory)
+
+        @app.chat
+        async def chat(request):
+            return "noted"
+
+        client = TestClient(app)
+        for cid in ("c1", "c2"):
+            body = make_request("I love kayaking", cid)
+            body["subject"] = "alice"
+            client.post("/v1/chat", json=body)
+
+        body = client.delete("/v1/subjects/alice/state").json()
+        assert body["vectors_removed"] == 4
+        assert memory.search("kayaking", subject="alice") == []
+
+    def test_ingest_happens_through_the_turn(self, tmp_path):
+        memory = self._store(tmp_path)
+        app = AgentApp(memory=memory)
+
+        @app.chat
+        async def chat(request):
+            return "noted"
+
+        client = TestClient(app)
+        body = make_request("I love kayaking", "c1")
+        body["subject"] = "alice"
+        client.post("/v1/chat", json=body)
+        # embedding runs in the awaited-after-response slot, not a background
+        # task a scale-to-zero pod could kill
+        assert memory.search("kayaking", subject="alice")
+
+    def test_search_tool_reports_when_nothing_matches(self, tmp_path):
+        from hopsworks_agent_protocol import search
+
+        memory = self._store(tmp_path)
+        app = AgentApp(memory=memory)
+        seen = {}
+
+        @app.chat
+        async def chat(request, ctx):
+            seen["result"] = search("kayaking")
+            return "ok"
+
+        client = TestClient(app)
+        client.post("/v1/chat", json=make_request("hello", "c1"))
+        assert "Nothing found" in seen["result"]
+
+    def test_search_tool_dates_its_hits(self, tmp_path):
+        from hopsworks_agent_protocol import search
+
+        memory = self._store(tmp_path)
+        app = AgentApp(memory=memory)
+        seen = {}
+
+        @app.chat
+        async def chat(request, ctx):
+            if request.text == "look":
+                seen["result"] = search("kayaking")
+                return "ok"
+            return "noted"
+
+        client = TestClient(app)
+        for text in ("I love kayaking", "look"):
+            body = make_request(text, "c1")
+            body["subject"] = "alice"
+            client.post("/v1/chat", json=body)
+        # the model needs the age of a memory to weigh it against the present
+        assert "I love kayaking" in seen["result"]
+        assert seen["result"].startswith("[20")
+
+    def test_manifest_advertises_search(self, tmp_path):
+        memory = self._store(tmp_path)
+        app = AgentApp(memory=memory)
+
+        @app.chat
+        async def chat(request):
+            return "ok"
+
+        client = TestClient(app)
+        caps = client.get("/.well-known/hopsworks-agent.json").json()["capabilities"]
+        assert caps["memory"] == {
+            "conversation_history": True,
+            "summary": False,
+            "state": True,
+            "search": True,
+        }

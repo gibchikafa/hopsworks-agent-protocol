@@ -131,7 +131,31 @@ def forget(key: str, scope: str = "user") -> str:
     return f"Forgot {key!r}."
 
 
-MEMORY_TOOLS = (remember, recall, forget)
+def search(query: str) -> str:
+    """Search earlier conversations for anything relevant to a topic.
+
+    Use this when the answer might depend on something discussed before that is
+    no longer in the visible history. Searches only this user's own past.
+
+    Args:
+        query: what to look for, in natural language.
+    """
+    memory, ctx = _resolve()
+    if memory is None:
+        return _NO_CONTEXT
+    hits = memory.search(query, subject=ctx.subject)
+    if not hits:
+        return f"Nothing found in earlier conversations about {query!r}."
+    lines = []
+    for hit in hits:
+        when = (hit.get("created_at") or "")[:10]
+        # timestamp and speaker are deliberately included: the model needs to
+        # know how old a memory is to weigh it against the current turn
+        lines.append(f"[{when} {hit.get('role', '?')}] {hit['content']}")
+    return "\n".join(lines)
+
+
+MEMORY_TOOLS = (remember, recall, forget, search)
 
 
 def memory_tools(framework: str = "plain"):
