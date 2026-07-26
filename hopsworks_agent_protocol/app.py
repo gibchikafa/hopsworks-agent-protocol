@@ -160,7 +160,7 @@ class AgentApp(FastAPI):
         self._stream_handler = handler
         return handler
 
-    def memory_tools(self, framework: str | None = None) -> list[Any]:
+    def memory_tools(self, framework: str | None = None, include=None) -> list[Any]:
         """Framework-native ``remember`` / ``recall`` / ``forget`` / ``search`` tools.
 
         Add them to your agent's tool list yourself — the SDK cannot reach into
@@ -169,11 +169,14 @@ class AgentApp(FastAPI):
 
             agent = create_react_agent(llm, [*tools, *app.memory_tools()])
 
-        Defaults to the app's detected framework.
+        Defaults to the app's detected framework. ``include`` registers a
+        subset by name, e.g. ``include=("recall", "search")`` for an agent that
+        must not let the model write subject-scoped state — see
+        :func:`~hopsworks_agent_protocol.tools.memory_tools`.
         """
         from .tools import memory_tools as _memory_tools
 
-        return _memory_tools(framework or self.framework)
+        return _memory_tools(framework or self.framework, include=include)
 
     # ── internals ─────────────────────────────────────────────────────────
 

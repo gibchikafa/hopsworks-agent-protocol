@@ -158,7 +158,20 @@ def search(query: str) -> str:
 MEMORY_TOOLS = (remember, recall, forget, search)
 
 
-def memory_tools(framework: str = "plain"):
+def _select(include):
+    """The named subset of MEMORY_TOOLS, in the canonical order."""
+    if include is None:
+        return list(MEMORY_TOOLS)
+    by_name = {fn.__name__: fn for fn in MEMORY_TOOLS}
+    unknown = [name for name in include if name not in by_name]
+    if unknown:
+        raise ValueError(
+            f"Unknown memory tool(s) {unknown}. Available: {sorted(by_name)}."
+        )
+    return [fn for fn in MEMORY_TOOLS if fn.__name__ in set(include)]
+
+
+def memory_tools(framework: str = "plain", include=None):
     """The memory tools wrapped in a framework's tool type.
 
     One line to register, but still explicit — the SDK cannot reach into an
@@ -166,9 +179,22 @@ def memory_tools(framework: str = "plain"):
     agent would be worse than asking::
 
         agent = create_react_agent(llm, [*my_tools, *app.memory_tools("langgraph")])
+
+    ``include`` registers a subset by name. Reach for it when the app has its
+    own opinion about what may be written where, because ``remember`` defaults
+    to ``user`` scope owned by ``ctx.subject`` — a model that decides a fact is
+    worth keeping will write it there, across conversations, whatever the app
+    does elsewhere. An agent that scopes identity to a single conversation
+    should not also offer a tool that can promote that identity to the subject::
+
+        app.memory_tools("langgraph", include=("recall", "search"))
+
+    A system-prompt rule is not a substitute: the tool is callable whether or
+    not the prompt mentions it.
     """
+    tools = _select(include)
     if framework in ("plain", "custom", None):
-        return list(MEMORY_TOOLS)
+        return tools
     if framework in ("langgraph", "langchain"):
         try:
             from langchain_core.tools import tool as lc_tool
@@ -177,7 +203,7 @@ def memory_tools(framework: str = "plain"):
                 "memory_tools('langgraph') requires langchain-core: "
                 "pip install langchain-core"
             ) from err
-        return [lc_tool(fn) for fn in MEMORY_TOOLS]
+        return [lc_tool(fn) for fn in tools]
     if framework == "llamaindex":
         try:
             from llama_index.core.tools import FunctionTool
@@ -186,7 +212,7 @@ def memory_tools(framework: str = "plain"):
                 "memory_tools('llamaindex') requires llama-index-core: "
                 "pip install llama-index-core"
             ) from err
-        return [FunctionTool.from_defaults(fn=fn) for fn in MEMORY_TOOLS]
+        return [FunctionTool.from_defaults(fn=fn) for fn in tools]
     raise ValueError(
         f"Unknown framework {framework!r}. Supported: 'langgraph', "
         "'llamaindex', 'plain' (bare functions to wrap yourself)."
