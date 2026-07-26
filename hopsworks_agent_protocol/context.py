@@ -55,6 +55,10 @@ class HandlerContext:
         # back to the conversation, so memories degrade to per-conversation
         # durability rather than leaking into a shared bucket.
         self.subject = subject or self.conversation_id
+        # where the subject came from: "client" (asserted on the request),
+        # "conversation" (the fallback above), or "app" (the agent identified
+        # the user mid-turn — see rebind_subject).
+        self.subject_source = "client" if subject is not None else "conversation"
         # turn lifecycle bookkeeping, owned by AgentApp
         self._turn_open = False
         self._next_seq = 1
@@ -103,6 +107,42 @@ class HandlerContext:
         return {
             row["key"]: row["value"] for row in self.memory.list_state(scope, owner)
         }
+
+    def rebind_subject(self, subject: str) -> None:
+        """Bind durable memory to the end user this turn just identified.
+
+        The transport authenticates the *chatbot*, not the person using it — a
+        project-wide serving key is the bot's own credential, the same way any
+        app holds an API key to reach its backend. So when the agent does what
+        a real chatbot does and asks who it is speaking to, the answer arrives
+        mid-turn, after :meth:`begin_turn` has already stamped the question with
+        whatever the client asserted (often the operator, or the
+        per-conversation fallback).
+
+        Calling this points ``user`` scope, :meth:`system_context` and
+        :meth:`search` at the person instead::
+
+            ctx.rebind_subject(customer_key(first, last, phone))
+
+        It also restamps the rows this turn already wrote, so the turn is not
+        split between two subjects. Safe to call repeatedly; the last call wins.
+
+        This is identification, not authentication. The subject it binds is
+        only as trustworthy as whatever the agent used to derive it, and
+        ``user`` scope is readable by anyone who can reproduce that value.
+        """
+        if not subject or subject == self.subject:
+            return
+        self.subject = subject
+        # "the app worked it out", which is neither "the client told us" nor
+        # "we fell back to the conversation" — an audit view must be able to
+        # tell the three apart.
+        self.subject_source = "app"
+        self.has_subject = True
+        if self.memory is not None:
+            self.memory.rebind_turn_subject(
+                self.conversation_id, self.turn_id, subject
+            )
 
     def _state_owner(self, scope: str) -> str:
         if scope == "session":

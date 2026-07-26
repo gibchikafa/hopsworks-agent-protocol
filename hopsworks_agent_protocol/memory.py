@@ -208,6 +208,24 @@ class ChatMemory(ABC):
     def clear(self, conversation_id: str) -> None:
         """Drop a conversation."""
 
+    def rebind_turn_subject(
+        self, conversation_id: str, turn_id: str, subject: str
+    ) -> None:
+        """Restamp this turn's rows with a subject learned while it ran.
+
+        ``begin_turn`` writes the user message before the handler executes, so
+        an agent that discovers who it is talking to *during* the turn — the
+        chatbot asking for your details, which is how identification works when
+        the transport only authenticates the chatbot itself — would otherwise
+        leave the question under one subject and the answer under another. That
+        splits the turn for anything that filters by subject, notably
+        :meth:`search`.
+
+        Not abstract: a store with no per-row subject has nothing to restamp,
+        and silently doing nothing is the correct behaviour for it.
+        """
+        return None
+
     def append(self, conversation_id: str, role: str, content: str) -> None:
         """Record one standalone message, e.g. to seed a conversation.
 
@@ -915,6 +933,31 @@ class PersistentAgentMemory(ChatMemory):
                     self._pending[turn_id].append(
                         {"role": role, "content": content}
                     )
+
+    def rebind_turn_subject(
+        self, conversation_id: str, turn_id: str, subject: str
+    ) -> None:
+        """Restamp every row already written for this turn (see the base class).
+
+        Rows written *after* this carry the new subject because the caller
+        passes ``ctx.subject``, which the context has already updated — so this
+        only has to catch up the ones ``begin_turn`` wrote. Best-effort like
+        every other write here: a failure leaves the turn split across two
+        subjects, which is worth a warning but never worth failing the reply.
+        """
+        if not self._ensure_engine():
+            return
+        t = self._table
+        try:
+            with self._engine.begin() as conn:
+                conn.execute(
+                    t.update()
+                    .where(t.c.conversation_id == conversation_id)
+                    .where(t.c.turn_id == turn_id)
+                    .values(subject=subject)
+                )
+        except Exception:  # noqa: BLE001 — memory must never break a turn
+            log.exception("Memory rebind_turn_subject failed for turn %s", turn_id)
 
     def end_turn(
         self, conversation_id: str, turn_id: str, *, status: str = TURN_CLOSED
