@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 from .memory import WRITABLE_SCOPES, WRITTEN_BY_AGENT
 
@@ -46,6 +47,54 @@ def _resolve():
 
 def _owner(ctx, scope: str) -> str:
     return ctx.conversation_id if scope == "session" else ctx.subject
+
+
+#: Words too common to make two keys related. Without this, every key sharing
+#: "user" or "customer" would be reported against every other one.
+_STOPWORDS = frozenset(
+    {"the", "a", "of", "for", "to", "is", "user", "users", "my", "their"}
+)
+#: How many existing keys to name back. Enough to spot a duplicate, not enough
+#: to turn a tool result into a memory dump.
+_MAX_RELATED = 5
+
+
+def _normalize_key(key: str) -> str:
+    """One spelling per key, so case and spacing cannot fork a memory.
+
+    ``Preferred Language`` and ``preferred_language`` are the same fact, and
+    storing both is how a store ends up disagreeing with itself. Applied to the
+    model-facing tools only; programmatic callers of ``set_state`` keep whatever
+    key they chose, because they are not guessing.
+    """
+    return "_".join(str(key).strip().lower().split())
+
+
+def _tokens(key: str) -> set[str]:
+    return {w for w in re.split(r"[^a-z0-9]+", key.lower()) if w and w not in _STOPWORDS}
+
+
+def _related_keys(memory, scope: str, owner: str, key: str) -> list[str]:
+    """Existing keys that look like they might mean the same thing.
+
+    Token overlap, not embeddings: it is free, it runs on the write path, and it
+    catches the case that actually occurs — the model coining a synonym of a key
+    it already wrote. Best-effort; a failure here must not block the write.
+    """
+    try:
+        existing = memory.list_state(scope, owner)
+    except Exception:  # noqa: BLE001
+        log.debug("Could not list state for duplicate check", exc_info=True)
+        return []
+    wanted = _tokens(key)
+    if not wanted:
+        return []
+    related = [
+        row["key"]
+        for row in existing
+        if row["key"] != key and _tokens(row["key"]) & wanted
+    ]
+    return related[:_MAX_RELATED]
 
 
 def _check_scope(scope: str) -> str | None:
@@ -85,15 +134,31 @@ def remember(key: str, value: str, scope: str = "user") -> str:
             "message_id": ctx.message_id,
         }
     )
+    owner = _owner(ctx, scope)
+    key = _normalize_key(key)
+    # Read before write, so the model sees what it is about to sit beside.
+    neighbours = _related_keys(memory, scope, owner, key)
     memory.set_state(
         scope,
-        _owner(ctx, scope),
+        owner,
         key,
         value,
         source_ref=source_ref,
         written_by=WRITTEN_BY_AGENT,
     )
-    return f"Stored {key!r} in {scope} memory."
+    stored = f"Stored {key!r} in {scope} memory."
+    if neighbours:
+        # Nothing is merged automatically — the model knows which of these means
+        # the same thing and this store does not. Naming them is what stops
+        # customer_name, customer_first_name and name accumulating as three
+        # rows that disagree, which is the failure mode of upserting on exact
+        # key match alone.
+        listed = ", ".join(repr(n) for n in neighbours)
+        stored += (
+            f" You already store {listed} for this user — if any of those mean "
+            f"the same thing as {key!r}, `forget` the ones you are replacing."
+        )
+    return stored
 
 
 def recall(key: str, scope: str = "user") -> str:
@@ -106,6 +171,9 @@ def recall(key: str, scope: str = "user") -> str:
     memory, ctx = _resolve()
     if memory is None:
         return _NO_CONTEXT
+    # same normalization as remember, or a key the model stored is unreachable
+    # by the spelling it used to store it
+    key = _normalize_key(key)
     value = memory.get_state(scope, _owner(ctx, scope), key)
     if value is None:
         return f"Nothing stored under {key!r} in {scope} memory."
@@ -125,6 +193,7 @@ def forget(key: str, scope: str = "user") -> str:
     problem = _check_scope(scope)
     if problem:
         return problem
+    key = _normalize_key(key)
     removed = memory.delete_state(scope, _owner(ctx, scope), key)
     if not removed:
         return f"Nothing stored under {key!r} in {scope} memory."

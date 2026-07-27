@@ -452,6 +452,8 @@ class PersistentAgentMemory(ChatMemory):
         max_state_keys_written: int = 128,
         max_state_keys_injected: int = 32,
         state_inject_value_chars: int = 1024,
+        recency_half_life_days: float | None = 30.0,
+        search_oversample: int = 3,
     ):
         try:
             import sqlalchemy  # noqa: F401 — fail fast if the extra is missing
@@ -476,6 +478,12 @@ class PersistentAgentMemory(ChatMemory):
         self._max_keys_written = max_state_keys_written
         self._max_keys_injected = max_state_keys_injected
         self._inject_value_chars = state_inject_value_chars
+        # How fast similarity gives way to age in search ranking. A support
+        # agent wants recent context; an agent whose one relevant fact is a year
+        # old does not, so this is a knob and `None` turns it off entirely,
+        # restoring pure similarity order.
+        self._half_life = recency_half_life_days
+        self._search_oversample = max(1, search_oversample)
         self._url = url  # resolved lazily (may read env/secrets)
         self._table_name = table_name
         # conversation_id -> (summary_version, turns). The version is what makes
@@ -1494,9 +1502,16 @@ class PersistentAgentMemory(ChatMemory):
             f"- {r['key']}: {r['value'][: self._inject_value_chars]}" for r in shown
         ]
         if len(rows) > len(shown):
-            # deliberately uncounted: the exact number would cost another query
-            # and the model only needs to know its view is partial
-            lines.append("- (older values not shown)")
+            # Say there is a budget and that this view is partial. A silent cap
+            # leaves the model believing it can remember without limit and that
+            # what it sees is everything; told there is pressure, it prunes.
+            # Still uncounted beyond "more than": the exact total costs another
+            # query and does not change what the model should do about it.
+            lines.append(
+                f"- (showing the {len(shown)} most recently updated of more "
+                "than that — consolidate related keys, or `forget` ones that "
+                "are stale, so the useful ones stay visible)"
+            )
         return "\n".join(lines)
 
     # ── semantic search (tier 3) ─────────────────────────────────────────
@@ -1526,12 +1541,60 @@ class PersistentAgentMemory(ChatMemory):
             except Exception:  # noqa: BLE001
                 log.exception("Embedding the query failed; falling back to keywords")
             else:
-                return self._vector_store.search(
-                    vector, k=k, subject=subject, conversation_id=conversation_id
+                # Over-fetch, then re-rank. Re-ranking the k rows the index
+                # already chose would only reorder a set similarity picked, so
+                # the old-but-relevant message still never appears — which is
+                # the entire complaint recency weighting exists to answer. The
+                # candidate pool has to be wider than the answer.
+                wanted = k * self._search_oversample if self._half_life else k
+                hits = self._vector_store.search(
+                    vector,
+                    k=wanted,
+                    subject=subject,
+                    conversation_id=conversation_id,
                 )
+                return self._rerank(hits, k)
         return self._keyword_search(
             query, subject=subject, conversation_id=conversation_id, k=k
         )
+
+    def _rerank(self, hits: list[dict], k: int) -> list[dict]:
+        """Trade similarity off against age, then cut to ``k``.
+
+        ``weight = 0.5 ** (age / half_life)`` — a true half-life, so a memory
+        exactly ``recency_half_life_days`` old counts half as much as an
+        identical one from today. (The ``exp(-age / half_life)`` form often
+        quoted for this is a *time constant*: it leaves 0.37 at the half-life,
+        not 0.5, which makes the parameter mean something other than its name.)
+
+        Only the vector path needs this. Keyword results come back ordered by
+        id, which is already recency, and carry no similarity to trade against.
+        """
+        if not self._half_life or not hits:
+            return hits[:k]
+        now = _utcnow()
+        scored = []
+        for hit in hits:
+            score = hit.get("score")
+            if score is None:
+                scored.append((0.0, hit))
+                continue
+            created = hit.get("created_at")
+            weight = 1.0
+            if created:
+                try:
+                    when = datetime.fromisoformat(str(created))
+                    if when.tzinfo is not None:
+                        when = when.replace(tzinfo=None)
+                    age_days = max((now - when).total_seconds(), 0.0) / 86400.0
+                    weight = 0.5 ** (age_days / self._half_life)
+                except (TypeError, ValueError):
+                    # an unparseable timestamp must not silently sort a row to
+                    # the bottom; leave it on similarity alone
+                    log.debug("Unparseable created_at %r; ranking on score", created)
+            scored.append((score * weight, hit))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [hit for _, hit in scored[:k]]
 
     def _keyword_search(
         self,

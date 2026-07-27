@@ -1613,7 +1613,10 @@ class TestDurableState:
             memory.set_state("user", "alice", f"k{i}", "v" * 50)
         block = memory.state_block("alice", "c1")
         assert block.count("\n") == 2  # two values plus the truncation marker
-        assert "older values not shown" in block
+        # the marker names the budget rather than just admitting truncation, so
+        # the model knows it is under pressure and can curate
+        assert "showing the 2 most recently updated" in block
+        assert "forget" in block
         assert "v" * 6 not in block
 
     def test_state_table_absent_without_long_term(self, tmp_path):
@@ -2230,3 +2233,156 @@ class TestReviewRegressions:
         # ingest writes online-only, so the offline table this defaults to is
         # always empty — and unreachable from a serving pod
         assert seen["online"] is True
+
+
+class TestRetrievalAndReconciliation:
+    """Ranking and key-sprawl features taken from the SDK comparison."""
+
+    def _store(self, tmp_path, **kw):
+        from hopsworks_agent_protocol import PersistentAgentMemory
+
+        return PersistentAgentMemory(
+            url=f"sqlite:///{tmp_path}/m.db",
+            table_name="agent_memory_items_rr",
+            long_term=True,
+            **kw,
+        )
+
+    def test_recency_outranks_a_slightly_better_old_match(self, tmp_path):
+        from datetime import timedelta
+
+        from hopsworks_agent_protocol.memory import _utcnow
+
+        memory = self._store(tmp_path, recency_half_life_days=30.0)
+        now = _utcnow()
+        old = {
+            "item_id": 1,
+            "content": "the better match, from a year ago",
+            "score": 0.90,
+            "created_at": (now - timedelta(days=365)).isoformat(),
+        }
+        recent = {
+            "item_id": 2,
+            "content": "the slightly worse match, from today",
+            "score": 0.80,
+            "created_at": now.isoformat(),
+        }
+        ranked = memory._rerank([old, recent], k=2)
+        assert [r["item_id"] for r in ranked] == [2, 1]
+
+    def test_half_life_means_half(self, tmp_path):
+        from datetime import timedelta
+
+        from hopsworks_agent_protocol.memory import _utcnow
+
+        memory = self._store(tmp_path, recency_half_life_days=10.0)
+        now = _utcnow()
+        # identical similarity; one is exactly one half-life old. Ranking is by
+        # score * 0.5 ** (age / half_life), so the older one must score half.
+        fresh = {"item_id": 1, "score": 1.0, "created_at": now.isoformat()}
+        aged = {
+            "item_id": 2,
+            "score": 1.0,
+            "created_at": (now - timedelta(days=10)).isoformat(),
+        }
+        ranked = memory._rerank([aged, fresh], k=2)
+        assert [r["item_id"] for r in ranked] == [1, 2]
+        # and a twice-as-similar old memory still wins, which is the point of
+        # weighting rather than sorting by date
+        aged_strong = dict(aged, score=2.1)
+        assert memory._rerank([aged_strong, fresh], k=1)[0]["item_id"] == 2
+
+    def test_disabling_recency_restores_similarity_order(self, tmp_path):
+        from datetime import timedelta
+
+        from hopsworks_agent_protocol.memory import _utcnow
+
+        memory = self._store(tmp_path, recency_half_life_days=None)
+        now = _utcnow()
+        old = {
+            "item_id": 1,
+            "score": 0.9,
+            "created_at": (now - timedelta(days=900)).isoformat(),
+        }
+        recent = {"item_id": 2, "score": 0.8, "created_at": now.isoformat()}
+        assert [r["item_id"] for r in memory._rerank([old, recent], k=2)] == [1, 2]
+
+    def test_unparseable_timestamp_ranks_on_score_alone(self, tmp_path):
+        memory = self._store(tmp_path, recency_half_life_days=30.0)
+        rows = [
+            {"item_id": 1, "score": 0.9, "created_at": "not a date"},
+            {"item_id": 2, "score": 0.5, "created_at": None},
+        ]
+        # neither is dropped or sorted to the bottom for lacking a usable date
+        assert [r["item_id"] for r in memory._rerank(rows, k=2)] == [1, 2]
+
+    def test_search_over_fetches_so_reranking_can_change_the_answer(self, tmp_path):
+        from hopsworks_agent_protocol.vectorstore import InMemoryVectorStore
+
+        seen = {}
+
+        class Recording(InMemoryVectorStore):
+            def search(self, vector, *, k=5, subject=None, conversation_id=None):
+                seen["k"] = k
+                return []
+
+        memory = self._store(
+            tmp_path,
+            vector_store=Recording(),
+            embedder=lambda text: [1.0, 0.0],
+            recency_half_life_days=30.0,
+            search_oversample=3,
+        )
+        memory.search("anything", subject="s1", k=5)
+        # re-ranking the 5 the index already picked would only reorder them
+        assert seen["k"] == 15
+
+    def test_remember_names_existing_near_duplicate_keys(self, tmp_path):
+        from hopsworks_agent_protocol import tools
+
+        memory = self._store(tmp_path)
+        memory.set_state("user", "alice", "customer_first_name", "Aaron")
+
+        class Ctx:
+            conversation_id = "c1"
+            turn_id = "t1"
+            message_id = "m1"
+            subject = "alice"
+
+        ctx = Ctx()
+        ctx.memory = memory
+        original = tools._resolve
+        tools._resolve = lambda: (memory, ctx)
+        try:
+            reply = tools.remember("Customer Name", "Aaron Mitchell")
+        finally:
+            tools._resolve = original
+        # normalized on the way in...
+        assert "'customer_name'" in reply
+        assert memory.get_state("user", "alice", "customer_name") == "Aaron Mitchell"
+        # ...and the model is told what it now sits beside, which is how the
+        # customer_name / customer_first_name split got noticed in the first place
+        assert "customer_first_name" in reply
+
+    def test_recall_finds_what_remember_normalized(self, tmp_path):
+        from hopsworks_agent_protocol import tools
+
+        memory = self._store(tmp_path)
+
+        class Ctx:
+            conversation_id = "c1"
+            turn_id = "t1"
+            message_id = "m1"
+            subject = "alice"
+
+        ctx = Ctx()
+        ctx.memory = memory
+        original = tools._resolve
+        tools._resolve = lambda: (memory, ctx)
+        try:
+            tools.remember("Preferred Language", "Finnish")
+            assert tools.recall("preferred language") == "Finnish"
+            assert tools.recall("PREFERRED_LANGUAGE") == "Finnish"
+            assert "Forgot" in tools.forget("Preferred Language")
+        finally:
+            tools._resolve = original
