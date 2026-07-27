@@ -184,6 +184,95 @@ def _read_hopsworks_secret(secret_name: str) -> str:
         return hopsworks.get_secrets_api().get(secret_name)
 
 
+def _url_from_connector(connector) -> str:
+    """A SQLAlchemy URL for the project database, from its JDBC connector.
+
+    The online feature store *is* the database the memory tables live in, so
+    its connector already carries the credentials — which matters because the
+    MYSQL_* environment variables this module normally reads are injected into
+    agent deployments and nowhere else. Without this, registering feature
+    groups would only be possible from inside the very pod that has no reason
+    to do it.
+    """
+    raw = getattr(connector, "connection_string", None) or ""
+    match = re.match(r"jdbc:mysql://([^:/]+):(\d+)/([^?;]+)", raw)
+    if not match:
+        raise RuntimeError(
+            f"Could not read a MySQL host, port and database out of the online "
+            f"storage connector ({raw!r}). Pass url= explicitly."
+        )
+    host, port, database = match.groups()
+
+    arguments = getattr(connector, "arguments", None) or {}
+    if isinstance(arguments, list):
+        # some versions hand back [{"name": ..., "value": ...}, ...]
+        arguments = {
+            entry.get("name"): entry.get("value")
+            for entry in arguments
+            if isinstance(entry, dict)
+        }
+    user = arguments.get("user") or arguments.get("username")
+    password = arguments.get("password")
+    if not user or password is None:
+        raise RuntimeError(
+            "The online storage connector carries no user/password, so the "
+            "project database URL cannot be built. Pass url= explicitly."
+        )
+    return f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
+
+
+def register_feature_groups(
+    feature_store=None,
+    *,
+    url: str | None = None,
+    version: int = 1,
+    include=None,
+    table_name: str | None = None,
+):
+    """Register the project's memory tables as external feature groups.
+
+    The notebook-friendly entry point: it needs nothing but a Hopsworks login,
+    deriving the database URL from the project's own online storage connector
+    when one is not passed. Registration is project-wide metadata, so it asks
+    for no deployment id and belongs to no particular agent.
+
+    See :meth:`PersistentAgentMemory.register_feature_groups` for what is
+    registered and why it is read-through.
+
+        import hopsworks
+        from hopsworks_agent_protocol.memory import register_feature_groups
+
+        register_feature_groups()
+    """
+    if feature_store is None:
+        import hopsworks
+
+        feature_store = hopsworks.login().get_feature_store()
+    if url is None:
+        try:
+            url = deployment_mysql_url()
+        except RuntimeError:
+            url = _url_from_connector(
+                feature_store.get_online_storage_connector()
+            )
+    # long_term and a summarizer only so all three table definitions exist to
+    # register; which of them are actually created is read from the database.
+    # The deployment id is a placeholder: nothing here reads or writes rows.
+    memory = PersistentAgentMemory(
+        url=url,
+        deployment_id="registration",
+        long_term=True,
+        summarize=lambda previous, turns: "",
+        table_name=table_name,
+        # declare every tier so its definition exists to register, but do not
+        # create anything: which tables are real is a question for the database
+        create_tables=False,
+    )
+    return memory.register_feature_groups(
+        feature_store, version=version, include=include
+    )
+
+
 class ChatMemory(ABC):
     """Conversation store keyed by conversation_id.
 
@@ -489,6 +578,7 @@ class PersistentAgentMemory(ChatMemory):
         recency_half_life_days: float | None = 30.0,
         search_oversample: int = 3,
         deployment_id: str | None = None,
+        create_tables: bool = True,
     ):
         try:
             import sqlalchemy  # noqa: F401 — fail fast if the extra is missing
@@ -522,6 +612,11 @@ class PersistentAgentMemory(ChatMemory):
         self._url = url  # resolved lazily (may read env/secrets)
         self._table_name = table_name
         self._deployment_id = deployment_id
+        # False for a handle that only wants to look at the schema — feature
+        # group registration, say. Inspecting a database should never be the
+        # thing that creates a table in it, and a tier this agent does not run
+        # would otherwise be conjured into existence by the act of listing it.
+        self._create_tables = create_tables
         # resolved on first connect, then constant for the process
         self._deployment: str | None = None
         # conversation_id -> (summary_version, turns). The version is what makes
@@ -802,14 +897,15 @@ class PersistentAgentMemory(ChatMemory):
                 # created by *another deployment* is the ordinary case, so a
                 # duplicate-object error here means someone else succeeded and
                 # is not a failure.
-                try:
-                    metadata.create_all(engine, checkfirst=True)
-                except Exception as err:  # noqa: BLE001
-                    if not _already_exists(err):
-                        raise
-                    log.debug("Memory tables already created concurrently")
-                if not self._check_schema_version(engine, meta, table_name):
-                    return False
+                if self._create_tables:
+                    try:
+                        metadata.create_all(engine, checkfirst=True)
+                    except Exception as err:  # noqa: BLE001
+                        if not _already_exists(err):
+                            raise
+                        log.debug("Memory tables already created concurrently")
+                    if not self._check_schema_version(engine, meta, table_name):
+                        return False
                 self._engine = engine
                 self._deployment = deployment
                 self._table = table
@@ -1092,14 +1188,21 @@ class PersistentAgentMemory(ChatMemory):
                 f"Unknown table(s) {unknown}. Choose from {sorted(candidates)}."
             )
 
+        from sqlalchemy import inspect as sqlalchemy_inspect
+
+        inspector = sqlalchemy_inspect(self._engine)
         connector = feature_store.get_online_storage_connector()
         registered = {}
         for name in wanted:
             table, event_time = candidates[name]
-            if table is None:
-                # sessions needs a summarizer, state needs long_term — a tier
-                # that is switched off has no table to expose
-                log.info("Skipping %s: that memory tier is not enabled", name)
+            if table is None or not inspector.has_table(table.name):
+                # Asked of the database, not of this object's configuration: a
+                # store constructed without a summarizer still has no
+                # `sessions` attribute even when the table is sitting there,
+                # written by the agent that does have one. Registering what
+                # exists is the useful behaviour; registering what this
+                # particular handle was configured for is not.
+                log.info("Skipping %s: no such table in the database", name)
                 continue
             existing = feature_store.get_external_feature_group(
                 name=table.name, version=version

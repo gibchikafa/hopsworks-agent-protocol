@@ -2684,3 +2684,99 @@ class TestFeatureGroupRegistration:
         assert features["content"] == "string"
         assert features["created_at"] == "timestamp"
         assert features["seq"] == "int"
+
+
+class TestRegistrationEntryPoint:
+    """Registering from a notebook: no deployment, no MYSQL_* env vars."""
+
+    def test_url_is_derived_from_the_online_connector(self):
+        from hopsworks_agent_protocol.memory import _url_from_connector
+
+        class Connector:
+            connection_string = (
+                "jdbc:mysql://onlinefs.mysql.service.consul:3306/g1?useSSL=false"
+            )
+            arguments = {"user": "g1_meb10000", "password": "s3cret"}
+
+        assert _url_from_connector(Connector()) == (
+            "mysql+pymysql://g1_meb10000:s3cret@onlinefs.mysql.service.consul:3306/g1"
+        )
+
+    def test_connector_arguments_may_be_a_list(self):
+        from hopsworks_agent_protocol.memory import _url_from_connector
+
+        class Connector:
+            connection_string = "jdbc:mysql://h:3306/db"
+            arguments = [
+                {"name": "user", "value": "u"},
+                {"name": "password", "value": "p"},
+            ]
+
+        assert _url_from_connector(Connector()) == "mysql+pymysql://u:p@h:3306/db"
+
+    def test_unusable_connector_says_so(self):
+        from hopsworks_agent_protocol.memory import _url_from_connector
+
+        class Connector:
+            connection_string = "jdbc:postgresql://h:5432/db"
+            arguments = {}
+
+        with pytest.raises(RuntimeError, match="Pass url="):
+            _url_from_connector(Connector())
+
+    def test_registers_only_tables_that_exist(self, tmp_path, monkeypatch):
+        import sys
+        import types
+
+        from hopsworks_agent_protocol.memory import register_feature_groups
+
+        class Feature:
+            def __init__(self, name, type=None):  # noqa: A002
+                self.name = name
+                self.type = type
+
+        mod = types.ModuleType("hsfs")
+        feature_mod = types.ModuleType("hsfs.feature")
+        feature_mod.Feature = Feature
+        mod.feature = feature_mod
+        monkeypatch.setitem(sys.modules, "hsfs", mod)
+        monkeypatch.setitem(sys.modules, "hsfs.feature", feature_mod)
+
+        url = f"sqlite:///{tmp_path}/m.db"
+        # an agent that runs without the durable-state tier: only items and
+        # sessions are ever created
+        from hopsworks_agent_protocol import PersistentAgentMemory
+
+        agent = PersistentAgentMemory(
+            url=url,
+            deployment_id="d1",
+            long_term=False,
+            summarize=lambda prev, turns: "s",
+        )
+        assert agent.healthcheck() is True
+
+        created = []
+
+        class FakeFG:
+            def __init__(self, **kw):
+                self.kw = kw
+
+            def save(self):
+                created.append(self.kw["name"])
+
+        class FakeStore:
+            def get_online_storage_connector(self):
+                return "connector"
+
+            def get_external_feature_group(self, name, version):
+                return None
+
+            def create_external_feature_group(self, **kw):
+                return FakeFG(**kw)
+
+        registered = register_feature_groups(FakeStore(), url=url)
+
+        # the entry point declares all three tiers so their definitions exist,
+        # but state was never created, so it is not registered
+        assert set(registered) == {"items", "sessions"}
+        assert "agent_memory_state" not in created
