@@ -2534,3 +2534,153 @@ class TestSharedTableNames:
         assert memory._meta.name == "agent_memory_meta_42"
         assert memory._sessions.name == "agent_memory_sessions_42"
         assert memory._state.name == "agent_memory_state_42"
+
+
+class TestFeatureGroupRegistration:
+    """Memory tables exposed to the feature store for analysis.
+
+    Read-through only: the agent keeps writing over SQL, and these tests pin
+    that nothing here turns into a write path.
+    """
+
+    @pytest.fixture
+    def fake_hsfs(self, monkeypatch):
+        import sys
+        import types
+
+        class Feature:
+            def __init__(self, name, type=None):  # noqa: A002
+                self.name = name
+                self.type = type
+
+        mod = types.ModuleType("hsfs")
+        feature_mod = types.ModuleType("hsfs.feature")
+        feature_mod.Feature = Feature
+        mod.feature = feature_mod
+        monkeypatch.setitem(sys.modules, "hsfs", mod)
+        monkeypatch.setitem(sys.modules, "hsfs.feature", feature_mod)
+        return Feature
+
+    class FakeFG:
+        def __init__(self, **kw):
+            self.kw = kw
+            self.saved = False
+
+        def save(self):
+            self.saved = True
+
+    class FakeStore:
+        def __init__(self):
+            self.created = []
+            self.existing = {}
+
+        def get_online_storage_connector(self):
+            return "online-connector"
+
+        def get_external_feature_group(self, name, version):
+            return self.existing.get((name, version))
+
+        def create_external_feature_group(self, **kw):
+            fg = TestFeatureGroupRegistration.FakeFG(**kw)
+            self.created.append(fg)
+            return fg
+
+    def _store(self, tmp_path, **kw):
+        from hopsworks_agent_protocol import PersistentAgentMemory
+
+        memory = PersistentAgentMemory(
+            url=f"sqlite:///{tmp_path}/m.db",
+            deployment_id="d1",
+            long_term=True,
+            summarize=lambda prev, turns: "s",
+            **kw,
+        )
+        assert memory.healthcheck() is True
+        return memory
+
+    def test_registers_the_three_data_tables(self, tmp_path, fake_hsfs):
+        memory = self._store(tmp_path)
+        fs = self.FakeStore()
+
+        registered = memory.register_feature_groups(fs)
+
+        assert set(registered) == {"items", "sessions", "state"}
+        names = {fg.kw["name"] for fg in fs.created}
+        # meta is a single schema-version row; there is nothing to analyse
+        assert names == {
+            "agent_memory_items",
+            "agent_memory_sessions",
+            "agent_memory_state",
+        }
+        assert all(fg.saved for fg in fs.created)  # create is lazy in hsfs
+
+    def test_is_read_through_and_does_not_scan_the_serving_db(
+        self, tmp_path, fake_hsfs
+    ):
+        memory = self._store(tmp_path)
+        fs = self.FakeStore()
+        memory.register_feature_groups(fs)
+
+        for fg in fs.created:
+            # a query against the connector, not a copy of the data
+            assert fg.kw["query"] == f"SELECT * FROM {fg.kw['name']}"
+            assert fg.kw["storage_connector"] == "online-connector"
+            # statistics would scan the database the agent serves from
+            assert fg.kw["statistics_config"] is False
+
+    def test_carries_keys_and_event_time(self, tmp_path, fake_hsfs):
+        memory = self._store(tmp_path)
+        fs = self.FakeStore()
+        memory.register_feature_groups(fs)
+        by_name = {fg.kw["name"]: fg.kw for fg in fs.created}
+
+        assert by_name["agent_memory_items"]["event_time"] == "created_at"
+        assert by_name["agent_memory_state"]["event_time"] == "updated_at"
+        # sessions is keyed by the pair, since conversation ids can collide
+        # across deployments
+        assert by_name["agent_memory_sessions"]["primary_key"] == [
+            "deployment_id",
+            "conversation_id",
+        ]
+
+    def test_existing_group_is_reused_not_duplicated(self, tmp_path, fake_hsfs):
+        memory = self._store(tmp_path)
+        fs = self.FakeStore()
+        fs.existing[("agent_memory_items", 1)] = "already there"
+
+        registered = memory.register_feature_groups(fs)
+
+        assert registered["items"] == "already there"
+        assert "agent_memory_items" not in {fg.kw["name"] for fg in fs.created}
+
+    def test_include_selects_a_subset(self, tmp_path, fake_hsfs):
+        memory = self._store(tmp_path)
+        fs = self.FakeStore()
+        memory.register_feature_groups(fs, include=("state",))
+        assert [fg.kw["name"] for fg in fs.created] == ["agent_memory_state"]
+
+    def test_unknown_table_is_refused(self, tmp_path, fake_hsfs):
+        memory = self._store(tmp_path)
+        with pytest.raises(ValueError, match="Unknown table"):
+            memory.register_feature_groups(self.FakeStore(), include=("nope",))
+
+    def test_disabled_tier_is_skipped_not_invented(self, tmp_path, fake_hsfs):
+        from hopsworks_agent_protocol import PersistentAgentMemory
+
+        memory = PersistentAgentMemory(
+            url=f"sqlite:///{tmp_path}/m.db", deployment_id="d1", long_term=False
+        )
+        assert memory.healthcheck() is True
+        fs = self.FakeStore()
+        registered = memory.register_feature_groups(fs)
+        # no summarizer and no long_term: only the items table exists
+        assert set(registered) == {"items"}
+
+    def test_column_types_map_to_feature_types(self, tmp_path, fake_hsfs):
+        memory = self._store(tmp_path)
+        features = {f.name: f.type for f in memory._features_for(memory._table)}
+        assert features["id"] == "int"
+        assert features["deployment_id"] == "string"
+        assert features["content"] == "string"
+        assert features["created_at"] == "timestamp"
+        assert features["seq"] == "int"

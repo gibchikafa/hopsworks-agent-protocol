@@ -992,6 +992,140 @@ class PersistentAgentMemory(ChatMemory):
         with self._lock:
             self._cache.pop(conversation_id, None)
 
+    # ── feature-store registration (optional) ────────────────────────────
+
+    #: SQLAlchemy column type -> Hopsworks feature type, for the types this
+    #: module actually declares. Deliberately not a guess-anything mapping: a
+    #: type that turns up here unmapped is a schema change someone forgot to
+    #: think about, and should fail rather than be silently called a string.
+    #: Keyed on the SQLAlchemy type class name, which is what the column
+    #: objects carry ("String", not "VARCHAR"); the SQL spellings are here too
+    #: so a reflected table maps as readily as a declared one.
+    _FEATURE_TYPES = {
+        "INTEGER": "int",
+        "SMALLINTEGER": "int",
+        "SMALLINT": "int",
+        "STRING": "string",
+        "VARCHAR": "string",
+        "TEXT": "string",
+        "DATETIME": "timestamp",
+        "TIMESTAMP": "timestamp",
+    }
+
+    def _features_for(self, table):
+        from hsfs.feature import Feature
+
+        features = []
+        for column in table.columns:
+            name = type(column.type).__name__.upper()
+            kind = self._FEATURE_TYPES.get(name)
+            if kind is None:
+                raise RuntimeError(
+                    f"No Hopsworks feature type for column {column.name!r} "
+                    f"({name}) of {table.name}. Add it to _FEATURE_TYPES."
+                )
+            features.append(Feature(column.name, type=kind))
+        return features
+
+    def register_feature_groups(
+        self, feature_store=None, *, version: int = 1, include=None
+    ) -> dict:
+        """Expose the memory tables to the feature store, for analysis.
+
+        The tables stay exactly as they are and the agent keeps reading and
+        writing them over SQL. What this adds is **external** feature groups —
+        read-through definitions over a storage connector — so the same rows
+        can be queried with the Hopsworks API alongside the rest of a project's
+        data. Nothing is copied, nothing is materialised, and the serving path
+        is untouched.
+
+        External is the load-bearing word. A regular feature group owns its
+        storage and expects hsfs to do the writing, which this data cannot
+        tolerate: history is read as an ordered range, turns are closed with a
+        predicate update, and erasure is a row delete — none of which the
+        online feature-group API offers. Read-through gives the analysis story
+        without any of that.
+
+        The connector is the project's own online feature store, which is where
+        these tables already live, so no new credentials are involved.
+
+        Call it deliberately — from a notebook or a setup job, not at startup.
+        It is an operator action, so unlike everything else in this class it
+        raises on failure instead of degrading: a registration that silently
+        did nothing would be discovered as an empty feature group weeks later.
+
+        Note that this makes the rows readable by anyone with feature-store
+        access to the project, which is wider than the agent's own audience.
+        For transcripts (``agent_memory_items``) that means end-user
+        conversations become project-visible.
+
+        Args:
+            feature_store: an existing feature store handle; logs in if omitted.
+            version: feature group version to create.
+            include: table short names to register — any of "items",
+                "sessions", "state". Defaults to all that exist.
+
+        Returns:
+            ``{short_name: feature_group}`` for what was registered.
+        """
+        if not self._ensure_engine():
+            raise RuntimeError(
+                "Memory tables are not reachable, so there is nothing to "
+                "register. Check the database connection first."
+            )
+        if feature_store is None:
+            import hopsworks
+
+            feature_store = hopsworks.login().get_feature_store()
+
+        # event_time points at the column that says when the row happened, so
+        # the feature store can reason about time without being told again
+        candidates = {
+            "items": (self._table, "created_at"),
+            "sessions": (self._sessions, "last_active_at"),
+            "state": (self._state, "updated_at"),
+        }
+        wanted = list(candidates) if include is None else list(include)
+        unknown = [name for name in wanted if name not in candidates]
+        if unknown:
+            raise ValueError(
+                f"Unknown table(s) {unknown}. Choose from {sorted(candidates)}."
+            )
+
+        connector = feature_store.get_online_storage_connector()
+        registered = {}
+        for name in wanted:
+            table, event_time = candidates[name]
+            if table is None:
+                # sessions needs a summarizer, state needs long_term — a tier
+                # that is switched off has no table to expose
+                log.info("Skipping %s: that memory tier is not enabled", name)
+                continue
+            existing = feature_store.get_external_feature_group(
+                name=table.name, version=version
+            )
+            if existing is not None:
+                registered[name] = existing
+                continue
+            registered[name] = feature_store.create_external_feature_group(
+                name=table.name,
+                version=version,
+                storage_connector=connector,
+                query=f"SELECT * FROM {table.name}",
+                description=(
+                    f"Agent memory ({name}), read through to the project "
+                    "database. Written by hopsworks-agent-protocol over SQL; "
+                    "do not write through this feature group."
+                ),
+                primary_key=[c.name for c in table.primary_key.columns],
+                event_time=event_time,
+                features=self._features_for(table),
+                # statistics would scan the serving database on a schedule
+                statistics_config=False,
+            )
+            registered[name].save()
+        return registered
+
     def healthcheck(self) -> bool:
         # ready once the engine + tables are established and reachable; this is
         # also where a deployment's DDL runs, off the request path
