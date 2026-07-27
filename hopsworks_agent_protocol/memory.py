@@ -736,14 +736,17 @@ class PersistentAgentMemory(ChatMemory):
                 )
             return True
 
-    def _fold_state(self, conversation_id: str) -> tuple[int, int]:
-        """``(summary_version, last_summarized_item_id)`` for a conversation.
+    def _fold_state(self, conversation_id: str) -> tuple[int, int, int | None]:
+        """``(summary_version, last_summarized_item_id, message_count)``.
 
-        ``(0, 0)`` without a summarizer — nothing folds, so there is no session
-        row to read and no reason to pay for one.
+        ``message_count`` is ``None`` when there is no session row to read —
+        without a summarizer nothing folds, so paying for that read every turn
+        would buy nothing. It is not ``0``: callers have to tell "this
+        conversation holds no messages" apart from "there is no row to ask",
+        because the second means the cache cannot be validated at all.
         """
         if self._summarize is None or self._sessions is None:
-            return (0, 0)
+            return (0, 0, None)
         s = self._sessions
         try:
             with self._engine.connect() as conn:
@@ -752,19 +755,27 @@ class PersistentAgentMemory(ChatMemory):
                 ).fetchone()
         except Exception:  # noqa: BLE001
             log.exception("Session read failed; treating conversation as unfolded")
-            return (0, 0)
+            return (0, 0, None)
         if row is None:
-            return (0, 0)
-        return (row.summary_version, row.last_summarized_item_id)
+            return (0, 0, 0)
+        return (row.summary_version, row.last_summarized_item_id, row.message_count)
 
     def get(self, conversation_id: str) -> list[Turn]:
         if not self._ensure_engine():
             return []
-        version, cutoff = self._fold_state(conversation_id)
-        with self._lock:
-            cached = self._cache.get(conversation_id)
-            if cached is not None and cached[0] == version:
-                return list(cached[1])
+        version, cutoff, count = self._fold_state(conversation_id)
+        # Cache identity is (fold version, message count). The version alone
+        # only moves on a fold, so between folds — and always without a
+        # summarizer, where it is pinned at 0 — a replica that cached this
+        # conversation never saw turns written by another replica, and the model
+        # silently lost them under round-robin routing. The count comes from the
+        # session row already read above, so this costs nothing extra.
+        key = (version, count)
+        if count is not None:
+            with self._lock:
+                cached = self._cache.get(conversation_id)
+                if cached is not None and cached[0] == key:
+                    return list(cached[1])
         t = self._table
         try:
             with self._engine.connect() as conn:
@@ -788,11 +799,24 @@ class PersistentAgentMemory(ChatMemory):
             log.exception("Memory read failed; returning empty history")
             return []
         turns = [{"role": r.role, "content": r.content} for r in reversed(rows)]
-        with self._lock:
-            self._cache[conversation_id] = (version, list(turns))
+        if count is not None:
+            with self._lock:
+                self._cache[conversation_id] = (key, list(turns))
         return turns
 
     def clear(self, conversation_id: str) -> None:
+        """Drop a conversation: its messages **and** its session row.
+
+        The session row has to go too. It holds the rolling summary — a
+        distillation of the very messages being deleted — so deleting only the
+        items leaves the content readable through ``get_summary`` and
+        ``system_context()``. It also holds ``message_count`` and the fold
+        cursor, so a reused conversation id would otherwise fold immediately and
+        blend the deleted conversation into the new one's summary.
+
+        Both statements share a transaction: a half-cleared conversation whose
+        summary outlived its messages is the exact state this exists to prevent.
+        """
         if self._ensure_engine():
             try:
                 with self._engine.begin() as conn:
@@ -801,6 +825,12 @@ class PersistentAgentMemory(ChatMemory):
                             self._table.c.conversation_id == conversation_id
                         )
                     )
+                    if self._sessions is not None:
+                        conn.execute(
+                            self._sessions.delete().where(
+                                self._sessions.c.conversation_id == conversation_id
+                            )
+                        )
             except Exception:  # noqa: BLE001
                 log.exception("Memory clear failed")
         with self._lock:
@@ -970,32 +1000,39 @@ class PersistentAgentMemory(ChatMemory):
         t = self._table
         try:
             with self._engine.begin() as conn:
-                conn.execute(
+                result = conn.execute(
                     t.update()
                     .where(t.c.conversation_id == conversation_id)
                     .where(t.c.turn_id == turn_id)
-                    .where(t.c.status == TURN_OPEN)
+                    # NOT `status == open`: the reaper may have already flipped
+                    # this turn to abandoned for outliving turn_timeout_seconds,
+                    # which agents legitimately do on deep tool loops. A turn
+                    # that actually finished should win over the reaper's guess,
+                    # otherwise the completed answer stays abandoned and
+                    # invisible to get(). Already-closed rows are excluded so a
+                    # duplicate end_turn cannot reopen or re-count anything.
+                    .where(t.c.status != TURN_CLOSED)
                     .values(status=status)
                 )
         except Exception:  # noqa: BLE001
             log.exception("Memory end_turn failed; turn left open")
             return
+        if result.rowcount == 0:
+            # Nothing transitioned: the turn was already closed, so its messages
+            # are already counted and cached. Bumping again would drift the fold
+            # trigger and duplicate rows in the cache.
+            return
         if status == TURN_CLOSED and pending:
             self._bump_message_count(conversation_id, len(pending))
-            # the turn's rows just became visible — extend the cache rather
-            # than dropping it, so closing a turn costs no extra read. If a
-            # fold lands concurrently the version moves on and the next read
-            # rebuilds; nothing here has to know about that.
-            with self._lock:
-                cached = self._cache.get(conversation_id)
-                if cached is not None:
-                    version, turns = cached
-                    turns.extend(pending)
-                    if len(turns) > self._max:
-                        del turns[: len(turns) - self._max]
-        elif status != TURN_CLOSED:
-            with self._lock:
-                self._cache.pop(conversation_id, None)
+        # Drop the entry either way. This used to extend the cache in place to
+        # save a read, but the entry is now identified by (fold version, message
+        # count) and the count has just moved — so an extended entry would carry
+        # a key the next get() cannot match, and would have to be rebuilt
+        # anyway. Dropping it costs one indexed read on the next turn and
+        # removes the only path by which the in-process copy could drift from
+        # the table.
+        with self._lock:
+            self._cache.pop(conversation_id, None)
 
     def _bump_message_count(self, conversation_id: str, added: int) -> None:
         """Track how many messages the conversation holds, for the fold trigger.

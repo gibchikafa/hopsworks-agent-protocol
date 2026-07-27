@@ -46,6 +46,15 @@ FEATURES = (
 )
 
 
+class VectorPurgeError(RuntimeError):
+    """A purge could not be completed, so the content may still be searchable.
+
+    Distinct from "nothing matched": erasure is the one operation where an
+    unreported failure is worse than an error, because the caller has told a
+    user their data is gone.
+    """
+
+
 class VectorStore(ABC):
     """Where embedded memories live and are searched."""
 
@@ -77,6 +86,9 @@ class VectorStore(ABC):
 
         Deletion is a two-store problem: this holds a *copy* of the content, so
         deleting from MySQL alone leaves it searchable here.
+
+        Raises :class:`VectorPurgeError` if the rows could not be removed. A
+        return of ``0`` therefore means "nothing matched", never "it failed".
         """
 
     def healthcheck(self) -> bool:
@@ -408,19 +420,35 @@ class HopsworksVectorStore(VectorStore):
             )
             return 0
         try:
+            # `online=True` is not optional: ingest writes with
+            # storage="online" only, so the offline Delta table this defaults to
+            # is always empty. Worse, a serving pod cannot reach HopsFS at all,
+            # so the default read raises there — and the old blanket `except`
+            # turned that into "purged 0 rows", reporting a deletion that never
+            # happened. The filter stays client-side because the online store is
+            # a key-value lookup, not a query engine; there is no predicate to
+            # push down.
+            frame = fg.read(online=True)
             keys = [
                 row["item_id"]
-                for _, row in fg.read().iterrows()
+                for _, row in frame.iterrows()
                 if all(row.get(col) == val for col, val in probe.items())
             ]
             for key in keys:
                 delete_rows({"item_id": key})
             return len(keys)
-        except Exception:  # noqa: BLE001
+        except Exception as err:  # noqa: BLE001
+            # Raise rather than return 0. This is the erasure path: a caller
+            # that is told "0 rows removed" cannot tell "there was nothing to
+            # delete" from "the delete failed and the content is still
+            # searchable", and only one of those is safe to report to someone
+            # who asked to be forgotten.
             log.exception(
                 "Vector purge failed — deleted content may remain searchable"
             )
-            return 0
+            raise VectorPurgeError(
+                f"Could not purge vectors for {probe}: {err}"
+            ) from err
 
 
 def vector_store_for(embedder, deployment_id: str | None = None, **kwargs):

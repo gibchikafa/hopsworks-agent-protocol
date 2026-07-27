@@ -2086,3 +2086,147 @@ class TestSemanticSearch:
             "state": True,
             "search": True,
         }
+
+
+class TestReviewRegressions:
+    """Bugs found reviewing the implementation against the design doc.
+
+    Each of these failed silently: a stale summary served as if it were live, a
+    completed turn left invisible, a replica serving a truncated history, a
+    deletion reported as done. None raised, so only a test pins them.
+    """
+
+    def _store(self, tmp_path, **kw):
+        from hopsworks_agent_protocol import PersistentAgentMemory
+
+        return PersistentAgentMemory(
+            url=f"sqlite:///{tmp_path}/m.db",
+            table_name="agent_memory_items_r",
+            **kw,
+        )
+
+    def test_clear_drops_the_summary_not_just_the_messages(self, tmp_path):
+        memory = self._store(tmp_path, summarize=lambda *a, **k: "a summary")
+        memory.append("c1", "user", "something private")
+        with memory._engine.begin() as conn:
+            s = memory._sessions
+            conn.execute(
+                s.update()
+                .where(s.c.conversation_id == "c1")
+                .values(summary="a distillation of something private")
+            )
+        assert memory.get_summary("c1")
+
+        memory.clear("c1")
+
+        # the summary is derived from the deleted messages, so it goes with them
+        assert memory.get_summary("c1") is None
+        assert memory.get("c1") == []
+
+    def test_reused_conversation_id_does_not_inherit_the_fold_cursor(self, tmp_path):
+        memory = self._store(tmp_path, summarize=lambda *a, **k: "s")
+        for i in range(6):
+            memory.append("c1", "user", f"m{i}")
+        memory.clear("c1")
+        with memory._engine.connect() as conn:
+            s = memory._sessions
+            row = conn.execute(
+                s.select().where(s.c.conversation_id == "c1")
+            ).fetchone()
+        # no row at all: a stale message_count would trigger an immediate fold
+        # and blend the deleted conversation into the new one's summary
+        assert row is None
+
+    def test_completed_turn_beats_the_reaper(self, tmp_path):
+        memory = self._store(tmp_path)
+        memory.begin_turn("c1", "t1", "user", "a slow question")
+        memory.record_item("c1", "t1", "assistant", "the answer")
+        # the reaper flips a long-running turn to abandoned while it is still
+        # working — deep tool loops legitimately outlive turn_timeout_seconds
+        memory.end_turn("c1", "t1", status="abandoned")
+        # ...and then it finishes
+        memory.end_turn("c1", "t1")
+
+        assert memory.get("c1") == [
+            {"role": "user", "content": "a slow question"},
+            {"role": "assistant", "content": "the answer"},
+        ]
+
+    def test_double_close_does_not_double_count(self, tmp_path):
+        memory = self._store(tmp_path, summarize=lambda *a, **k: "s")
+        memory.begin_turn("c1", "t1", "user", "q")
+        memory.record_item("c1", "t1", "assistant", "a")
+        memory.end_turn("c1", "t1")
+        memory.end_turn("c1", "t1")
+        with memory._engine.connect() as conn:
+            s = memory._sessions
+            row = conn.execute(
+                s.select().where(s.c.conversation_id == "c1")
+            ).fetchone()
+        assert row.message_count == 2
+
+    def test_replica_sees_turns_written_by_another_replica(self, tmp_path):
+        url = f"sqlite:///{tmp_path}/m.db"
+        kw = {"table_name": "agent_memory_items_r", "summarize": lambda *a, **k: "s"}
+        from hopsworks_agent_protocol import PersistentAgentMemory
+
+        one = PersistentAgentMemory(url=url, **kw)
+        two = PersistentAgentMemory(url=url, **kw)
+
+        one.append("c1", "user", "first")
+        assert one.get("c1") == [{"role": "user", "content": "first"}]  # caches
+
+        two.append("c1", "user", "second")  # the other replica takes the turn
+
+        # no fold happened, so the summary version is unchanged: only the
+        # message count tells replica one its cached copy is short
+        assert one.get("c1") == [
+            {"role": "user", "content": "first"},
+            {"role": "user", "content": "second"},
+        ]
+
+    def test_failed_purge_raises_instead_of_reporting_zero(self):
+        from hopsworks_agent_protocol.vectorstore import (
+            HopsworksVectorStore,
+            VectorPurgeError,
+        )
+
+        class Unreadable:
+            def read(self, online=False):
+                raise RuntimeError("Connection to HopsFS failed")
+
+            def delete_from_online_store(self, keys):
+                raise AssertionError("should not be reached")
+
+        store = HopsworksVectorStore("d1", 3)
+        store._fg = Unreadable()
+
+        # "0 rows removed" would be indistinguishable from "nothing matched",
+        # and this is the path that tells a user their data is gone
+        with pytest.raises(VectorPurgeError):
+            store.purge(conversation_id="c1")
+
+    def test_purge_reads_the_online_store(self):
+        from hopsworks_agent_protocol.vectorstore import HopsworksVectorStore
+
+        seen = {}
+
+        class Recording:
+            def read(self, online=False):
+                seen["online"] = online
+                # duck-typed stand-in for a DataFrame: purge only ever calls
+                # iterrows(), and pandas is not a test dependency
+                rows = [{"item_id": "i1", "conversation_id": "c1"}]
+                return type(
+                    "Frame", (), {"iterrows": lambda self: enumerate(rows)}
+                )()
+
+            def delete_from_online_store(self, keys):
+                seen.setdefault("deleted", []).append(keys)
+
+        store = HopsworksVectorStore("d1", 3)
+        store._fg = Recording()
+        assert store.purge(conversation_id="c1") == 1
+        # ingest writes online-only, so the offline table this defaults to is
+        # always empty — and unreachable from a serving pod
+        assert seen["online"] is True
