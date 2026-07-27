@@ -1115,15 +1115,30 @@ class TestMemorySchemaGuards:
 
         monkeypatch.delenv("DEPLOYMENT_ID", raising=False)
         memory = PersistentAgentMemory()
+        # tables are shared now, so an agent with no identity would read and
+        # write every other agent's rows rather than merely share a table name
         with pytest.raises(RuntimeError, match="DEPLOYMENT_ID"):
-            memory._resolve_table_name()
+            memory._resolve_deployment_id()
 
-    def test_uses_deployment_id_for_table_name(self, monkeypatch, tmp_path):
+    def test_deployment_id_scopes_rows_not_the_table_name(
+        self, monkeypatch, tmp_path
+    ):
         from hopsworks_agent_protocol import PersistentAgentMemory
 
         monkeypatch.setenv("DEPLOYMENT_ID", "42")
         memory = PersistentAgentMemory(url=f"sqlite:///{tmp_path}/m.db")
-        assert memory._resolve_table_name() == "agent_memory_items_42"
+        assert memory._resolve_deployment_id() == "42"
+        assert memory._resolve_table_name() == "agent_memory_items"
+
+    def test_rejects_a_deployment_id_that_is_not_an_identifier(
+        self, monkeypatch, tmp_path
+    ):
+        from hopsworks_agent_protocol import PersistentAgentMemory
+
+        monkeypatch.setenv("DEPLOYMENT_ID", "42; DROP TABLE x")
+        memory = PersistentAgentMemory(url=f"sqlite:///{tmp_path}/m.db")
+        with pytest.raises(RuntimeError, match="Invalid deployment_id"):
+            memory._resolve_deployment_id()
 
     def test_records_schema_version(self, tmp_path):
         from sqlalchemy import select
@@ -2386,3 +2401,103 @@ class TestRetrievalAndReconciliation:
             assert "Forgot" in tools.forget("Preferred Language")
         finally:
             tools._resolve = original
+
+
+class TestDeploymentIsolation:
+    """Every agent in a project now shares one set of tables.
+
+    Before consolidation, isolation was physical — a query could not reach
+    another deployment's rows because they were in another table. Now it is a
+    WHERE clause on every statement, so a single omission silently returns,
+    edits or deletes someone else's memory. These tests are what stands in for
+    the table boundary that used to do it.
+    """
+
+    def _pair(self, tmp_path, **kw):
+        from hopsworks_agent_protocol import PersistentAgentMemory
+
+        url = f"sqlite:///{tmp_path}/shared.db"
+        common = dict(url=url, long_term=True, **kw)
+        return (
+            PersistentAgentMemory(deployment_id="agent_a", **common),
+            PersistentAgentMemory(deployment_id="agent_b", **common),
+        )
+
+    def test_same_conversation_id_in_two_deployments_stays_apart(self, tmp_path):
+        a, b = self._pair(tmp_path)
+        # conversation ids are chosen by clients; two agents can collide
+        a.append("shared-id", "user", "agent A's message")
+        b.append("shared-id", "user", "agent B's message")
+
+        assert a.get("shared-id") == [{"role": "user", "content": "agent A's message"}]
+        assert b.get("shared-id") == [{"role": "user", "content": "agent B's message"}]
+
+    def test_state_is_per_deployment_for_the_same_subject(self, tmp_path):
+        a, b = self._pair(tmp_path)
+        a.set_state("user", "alice", "tone", "formal")
+        b.set_state("user", "alice", "tone", "playful")
+
+        # the same person talking to two agents keeps two memories, and the
+        # unique constraint must not collapse them onto one row
+        assert a.get_state("user", "alice", "tone") == "formal"
+        assert b.get_state("user", "alice", "tone") == "playful"
+        assert len(a.list_state("user", "alice")) == 1
+
+    def test_app_scope_does_not_leak_between_deployments(self, tmp_path):
+        a, b = self._pair(tmp_path)
+        # `app` scope is owner='' — without deployment_id in the key, every
+        # agent's app state would collapse onto a single row
+        a.set_state("app", "", "policy", "A refunds up to 50")
+        b.set_state("app", "", "policy", "B refunds nothing")
+        assert a.get_state("app", "", "policy") == "A refunds up to 50"
+        assert b.get_state("app", "", "policy") == "B refunds nothing"
+
+    def test_clear_does_not_delete_another_deployments_conversation(self, tmp_path):
+        a, b = self._pair(tmp_path)
+        a.append("shared-id", "user", "keep me")
+        b.append("shared-id", "user", "delete me")
+
+        b.clear("shared-id")
+
+        assert a.get("shared-id") == [{"role": "user", "content": "keep me"}]
+        assert b.get("shared-id") == []
+
+    def test_delete_state_does_not_reach_another_deployment(self, tmp_path):
+        a, b = self._pair(tmp_path)
+        a.set_state("user", "alice", "tone", "formal")
+        b.set_state("user", "alice", "tone", "playful")
+
+        assert b.delete_state("user", "alice") == 1
+        assert a.get_state("user", "alice", "tone") == "formal"
+
+    def test_reaper_does_not_abandon_another_deployments_open_turn(self, tmp_path):
+        a, b = self._pair(tmp_path)
+        a.begin_turn("c1", "t1", "user", "A is still working")
+        b.begin_turn("c2", "t2", "user", "B is still working")
+
+        # B sweeps everything older than zero seconds — but only its own
+        assert b.reap_open_turns(older_than_seconds=0) == 1
+
+        a.record_item("c1", "t1", "assistant", "A finished")
+        a.end_turn("c1", "t1")
+        assert a.get("c1") == [
+            {"role": "user", "content": "A is still working"},
+            {"role": "assistant", "content": "A finished"},
+        ]
+
+    def test_keyword_search_does_not_cross_deployments(self, tmp_path):
+        a, b = self._pair(tmp_path)
+        a.append("c1", "user", "the password is hunter2")
+        b.append("c2", "user", "the password is swordfish")
+
+        hits = b.search("password", subject=None, k=10)
+        assert [h["content"] for h in hits] == ["the password is swordfish"]
+
+    def test_summary_is_per_deployment(self, tmp_path):
+        a, b = self._pair(tmp_path, summarize=lambda prev, turns: "a summary")
+        a.append("shared-id", "user", "A's history")
+        b.append("shared-id", "user", "B's history")
+        # sessions rows are keyed (deployment_id, conversation_id); a single-
+        # column PK would have made the second insert collide with the first
+        b.clear("shared-id")
+        assert a.get("shared-id") == [{"role": "user", "content": "A's history"}]

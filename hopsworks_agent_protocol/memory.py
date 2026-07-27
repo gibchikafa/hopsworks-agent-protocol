@@ -95,6 +95,22 @@ SCHEMA_VERSION = 1
 
 _TABLE_SUFFIX_RE = re.compile(r"^[A-Za-z0-9_]{1,48}$")
 
+#: Fragments MySQL, SQLite and Postgres use for "this object is already there".
+#: Matched on the message because SQLAlchemy does not normalise the DBAPI code
+#: for these across drivers.
+_EXISTS_MARKERS = ("already exists", "duplicate key", "duplicate entry")
+
+
+def _already_exists(err: Exception) -> bool:
+    """Did this DDL fail because someone else had already run it?
+
+    Two agents in a project start together, both find no tables, both issue
+    CREATE — one wins. The loser must treat that as success, or it marks itself
+    permanently unusable over a table that is sitting there working.
+    """
+    text = str(err).lower()
+    return any(marker in text for marker in _EXISTS_MARKERS)
+
 
 def new_turn_id() -> str:
     return f"turn_{uuid.uuid4().hex}"
@@ -454,6 +470,7 @@ class PersistentAgentMemory(ChatMemory):
         state_inject_value_chars: int = 1024,
         recency_half_life_days: float | None = 30.0,
         search_oversample: int = 3,
+        deployment_id: str | None = None,
     ):
         try:
             import sqlalchemy  # noqa: F401 — fail fast if the extra is missing
@@ -486,6 +503,9 @@ class PersistentAgentMemory(ChatMemory):
         self._search_oversample = max(1, search_oversample)
         self._url = url  # resolved lazily (may read env/secrets)
         self._table_name = table_name
+        self._deployment_id = deployment_id
+        # resolved on first connect, then constant for the process
+        self._deployment: str | None = None
         # conversation_id -> (summary_version, turns). The version is what makes
         # the cache safe once folding exists: another replica advancing the
         # cutoff bumps it, and this process notices on the next read instead of
@@ -502,46 +522,82 @@ class PersistentAgentMemory(ChatMemory):
         self._meta = None
         self._sessions = None
         self._state = None
-        self._init_failed = False
+        # a failed connect blocks retries until this monotonic deadline, with
+        # exponential backoff — never permanently (see _ensure_engine)
+        self._init_failed_until = 0.0
+        self._init_backoff = 1.0
         self._last_reap = 0.0
         self._last_prune = 0.0
 
-    def _resolve_table_name(self) -> str:
-        """Per-deployment table name, validated.
+    def _mine(self, stmt, table):
+        """Restrict a statement to this deployment's rows.
 
-        The suffix ends up in DDL. SQLAlchemy quotes identifiers so this is not
-        an injection vector, but an unvalidated ``DEPLOYMENT_ID`` still produces
-        junk table names — and the old ``'default'`` fallback would silently
-        make two deployments share one conversation history. So: an explicit
-        ``table_name`` wins, a deployment must have ``DEPLOYMENT_ID``, and only
-        a caller who passed their own ``url`` (tests, local dev) gets the
-        fallback.
+        Every read, update and delete in this module goes through here. It is a
+        one-line helper on purpose: with one shared table, a query that forgets
+        the deployment filter does not fail — it quietly returns, edits or
+        deletes another agent's memory. Making the filter a named call means a
+        missing one is visible when reading the code, and
+        ``TestDeploymentIsolation`` fails when it is not.
         """
-        if self._table_name is not None:
-            name = self._table_name
+        return stmt.where(table.c.deployment_id == self._deployment)
+
+    def _resolve_deployment_id(self) -> str:
+        """Which agent's rows these are.
+
+        Every deployment in a project shares one set of tables, so this value is
+        what keeps them apart — it is not a label, it is the first column of
+        every key and every WHERE clause in this module.
+
+        A deployment must therefore have a real one. The old ``'default'``
+        fallback was survivable when it only meant "share a table name"; now it
+        would mean two agents reading each other's conversations, so it is
+        allowed only for a caller who passed their own ``url`` (tests, local
+        development) and cannot be reached inside a deployment.
+        """
+        if self._deployment_id is not None:
+            value = self._deployment_id
         else:
-            deployment = os.environ.get("DEPLOYMENT_ID")
-            if deployment is None:
+            value = os.environ.get("DEPLOYMENT_ID")
+            if value is None:
                 if self._url is None:
                     raise RuntimeError(
-                        "DEPLOYMENT_ID is not set, so the per-deployment memory "
-                        "table name cannot be derived. Inside a Hopsworks agent "
+                        "DEPLOYMENT_ID is not set, so memory rows cannot be "
+                        "attributed to this agent. Inside a Hopsworks agent "
                         "deployment this is injected for you; elsewhere pass an "
-                        "explicit table_name= (or url=) to PersistentAgentMemory."
+                        "explicit deployment_id= (or url=) to "
+                        "PersistentAgentMemory."
                     )
                 log.warning(
-                    "DEPLOYMENT_ID is not set; falling back to the shared table "
-                    "suffix 'default'. Pass table_name= to keep deployments apart."
+                    "DEPLOYMENT_ID is not set; falling back to deployment_id "
+                    "'default'. Pass deployment_id= to keep agents apart."
                 )
-                deployment = "default"
-            name = f"agent_memory_items_{deployment}"
+                value = "default"
+        if not _TABLE_SUFFIX_RE.match(str(value)):
+            raise RuntimeError(
+                f"Invalid deployment_id {value!r}: must match "
+                "[A-Za-z0-9_]{1,48}."
+            )
+        return str(value)
 
+    def _resolve_table_name(self) -> str:
+        """The shared items table, validated.
+
+        Shared across the project rather than one table per deployment. Four
+        tables per agent meant a project with a hundred agents carried four
+        hundred tables, and every cold start ran DDL to make its own — which is
+        also where the replicas raced each other. One set of tables is created
+        once and found thereafter.
+
+        An explicit ``table_name`` still wins, for tests and for anyone who
+        wants a deployment kept physically apart.
+        """
+        name = self._table_name or "agent_memory_items"
         suffix = name[len("agent_memory_items_"):] if name.startswith(
             "agent_memory_items_"
         ) else name
-        if not _TABLE_SUFFIX_RE.match(suffix):
+        if suffix and not _TABLE_SUFFIX_RE.match(suffix):
             raise RuntimeError(
-                f"Invalid memory table name {name!r}: the deployment suffix must "
+                f"Invalid memory table name {name!r}: the suffix must "
                 "match [A-Za-z0-9_]{1,48}."
             )
         return name
@@ -557,12 +613,12 @@ class PersistentAgentMemory(ChatMemory):
         """
         if self._engine is not None:
             return True
-        if self._init_failed:
+        if time.monotonic() < self._init_failed_until:
             return False
         with self._lock:
             if self._engine is not None:
                 return True
-            if self._init_failed:
+            if time.monotonic() < self._init_failed_until:
                 return False
             try:
                 from sqlalchemy import (
@@ -580,16 +636,25 @@ class PersistentAgentMemory(ChatMemory):
                 )
 
                 url = self._url or deployment_mysql_url()
+                deployment = self._resolve_deployment_id()
                 table_name = self._resolve_table_name()
                 suffix = table_name[len("agent_memory_items_"):] if (
                     table_name.startswith("agent_memory_items_")
                 ) else table_name
+                # index and constraint names must stay unique per table, and
+                # the shared table has no suffix — so fall back to a fixed stem
+                suffix = suffix or "shared"
                 engine = create_engine(url, pool_pre_ping=True)
                 metadata = MetaData()
                 table = Table(
                     table_name,
                     metadata,
                     Column("id", Integer, primary_key=True, autoincrement=True),
+                    # Which deployment's memory this row is. One table now holds
+                    # every agent in the project, so this is not descriptive: it
+                    # is the first column of every index and every WHERE clause,
+                    # and omitting it anywhere is a cross-deployment data leak.
+                    Column("deployment_id", String(64), nullable=False),
                     Column("conversation_id", String(255), nullable=False),
                     Column("turn_id", String(64), nullable=False),
                     # the protocol message id, so anything written during the
@@ -603,14 +668,32 @@ class PersistentAgentMemory(ChatMemory):
                     Column("content", Text, nullable=False),
                     Column("created_at", DateTime, nullable=False),
                     Column("expires_at", DateTime, nullable=True),
-                    Index(f"idx_{suffix}_conv", "conversation_id", "id"),
-                    Index(f"idx_{suffix}_turn", "conversation_id", "turn_id"),
+                    # deployment_id leads all of these. A conversation id is
+                    # unique in practice, but an index that does not start with
+                    # the deployment turns every lookup into a scan of every
+                    # other agent's rows in the same table.
+                    Index(
+                        f"idx_{suffix}_conv", "deployment_id", "conversation_id", "id"
+                    ),
+                    Index(
+                        f"idx_{suffix}_turn",
+                        "deployment_id",
+                        "conversation_id",
+                        "turn_id",
+                    ),
                     # drives the "oldest open turn" lookup on the fold path
-                    Index(f"idx_{suffix}_open", "conversation_id", "status", "id"),
-                    Index(f"idx_{suffix}_msg", "message_id"),
+                    Index(
+                        f"idx_{suffix}_open",
+                        "deployment_id",
+                        "conversation_id",
+                        "status",
+                        "id",
+                    ),
+                    Index(f"idx_{suffix}_msg", "deployment_id", "message_id"),
                 )
                 meta = Table(
-                    f"agent_memory_meta_{suffix}",
+                    f"agent_memory_meta_{suffix}" if suffix != "shared"
+                    else "agent_memory_meta",
                     metadata,
                     Column("table_name", String(64), primary_key=True),
                     Column("schema_version", Integer, nullable=False),
@@ -620,8 +703,13 @@ class PersistentAgentMemory(ChatMemory):
                 if self._summarize is not None:
                     # tier 2 only: no summarizer, no bookkeeping to keep
                     sessions = Table(
-                        f"agent_memory_sessions_{suffix}",
+                        f"agent_memory_sessions_{suffix}" if suffix != "shared"
+                        else "agent_memory_sessions",
                         metadata,
+                        # composite PK: two deployments may legitimately use
+                        # the same conversation id, and before consolidation
+                        # they were kept apart by living in different tables
+                        Column("deployment_id", String(64), primary_key=True),
                         Column("conversation_id", String(255), primary_key=True),
                         Column("subject", String(255), nullable=True),
                         Column("summary", Text, nullable=True),
@@ -649,9 +737,11 @@ class PersistentAgentMemory(ChatMemory):
                 if self._long_term:
                     # tier 3 only
                     state = Table(
-                        f"agent_memory_state_{suffix}",
+                        f"agent_memory_state_{suffix}" if suffix != "shared"
+                        else "agent_memory_state",
                         metadata,
                         Column("id", Integer, primary_key=True, autoincrement=True),
+                        Column("deployment_id", String(64), nullable=False),
                         Column("scope", String(8), nullable=False),
                         # subject (user), '' (app), or conversation id (session)
                         Column("owner", String(255), nullable=False),
@@ -668,19 +758,40 @@ class PersistentAgentMemory(ChatMemory):
                         Column("updated_at", DateTime, nullable=False),
                         # agent-written state decays; operator-written does not
                         Column("expires_at", DateTime, nullable=True),
+                        # `app` scope is owner='' and agent-wide — with a
+                        # shared table that would collapse every deployment's
+                        # app state onto one row without deployment_id here
                         UniqueConstraint(
+                            "deployment_id",
                             "scope",
                             "owner",
                             "state_key",
                             name=f"uq_{suffix}_state",
                         ),
-                        Index(f"idx_{suffix}_state_owner", "scope", "owner"),
+                        Index(
+                            f"idx_{suffix}_state_owner",
+                            "deployment_id",
+                            "scope",
+                            "owner",
+                        ),
                     )
-                metadata.create_all(engine)
+                # checkfirst=True is create-if-not-exists, but two replicas
+                # starting together can still both pass the check and both
+                # issue CREATE. With one table per deployment that was a rare
+                # cold-start race; with shared tables, finding them already
+                # created by *another deployment* is the ordinary case, so a
+                # duplicate-object error here means someone else succeeded and
+                # is not a failure.
+                try:
+                    metadata.create_all(engine, checkfirst=True)
+                except Exception as err:  # noqa: BLE001
+                    if not _already_exists(err):
+                        raise
+                    log.debug("Memory tables already created concurrently")
                 if not self._check_schema_version(engine, meta, table_name):
-                    self._init_failed = True
                     return False
                 self._engine = engine
+                self._deployment = deployment
                 self._table = table
                 self._meta = meta
                 self._sessions = sessions
@@ -692,10 +803,18 @@ class PersistentAgentMemory(ChatMemory):
                 )
                 return True
             except Exception:  # noqa: BLE001 — degrade to stateless, never crash
-                self._init_failed = True
+                # Retryable, not sticky. This used to latch permanently, so a
+                # database blip during the first touch left the replica
+                # answering /ready with 503 forever while /health stayed ok —
+                # so Kubernetes never restarted it. A zombie replica is worse
+                # than a slow one.
+                self._init_failed_until = time.monotonic() + self._init_backoff
+                self._init_backoff = min(self._init_backoff * 2, 60.0)
                 log.exception(
-                    "PersistentAgentMemory could not connect to the database; the "
-                    "agent will run without persistent memory"
+                    "PersistentAgentMemory could not connect to the database; "
+                    "retrying in %.0fs, running without persistent memory until "
+                    "then",
+                    self._init_backoff,
                 )
                 return False
 
@@ -759,7 +878,9 @@ class PersistentAgentMemory(ChatMemory):
         try:
             with self._engine.connect() as conn:
                 row = conn.execute(
-                    s.select().where(s.c.conversation_id == conversation_id)
+                    self._mine(
+                        s.select().where(s.c.conversation_id == conversation_id), s
+                    )
                 ).fetchone()
         except Exception:  # noqa: BLE001
             log.exception("Session read failed; treating conversation as unfolded")
@@ -788,7 +909,7 @@ class PersistentAgentMemory(ChatMemory):
         try:
             with self._engine.connect() as conn:
                 rows = conn.execute(
-                    t.select()
+                    self._mine(t.select(), t)
                     .where(t.c.conversation_id == conversation_id)
                     # closed turns only: an open turn has no reply yet, and an
                     # abandoned one is a question we failed to answer — neither
@@ -829,14 +950,21 @@ class PersistentAgentMemory(ChatMemory):
             try:
                 with self._engine.begin() as conn:
                     conn.execute(
-                        self._table.delete().where(
-                            self._table.c.conversation_id == conversation_id
+                        self._mine(
+                            self._table.delete().where(
+                                self._table.c.conversation_id == conversation_id
+                            ),
+                            self._table,
                         )
                     )
                     if self._sessions is not None:
                         conn.execute(
-                            self._sessions.delete().where(
-                                self._sessions.c.conversation_id == conversation_id
+                            self._mine(
+                                self._sessions.delete().where(
+                                    self._sessions.c.conversation_id
+                                    == conversation_id
+                                ),
+                                self._sessions,
                             )
                         )
             except Exception:  # noqa: BLE001
@@ -888,6 +1016,7 @@ class PersistentAgentMemory(ChatMemory):
             with self._engine.begin() as conn:
                 conn.execute(
                     self._table.insert().values(
+                        deployment_id=self._deployment,
                         conversation_id=conversation_id,
                         turn_id=turn_id,
                         message_id=message_id,
@@ -989,7 +1118,7 @@ class PersistentAgentMemory(ChatMemory):
         try:
             with self._engine.begin() as conn:
                 conn.execute(
-                    t.update()
+                    self._mine(t.update(), t)
                     .where(t.c.conversation_id == conversation_id)
                     .where(t.c.turn_id == turn_id)
                     .values(subject=subject)
@@ -1009,7 +1138,7 @@ class PersistentAgentMemory(ChatMemory):
         try:
             with self._engine.begin() as conn:
                 result = conn.execute(
-                    t.update()
+                    self._mine(t.update(), t)
                     .where(t.c.conversation_id == conversation_id)
                     .where(t.c.turn_id == turn_id)
                     # NOT `status == open`: the reaper may have already flipped
@@ -1055,7 +1184,7 @@ class PersistentAgentMemory(ChatMemory):
         try:
             with self._engine.begin() as conn:
                 result = conn.execute(
-                    s.update()
+                    self._mine(s.update(), s)
                     .where(s.c.conversation_id == conversation_id)
                     .values(
                         message_count=s.c.message_count + added,
@@ -1067,6 +1196,7 @@ class PersistentAgentMemory(ChatMemory):
             with self._engine.begin() as conn:
                 conn.execute(
                     s.insert().values(
+                        deployment_id=self._deployment,
                         conversation_id=conversation_id,
                         message_count=added,
                         last_summarized_item_id=0,
@@ -1081,7 +1211,7 @@ class PersistentAgentMemory(ChatMemory):
             try:
                 with self._engine.begin() as conn:
                     conn.execute(
-                        s.update()
+                        self._mine(s.update(), s)
                         .where(s.c.conversation_id == conversation_id)
                         .values(
                             message_count=s.c.message_count + added,
@@ -1111,7 +1241,7 @@ class PersistentAgentMemory(ChatMemory):
         try:
             with self._engine.begin() as conn:
                 result = conn.execute(
-                    t.update()
+                    self._mine(t.update(), t)
                     .where(t.c.status == TURN_OPEN)
                     .where(t.c.created_at < cutoff)
                     .values(status=TURN_ABANDONED)
@@ -1156,7 +1286,7 @@ class PersistentAgentMemory(ChatMemory):
                 ids = [
                     r.id
                     for r in conn.execute(
-                        t.select()
+                        self._mine(t.select(), t)
                         .with_only_columns(t.c.id)
                         .where(t.c.expires_at.isnot(None))
                         .where(t.c.expires_at < now)
@@ -1166,7 +1296,7 @@ class PersistentAgentMemory(ChatMemory):
             if not ids:
                 return 0
             with self._engine.begin() as conn:
-                conn.execute(t.delete().where(t.c.id.in_(ids)))
+                conn.execute(self._mine(t.delete().where(t.c.id.in_(ids)), t))
         except Exception:  # noqa: BLE001
             log.exception("Pruning expired memory rows failed")
             return 0
@@ -1179,7 +1309,9 @@ class PersistentAgentMemory(ChatMemory):
         if not self._ensure_engine():
             return []
         t = self._table
-        stmt = t.select().where(t.c.conversation_id == conversation_id)
+        stmt = self._mine(
+            t.select().where(t.c.conversation_id == conversation_id), t
+        )
         if not include_events:
             # the default is a clean transcript: messages of turns that
             # completed. Folded rows stay — they are still what was said.
@@ -1220,7 +1352,9 @@ class PersistentAgentMemory(ChatMemory):
         try:
             with self._engine.connect() as conn:
                 row = conn.execute(
-                    s.select().where(s.c.conversation_id == conversation_id)
+                    self._mine(
+                        s.select().where(s.c.conversation_id == conversation_id), s
+                    )
                 ).fetchone()
         except Exception:  # noqa: BLE001
             log.exception("Summary read failed")
@@ -1239,7 +1373,7 @@ class PersistentAgentMemory(ChatMemory):
         s, t = self._sessions, self._table
         with self._engine.begin() as conn:
             row = conn.execute(
-                s.select()
+                self._mine(s.select(), s)
                 .where(s.c.conversation_id == conversation_id)
                 .with_for_update()
             ).fetchone()
@@ -1252,14 +1386,14 @@ class PersistentAgentMemory(ChatMemory):
             # exist yet, so folding would compact the question into the summary
             # and leave the answer dangling in the visible window.
             open_min = conn.execute(
-                t.select()
+                self._mine(t.select(), t)
                 .with_only_columns(func.min(t.c.id))
                 .where(t.c.conversation_id == conversation_id)
                 .where(t.c.status == TURN_OPEN)
             ).scalar()
 
             stmt = (
-                t.select()
+                self._mine(t.select(), t)
                 .where(t.c.conversation_id == conversation_id)
                 .where(t.c.status == TURN_CLOSED)
                 .where(t.c.memory_type == ITEM_MESSAGE)
@@ -1292,7 +1426,7 @@ class PersistentAgentMemory(ChatMemory):
         s = self._sessions
         with self._engine.begin() as conn:
             result = conn.execute(
-                s.update()
+                self._mine(s.update(), s)
                 .where(s.c.conversation_id == conversation_id)
                 .where(s.c.summary_version == version)
                 .values(
@@ -1349,7 +1483,7 @@ class PersistentAgentMemory(ChatMemory):
         try:
             with self._engine.begin() as conn:
                 result = conn.execute(
-                    st.update()
+                    self._mine(st.update(), st)
                     .where(st.c.scope == scope)
                     .where(st.c.owner == owner)
                     .where(st.c.state_key == key)
@@ -1358,7 +1492,11 @@ class PersistentAgentMemory(ChatMemory):
                 if not result.rowcount:
                     conn.execute(
                         st.insert().values(
-                            scope=scope, owner=owner, state_key=key, **values
+                            deployment_id=self._deployment,
+                            scope=scope,
+                            owner=owner,
+                            state_key=key,
+                            **values,
                         )
                     )
         except Exception:  # noqa: BLE001 — a lost race on the unique key, or a
@@ -1366,7 +1504,7 @@ class PersistentAgentMemory(ChatMemory):
             try:
                 with self._engine.begin() as conn:
                     conn.execute(
-                        st.update()
+                        self._mine(st.update(), st)
                         .where(st.c.scope == scope)
                         .where(st.c.owner == owner)
                         .where(st.c.state_key == key)
@@ -1385,7 +1523,7 @@ class PersistentAgentMemory(ChatMemory):
         try:
             with self._engine.connect() as conn:
                 rows = conn.execute(
-                    st.select()
+                    self._mine(st.select(), st)
                     .with_only_columns(st.c.id)
                     .where(st.c.scope == scope)
                     .where(st.c.owner == owner)
@@ -1396,7 +1534,7 @@ class PersistentAgentMemory(ChatMemory):
             if not excess:
                 return
             with self._engine.begin() as conn:
-                conn.execute(st.delete().where(st.c.id.in_(excess)))
+                conn.execute(self._mine(st.delete().where(st.c.id.in_(excess)), st))
             log.info(
                 "Evicted %d agent-written state key(s) for %s/%s over the cap",
                 len(excess),
@@ -1429,7 +1567,7 @@ class PersistentAgentMemory(ChatMemory):
         st = self._state
         now = _utcnow()
         stmt = (
-            st.select()
+            self._mine(st.select(), st)
             .where(st.c.scope == scope)
             .where(st.c.owner == owner)
             .where((st.c.expires_at.is_(None)) | (st.c.expires_at > now))
@@ -1464,7 +1602,9 @@ class PersistentAgentMemory(ChatMemory):
         if not self._ensure_engine() or self._state is None:
             return 0
         st = self._state
-        stmt = st.delete().where(st.c.scope == scope).where(st.c.owner == owner)
+        stmt = self._mine(
+            st.delete().where(st.c.scope == scope).where(st.c.owner == owner), st
+        )
         if key is not None:
             stmt = stmt.where(st.c.state_key == key)
         try:
@@ -1611,7 +1751,7 @@ class PersistentAgentMemory(ChatMemory):
             return []
         t = self._table
         stmt = (
-            t.select()
+            self._mine(t.select(), t)
             .where(t.c.memory_type == ITEM_MESSAGE)
             .where(t.c.status == TURN_CLOSED)
         )
@@ -1662,7 +1802,7 @@ class PersistentAgentMemory(ChatMemory):
         try:
             with self._engine.connect() as conn:
                 rows = conn.execute(
-                    t.select()
+                    self._mine(t.select(), t)
                     .where(t.c.conversation_id == conversation_id)
                     .where(t.c.turn_id == turn_id)
                     .where(t.c.memory_type == ITEM_MESSAGE)
