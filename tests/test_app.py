@@ -2501,3 +2501,36 @@ class TestDeploymentIsolation:
         # column PK would have made the second insert collide with the first
         b.clear("shared-id")
         assert a.get("shared-id") == [{"role": "user", "content": "A's history"}]
+
+
+class TestSharedTableNames:
+    def test_default_tables_have_no_suffix(self, tmp_path):
+        from hopsworks_agent_protocol import PersistentAgentMemory
+
+        memory = PersistentAgentMemory(
+            url=f"sqlite:///{tmp_path}/m.db",
+            deployment_id="d1",
+            long_term=True,
+            summarize=lambda prev, turns: "s",
+        )
+        assert memory.healthcheck() is True
+        # not agent_memory_meta_agent_memory_items
+        assert memory._table.name == "agent_memory_items"
+        assert memory._meta.name == "agent_memory_meta"
+        assert memory._sessions.name == "agent_memory_sessions"
+        assert memory._state.name == "agent_memory_state"
+
+    def test_explicit_table_name_suffixes_every_companion(self, tmp_path):
+        from hopsworks_agent_protocol import PersistentAgentMemory
+
+        memory = PersistentAgentMemory(
+            url=f"sqlite:///{tmp_path}/m.db",
+            table_name="agent_memory_items_42",
+            deployment_id="d1",
+            long_term=True,
+            summarize=lambda prev, turns: "s",
+        )
+        assert memory.healthcheck() is True
+        assert memory._meta.name == "agent_memory_meta_42"
+        assert memory._sessions.name == "agent_memory_sessions_42"
+        assert memory._state.name == "agent_memory_state_42"
