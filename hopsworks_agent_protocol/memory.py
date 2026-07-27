@@ -239,6 +239,20 @@ def register_feature_groups(
     See :meth:`PersistentAgentMemory.register_feature_groups` for what is
     registered and why it is read-through.
 
+    How they are read afterwards matters, because the obvious way does not
+    work. ``fg.read()`` from Python/pandas raises: hsfs will not pull an
+    external feature group into a dataframe through its storage connector.
+    Verified against a live cluster, which answers::
+
+        Reading an External Feature Group directly into a Pandas Dataframe
+        using Python/Pandas as Engine from the external storage system is not
+        supported [...] you can use the Query API to create Feature
+        Views/Training Data containing External Feature Groups.
+
+    So read them from Spark, or through a feature view built over them. Plain
+    Python analysis is better served by querying the database directly, which
+    is what the agent does anyway.
+
         import hopsworks
         from hopsworks_agent_protocol.memory import register_feature_groups
 
