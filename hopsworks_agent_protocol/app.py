@@ -371,6 +371,14 @@ class AgentApp(FastAPI):
         # non-streaming tool events (buffered on the context) ride on metadata
         if ctx._event_buffer:
             response.metadata.setdefault("tool_events", ctx._event_buffer)
+        # Which subject this turn's memory was actually keyed on. Only reported
+        # when the agent identified the user itself (rebind_subject): the client
+        # already knows the subject it asserted, but it cannot know one the
+        # agent derived mid-turn — and without this a memory inspector reads the
+        # subject it sent, finds an empty bucket, and reports "nothing stored"
+        # about a user the agent has been happily remembering.
+        if ctx.subject_source == "app":
+            response.metadata.setdefault("subject", ctx.subject)
         _annotate_span(ctx, response)
         return response
 
@@ -398,7 +406,13 @@ class AgentApp(FastAPI):
         response = self._finalize("".join(chunks), ctx)
         response.citations = final.citations
         response.usage = final.usage
-        response.metadata = final.metadata
+        # Merge, do not replace: _finalize has already put the turn's own keys
+        # here (tool_events, trace_id, the resolved subject). Assigning
+        # final.metadata over the top dropped every one of them whenever a
+        # stream handler yielded a final response alongside streamed text —
+        # which is the shape a handler uses to stream tokens and still return
+        # structured output. The handler's own keys still win on a collision.
+        response.metadata = {**response.metadata, **final.metadata}
         return response
 
     def _invoke_stream(
