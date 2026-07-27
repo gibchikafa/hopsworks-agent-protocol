@@ -2536,22 +2536,27 @@ class TestSharedTableNames:
         assert memory._state.name == "agent_memory_state_42"
 
 
-class TestFeatureGroupRegistration:
-    """Memory tables exposed to the feature store for analysis.
 
-    Read-through only: the agent keeps writing over SQL, and these tests pin
-    that nothing here turns into a write path.
+
+class TestFeatureGroupExport:
+    """Copying memory rows into feature groups.
+
+    The database stays the system of record; this is the path that makes the
+    rows analysable without the serving path giving up ordered reads, predicate
+    updates or deletes.
     """
 
-    @pytest.fixture
+    @pytest.fixture(autouse=True)
     def fake_hsfs(self, monkeypatch):
+        """hsfs is not a test dependency; the export only needs Feature."""
         import sys
         import types
 
         class Feature:
-            def __init__(self, name, type=None):  # noqa: A002
+            def __init__(self, name, type=None, online_type=None):  # noqa: A002
                 self.name = name
                 self.type = type
+                self.online_type = online_type
 
         mod = types.ModuleType("hsfs")
         feature_mod = types.ModuleType("hsfs.feature")
@@ -2564,26 +2569,19 @@ class TestFeatureGroupRegistration:
     class FakeFG:
         def __init__(self, **kw):
             self.kw = kw
-            self.saved = False
+            self.inserts = []
 
-        def save(self):
-            self.saved = True
+        def insert(self, frame, **kwargs):
+            self.inserts.append((frame, kwargs))
 
     class FakeStore:
         def __init__(self):
-            self.created = []
-            self.existing = {}
+            self.groups = {}
 
-        def get_online_storage_connector(self):
-            return "online-connector"
-
-        def get_external_feature_group(self, name, version):
-            return self.existing.get((name, version))
-
-        def create_external_feature_group(self, **kw):
-            fg = TestFeatureGroupRegistration.FakeFG(**kw)
-            self.created.append(fg)
-            return fg
+        def get_or_create_feature_group(self, **kw):
+            key = (kw["name"], kw["version"])
+            self.groups.setdefault(key, TestFeatureGroupExport.FakeFG(**kw))
+            return self.groups[key]
 
     def _store(self, tmp_path, **kw):
         from hopsworks_agent_protocol import PersistentAgentMemory
@@ -2598,185 +2596,106 @@ class TestFeatureGroupRegistration:
         assert memory.healthcheck() is True
         return memory
 
-    def test_registers_the_three_data_tables(self, tmp_path, fake_hsfs):
+    def test_exports_rows_with_append_and_online_by_default(self, tmp_path):
         memory = self._store(tmp_path)
+        memory.append("c1", "user", "hello")
+        memory.set_state("user", "alice", "tone", "formal")
         fs = self.FakeStore()
 
-        registered = memory.register_feature_groups(fs)
+        counts = memory.export_feature_groups(fs)
 
-        assert set(registered) == {"items", "sessions", "state"}
-        names = {fg.kw["name"] for fg in fs.created}
-        # meta is a single schema-version row; there is nothing to analyse
-        assert names == {
-            "agent_memory_items",
-            "agent_memory_sessions",
-            "agent_memory_state",
-        }
-        assert all(fg.saved for fg in fs.created)  # create is lazy in hsfs
+        assert counts["agent_memory_items"] == 1
+        assert counts["agent_memory_state"] == 1
+        for fg in fs.groups.values():
+            for frame, kwargs in fg.inserts:
+                assert kwargs["write_options"] == {"mode": "append"}
+                # offline is a Delta write: worth a schedule, not every batch
+                assert kwargs["storage"] == "online"
+        assert all(fg.kw["online_enabled"] is True for fg in fs.groups.values())
 
-    def test_is_read_through_and_does_not_scan_the_serving_db(
-        self, tmp_path, fake_hsfs
-    ):
+    def test_both_omits_the_storage_argument(self, tmp_path):
         memory = self._store(tmp_path)
+        memory.append("c1", "user", "hello")
         fs = self.FakeStore()
-        memory.register_feature_groups(fs)
+        memory.export_feature_groups(fs, storage="both", include=("items",))
+        _, kwargs = fs.groups[("agent_memory_items", 1)].inserts[0]
+        # hsfs writes both stores when the argument is absent
+        assert "storage" not in kwargs
 
-        for fg in fs.created:
-            # a query against the connector, not a copy of the data
-            assert fg.kw["query"] == f"SELECT * FROM {fg.kw['name']}"
-            assert fg.kw["storage_connector"] == "online-connector"
-            # statistics would scan the database the agent serves from
-            assert fg.kw["statistics_config"] is False
-
-    def test_carries_keys_and_event_time(self, tmp_path, fake_hsfs):
+    def test_offline_backfill(self, tmp_path):
         memory = self._store(tmp_path)
+        memory.append("c1", "user", "hello")
         fs = self.FakeStore()
-        memory.register_feature_groups(fs)
-        by_name = {fg.kw["name"]: fg.kw for fg in fs.created}
+        memory.export_feature_groups(fs, storage="offline", include=("items",))
+        _, kwargs = fs.groups[("agent_memory_items", 1)].inserts[0]
+        assert kwargs["storage"] == "offline"
 
-        assert by_name["agent_memory_items"]["event_time"] == "created_at"
-        assert by_name["agent_memory_state"]["event_time"] == "updated_at"
-        # sessions is keyed by the pair, since conversation ids can collide
-        # across deployments
-        assert by_name["agent_memory_sessions"]["primary_key"] == [
+    def test_unknown_storage_is_refused(self, tmp_path):
+        memory = self._store(tmp_path)
+        with pytest.raises(ValueError, match="Unknown storage"):
+            memory.export_feature_groups(self.FakeStore(), storage="nearline")
+
+    def test_since_exports_only_newer_rows(self, tmp_path):
+        memory = self._store(tmp_path)
+        memory.append("c1", "user", "first")
+        memory.append("c1", "user", "second")
+        fs = self.FakeStore()
+
+        counts = memory.export_feature_groups(fs, include=("items",))
+        assert counts["agent_memory_items"] == 2
+
+        fs2 = self.FakeStore()
+        counts = memory.export_feature_groups(fs2, include=("items",), since=1)
+        assert counts["agent_memory_items"] == 1
+
+    def test_keys_include_the_deployment(self, tmp_path):
+        memory = self._store(tmp_path)
+        memory.append("c1", "user", "hello")
+        memory.set_state("user", "alice", "tone", "formal")
+        fs = self.FakeStore()
+        memory.export_feature_groups(fs)
+
+        keys = {name: fg.kw["primary_key"] for (name, _), fg in fs.groups.items()}
+        # one feature group holds every deployment's rows, so the deployment
+        # has to be part of what makes a row unique
+        assert keys["agent_memory_items"] == ["deployment_id", "id"]
+        assert keys["agent_memory_sessions"] == [
             "deployment_id",
             "conversation_id",
         ]
 
-    def test_existing_group_is_reused_not_duplicated(self, tmp_path, fake_hsfs):
+    def test_batches_large_exports(self, tmp_path):
+        memory = self._store(tmp_path)
+        for i in range(5):
+            memory.append("c1", "user", f"m{i}")
+        fs = self.FakeStore()
+        memory.export_feature_groups(fs, include=("items",), batch_size=2)
+        inserts = fs.groups[("agent_memory_items", 1)].inserts
+        assert [len(frame) for frame, _ in inserts] == [2, 2, 1]
+
+    def test_nothing_to_export_is_not_a_feature_group(self, tmp_path):
         memory = self._store(tmp_path)
         fs = self.FakeStore()
-        fs.existing[("agent_memory_items", 1)] = "already there"
+        counts = memory.export_feature_groups(fs, include=("items",))
+        # an empty table should not leave an empty feature group behind
+        assert counts["agent_memory_items"] == 0
+        assert fs.groups == {}
 
-        registered = memory.register_feature_groups(fs)
-
-        assert registered["items"] == "already there"
-        assert "agent_memory_items" not in {fg.kw["name"] for fg in fs.created}
-
-    def test_include_selects_a_subset(self, tmp_path, fake_hsfs):
+    def test_content_is_not_truncated_to_varchar_100(self, tmp_path):
         memory = self._store(tmp_path)
-        fs = self.FakeStore()
-        memory.register_feature_groups(fs, include=("state",))
-        assert [fg.kw["name"] for fg in fs.created] == ["agent_memory_state"]
+        features = {
+            f.name: f.online_type for f in memory._features_for(memory._table)
+        }
+        # inferred strings land as varchar(100) online, which would silently
+        # cut message content; TEXT columns must stay TEXT
+        assert features["content"] == "text"
+        assert features["conversation_id"] == "varchar(255)"
+        assert features["status"] == "varchar(16)"
 
-    def test_unknown_table_is_refused(self, tmp_path, fake_hsfs):
-        memory = self._store(tmp_path)
-        with pytest.raises(ValueError, match="Unknown table"):
-            memory.register_feature_groups(self.FakeStore(), include=("nope",))
-
-    def test_disabled_tier_is_skipped_not_invented(self, tmp_path, fake_hsfs):
-        from hopsworks_agent_protocol import PersistentAgentMemory
-
-        memory = PersistentAgentMemory(
-            url=f"sqlite:///{tmp_path}/m.db", deployment_id="d1", long_term=False
-        )
-        assert memory.healthcheck() is True
-        fs = self.FakeStore()
-        registered = memory.register_feature_groups(fs)
-        # no summarizer and no long_term: only the items table exists
-        assert set(registered) == {"items"}
-
-    def test_column_types_map_to_feature_types(self, tmp_path, fake_hsfs):
+    def test_integers_are_bigint(self, tmp_path):
         memory = self._store(tmp_path)
         features = {f.name: f.type for f in memory._features_for(memory._table)}
-        assert features["id"] == "int"
-        assert features["deployment_id"] == "string"
-        assert features["content"] == "string"
-        assert features["created_at"] == "timestamp"
-        assert features["seq"] == "int"
-
-
-class TestRegistrationEntryPoint:
-    """Registering from a notebook: no deployment, no MYSQL_* env vars."""
-
-    def test_url_is_derived_from_the_online_connector(self):
-        from hopsworks_agent_protocol.memory import _url_from_connector
-
-        class Connector:
-            connection_string = (
-                "jdbc:mysql://onlinefs.mysql.service.consul:3306/g1?useSSL=false"
-            )
-            arguments = {"user": "g1_meb10000", "password": "s3cret"}
-
-        assert _url_from_connector(Connector()) == (
-            "mysql+pymysql://g1_meb10000:s3cret@onlinefs.mysql.service.consul:3306/g1"
-        )
-
-    def test_connector_arguments_may_be_a_list(self):
-        from hopsworks_agent_protocol.memory import _url_from_connector
-
-        class Connector:
-            connection_string = "jdbc:mysql://h:3306/db"
-            arguments = [
-                {"name": "user", "value": "u"},
-                {"name": "password", "value": "p"},
-            ]
-
-        assert _url_from_connector(Connector()) == "mysql+pymysql://u:p@h:3306/db"
-
-    def test_unusable_connector_says_so(self):
-        from hopsworks_agent_protocol.memory import _url_from_connector
-
-        class Connector:
-            connection_string = "jdbc:postgresql://h:5432/db"
-            arguments = {}
-
-        with pytest.raises(RuntimeError, match="Pass url="):
-            _url_from_connector(Connector())
-
-    def test_registers_only_tables_that_exist(self, tmp_path, monkeypatch):
-        import sys
-        import types
-
-        from hopsworks_agent_protocol.memory import register_feature_groups
-
-        class Feature:
-            def __init__(self, name, type=None):  # noqa: A002
-                self.name = name
-                self.type = type
-
-        mod = types.ModuleType("hsfs")
-        feature_mod = types.ModuleType("hsfs.feature")
-        feature_mod.Feature = Feature
-        mod.feature = feature_mod
-        monkeypatch.setitem(sys.modules, "hsfs", mod)
-        monkeypatch.setitem(sys.modules, "hsfs.feature", feature_mod)
-
-        url = f"sqlite:///{tmp_path}/m.db"
-        # an agent that runs without the durable-state tier: only items and
-        # sessions are ever created
-        from hopsworks_agent_protocol import PersistentAgentMemory
-
-        agent = PersistentAgentMemory(
-            url=url,
-            deployment_id="d1",
-            long_term=False,
-            summarize=lambda prev, turns: "s",
-        )
-        assert agent.healthcheck() is True
-
-        created = []
-
-        class FakeFG:
-            def __init__(self, **kw):
-                self.kw = kw
-
-            def save(self):
-                created.append(self.kw["name"])
-
-        class FakeStore:
-            def get_online_storage_connector(self):
-                return "connector"
-
-            def get_external_feature_group(self, name, version):
-                return None
-
-            def create_external_feature_group(self, **kw):
-                return FakeFG(**kw)
-
-        registered = register_feature_groups(FakeStore(), url=url)
-
-        # the entry point declares all three tiers so their definitions exist,
-        # but state was never created, so it is not registered
-        assert set(registered) == {"items", "sessions"}
-        assert "agent_memory_state" not in created
+        # a pandas frame carries integers as int64; declaring 'int' fails
+        # schema verification before a row is written
+        assert features["id"] == "bigint"
+        assert features["seq"] == "bigint"

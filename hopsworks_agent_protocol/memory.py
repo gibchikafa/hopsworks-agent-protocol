@@ -221,42 +221,85 @@ def _url_from_connector(connector) -> str:
     return f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
 
 
-def register_feature_groups(
+#: Where an export writes. ``None`` means "let hsfs do both", which is its own
+#: default; "online" is ours, because the offline half is a Delta write that
+#: costs far more than the row it carries and is rarely wanted per batch.
+EXPORT_STORAGE_ONLINE = "online"
+EXPORT_STORAGE_OFFLINE = "offline"
+EXPORT_STORAGE_BOTH = "both"
+
+
+def _storage_arg(storage: str | None) -> str | None:
+    """The ``storage=`` value to hand ``fg.insert``, or None to leave it out.
+
+    hsfs writes both stores when the argument is absent, so "both" is expressed
+    by omitting it rather than by passing a value.
+    """
+    if storage in (EXPORT_STORAGE_BOTH, None):
+        return None
+    if storage in (EXPORT_STORAGE_ONLINE, EXPORT_STORAGE_OFFLINE):
+        return storage
+    raise ValueError(
+        f"Unknown storage {storage!r}. Use 'online', 'offline' or 'both'."
+    )
+
+
+def _url_from_connector(connector) -> str:
+    """A SQLAlchemy URL for the project database, from its JDBC connector.
+
+    The online feature store *is* the database the memory tables live in, so
+    its connector already carries the credentials — which matters because the
+    MYSQL_* environment variables this module normally reads are injected into
+    agent deployments and nowhere else. Without this, an export job could only
+    run inside the very pod that has no reason to run it.
+    """
+    raw = getattr(connector, "connection_string", None) or ""
+    match = re.match(r"jdbc:mysql://([^:/]+):(\d+)/([^?;]+)", raw)
+    if not match:
+        raise RuntimeError(
+            f"Could not read a MySQL host, port and database out of the online "
+            f"storage connector ({raw!r}). Pass url= explicitly."
+        )
+    host, port, database = match.groups()
+    arguments = getattr(connector, "arguments", None) or {}
+    if isinstance(arguments, list):
+        arguments = {
+            entry.get("name"): entry.get("value")
+            for entry in arguments
+            if isinstance(entry, dict)
+        }
+    user = arguments.get("user") or arguments.get("username")
+    password = arguments.get("password")
+    if not user or password is None:
+        raise RuntimeError(
+            "The online storage connector carries no user/password, so the "
+            "project database URL cannot be built. Pass url= explicitly."
+        )
+    return f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
+
+
+def export_feature_groups(
     feature_store=None,
     *,
     url: str | None = None,
+    storage: str | None = EXPORT_STORAGE_ONLINE,
+    since: int | None = None,
     version: int = 1,
     include=None,
     table_name: str | None = None,
 ):
-    """Register the project's memory tables as external feature groups.
+    """Copy the project's memory tables into feature groups.
 
-    The notebook-friendly entry point: it needs nothing but a Hopsworks login,
-    deriving the database URL from the project's own online storage connector
-    when one is not passed. Registration is project-wide metadata, so it asks
-    for no deployment id and belongs to no particular agent.
-
-    See :meth:`PersistentAgentMemory.register_feature_groups` for what is
-    registered and why it is read-through.
-
-    How they are read afterwards matters, because the obvious way does not
-    work. ``fg.read()`` from Python/pandas raises: hsfs will not pull an
-    external feature group into a dataframe through its storage connector.
-    Verified against a live cluster, which answers::
-
-        Reading an External Feature Group directly into a Pandas Dataframe
-        using Python/Pandas as Engine from the external storage system is not
-        supported [...] you can use the Query API to create Feature
-        Views/Training Data containing External Feature Groups.
-
-    So read them from Spark, or through a feature view built over them. Plain
-    Python analysis is better served by querying the database directly, which
-    is what the agent does anyway.
+    The entry point for a job or notebook: it needs nothing but a Hopsworks
+    login, deriving the database URL from the project's own online storage
+    connector when one is not passed. See
+    :meth:`PersistentAgentMemory.export_feature_groups`.
 
         import hopsworks
-        from hopsworks_agent_protocol.memory import register_feature_groups
+        from hopsworks_agent_protocol.memory import export_feature_groups
 
-        register_feature_groups()
+        export_feature_groups()                      # online only
+        export_feature_groups(storage="offline")     # backfill Delta
     """
     if feature_store is None:
         import hopsworks
@@ -269,21 +312,23 @@ def register_feature_groups(
             url = _url_from_connector(
                 feature_store.get_online_storage_connector()
             )
-    # long_term and a summarizer only so all three table definitions exist to
-    # register; which of them are actually created is read from the database.
-    # The deployment id is a placeholder: nothing here reads or writes rows.
     memory = PersistentAgentMemory(
         url=url,
-        deployment_id="registration",
+        deployment_id="export",
         long_term=True,
         summarize=lambda previous, turns: "",
         table_name=table_name,
-        # declare every tier so its definition exists to register, but do not
-        # create anything: which tables are real is a question for the database
+        # every tier declared so its definition exists to read; which tables
+        # are real is a question for the database, and reading is not a reason
+        # to create one
         create_tables=False,
     )
-    return memory.register_feature_groups(
-        feature_store, version=version, include=include
+    return memory.export_feature_groups(
+        feature_store,
+        storage=storage,
+        since=since,
+        version=version,
+        include=include,
     )
 
 
@@ -1102,6 +1147,735 @@ class PersistentAgentMemory(ChatMemory):
         with self._lock:
             self._cache.pop(conversation_id, None)
 
+    def healthcheck(self) -> bool:
+        """Whether the store is currently usable. Used by the readiness probe;
+        default assumes always ready."""
+        return True
+
+    def maybe_reap(self) -> None:
+        """Sweep turns that were never closed. No-op for stores whose open
+        turns cannot outlive the process."""
+
+    def transcript(
+        self, conversation_id: str, *, include_events: bool = False
+    ) -> list[dict]:
+        """The human-facing record of a conversation.
+
+        Deliberately not the same thing as :meth:`get`. ``get`` returns what the
+        model reads — bounded, and shrinking as turns are folded into the
+        summary. This returns the whole conversation, including turns that have
+        been folded away, because it is what a person reads in the panel and
+        what an operator reads during an incident.
+        """
+        return [dict(turn, memory_type=ITEM_MESSAGE) for turn in self.get(conversation_id)]
+
+    def summarized_through(self, conversation_id: str) -> int:
+        """Highest item id represented by the summary rather than by
+        :meth:`get`. ``0`` when nothing has been folded — lets a UI draw the
+        line between "the agent still sees this" and "this is only in the
+        summary now"."""
+        return 0
+
+    # ── summarization (tier 2) ───────────────────────────────────────────
+
+    def get_summary(self, conversation_id: str) -> str | None:
+        """The rolling summary of folded-away turns, or None."""
+        return None
+
+    async def maybe_summarize(self, conversation_id: str) -> bool:
+        """Fold old turns into the summary if enough have accumulated.
+
+        Called after the response has been sent, so its cost lands on request
+        duration every Nth turn rather than on time-to-answer. Returns whether
+        a fold happened.
+        """
+        return False
+
+    # ── scoped durable state (tier 3) ────────────────────────────────────
+
+    def set_state(
+        self,
+        scope: str,
+        owner: str,
+        key: str,
+        value: str,
+        *,
+        source_ref: str | None = None,
+        written_by: str = WRITTEN_BY_AGENT,
+    ) -> None:
+        """Upsert one scoped durable value."""
+
+    def get_state(self, scope: str, owner: str, key: str) -> str | None:
+        return None
+
+    def list_state(
+        self,
+        scope: str,
+        owner: str,
+        *,
+        key: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict]:
+        return []
+
+    def delete_state(self, scope: str, owner: str, key: str | None = None) -> int:
+        return 0
+
+    def state_block(self, subject: str, conversation_id: str) -> str:
+        """Scoped state rendered for ``ctx.system_context()``."""
+        return ""
+
+    # ── semantic search (tier 3) ─────────────────────────────────────────
+
+    def search(
+        self,
+        query: str,
+        *,
+        subject: str | None = None,
+        conversation_id: str | None = None,
+        k: int = 5,
+    ) -> list[dict]:
+        """Older messages relevant to ``query``, most relevant first."""
+        return []
+
+    async def ingest_turn(self, conversation_id: str, turn_id: str) -> int:
+        """Embed a completed turn into the vector store. Returns rows sent."""
+        return 0
+
+    def purge_vectors(
+        self, *, conversation_id: str | None = None, subject: str | None = None
+    ) -> int:
+        return 0
+
+
+class InMemoryChatMemory(ChatMemory):
+    """Process-local store for development: lost on restart (agent
+    deployments can scale to zero) and not shared between replicas."""
+
+    def __init__(self, max_messages: int = 50):
+        self._max = max_messages
+        self._conversations: dict[str, list[Turn]] = {}
+        # open turns buffer their messages here; they land in the conversation
+        # on close and are dropped on abandon, so history never shows a
+        # question whose answer never arrived
+        self._open: dict[str, list[Turn]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, conversation_id: str) -> list[Turn]:
+        with self._lock:
+            return list(self._conversations.get(conversation_id, []))
+
+    def begin_turn(
+        self,
+        conversation_id: str,
+        turn_id: str,
+        role: str,
+        content: str,
+        *,
+        message_id: str | None = None,
+        subject: str | None = None,
+    ) -> None:
+        with self._lock:
+            self._open[turn_id] = [{"role": role, "content": content}]
+
+    def record_item(
+        self,
+        conversation_id: str,
+        turn_id: str,
+        role: str,
+        content: str,
+        *,
+        memory_type: str = ITEM_MESSAGE,
+        seq: int | None = None,
+        message_id: str | None = None,
+        subject: str | None = None,
+    ) -> None:
+        if memory_type != ITEM_MESSAGE:
+            # the dev store keeps history only; tool/event rows are debug
+            # telemetry and are dropped rather than half-modelled
+            return
+        with self._lock:
+            buffered = self._open.get(turn_id)
+            if buffered is not None:
+                buffered.append({"role": role, "content": content})
+
+    def end_turn(
+        self, conversation_id: str, turn_id: str, *, status: str = TURN_CLOSED
+    ) -> None:
+        with self._lock:
+            buffered = self._open.pop(turn_id, None)
+            if not buffered or status != TURN_CLOSED:
+                return
+            turns = self._conversations.setdefault(conversation_id, [])
+            turns.extend(buffered)
+            if len(turns) > self._max:
+                del turns[: len(turns) - self._max]
+
+    def clear(self, conversation_id: str) -> None:
+        with self._lock:
+            self._conversations.pop(conversation_id, None)
+
+
+class PersistentAgentMemory(ChatMemory):
+    """SQLAlchemy-backed store (MySQL, Postgres, SQLite, ...).
+
+    ``pip install 'hopsworks-agent-protocol[memory-sql]'``
+
+    Inside a Hopsworks agent deployment both arguments are optional:
+    ``PersistentAgentMemory()`` connects to the project MySQL using the
+    platform-injected env vars and derives a per-deployment table name from
+    ``DEPLOYMENT_ID``.
+
+    A per-conversation cache avoids a read round-trip on every turn for the
+    lifetime of the process.
+
+    Rows live in ``agent_memory_items_<DEPLOYMENT_ID>`` and carry turn identity
+    (``turn_id``, ``seq``, ``status``, ``message_id``) so the SDK can record the
+    user message before the handler runs without ever exposing a half-written
+    turn: only ``closed`` turns are returned by :meth:`get`. See
+    :meth:`begin_turn`.
+
+    Connection is **lazy and non-fatal**: construction never touches the
+    database (missing SQLAlchemy is the only hard error), the engine + tables
+    are created on first use — in a deployment that happens via the ``/ready``
+    probe, off the request path — and if the database is unreachable the store
+    degrades to statelessness — reads return empty, writes are dropped, both
+    with a warning — so a down database never crashes the agent at startup or
+    on a turn.
+    """
+
+    def __init__(
+        self,
+        url: str | None = None,
+        table_name: str | None = None,
+        max_messages: int = 50,
+        turn_timeout_seconds: int = 300,
+        summarize: Summarizer | None = None,
+        summarize_after_messages: int = 20,
+        keep_recent_messages: int = 10,
+        tool_event_retention_days: int | None = 30,
+        message_retention_days: int | None = None,
+        long_term: bool = False,
+        embedder: Embedder | None = None,
+        vector_store: "VectorStore | None" = None,
+        state_ttl_days: int | None = 90,
+        max_state_value_chars: int = 4096,
+        max_state_keys_written: int = 128,
+        max_state_keys_injected: int = 32,
+        state_inject_value_chars: int = 1024,
+        recency_half_life_days: float | None = 30.0,
+        search_oversample: int = 3,
+        deployment_id: str | None = None,
+        create_tables: bool = True,
+    ):
+        try:
+            import sqlalchemy  # noqa: F401 — fail fast if the extra is missing
+        except ImportError as err:
+            raise ImportError(
+                "PersistentAgentMemory requires SQLAlchemy: "
+                "pip install 'hopsworks-agent-protocol[memory-sql]'"
+            ) from err
+
+        self._max = max_messages
+        self._turn_timeout = turn_timeout_seconds
+        self._summarize = summarize
+        self._summarize_every = summarize_after_messages
+        self._keep_recent = keep_recent_messages
+        self._tool_event_retention = tool_event_retention_days
+        self._message_retention = message_retention_days
+        self._long_term = long_term
+        self._embedder = embedder
+        self._vector_store = vector_store
+        self._state_ttl = state_ttl_days
+        self._max_value_chars = max_state_value_chars
+        self._max_keys_written = max_state_keys_written
+        self._max_keys_injected = max_state_keys_injected
+        self._inject_value_chars = state_inject_value_chars
+        # How fast similarity gives way to age in search ranking. A support
+        # agent wants recent context; an agent whose one relevant fact is a year
+        # old does not, so this is a knob and `None` turns it off entirely,
+        # restoring pure similarity order.
+        self._half_life = recency_half_life_days
+        self._search_oversample = max(1, search_oversample)
+        self._url = url  # resolved lazily (may read env/secrets)
+        self._table_name = table_name
+        self._deployment_id = deployment_id
+        # False for a handle that only wants to look at the schema — feature
+        # group registration, say. Inspecting a database should never be the
+        # thing that creates a table in it, and a tier this agent does not run
+        # would otherwise be conjured into existence by the act of listing it.
+        self._create_tables = create_tables
+        # resolved on first connect, then constant for the process
+        self._deployment: str | None = None
+        # conversation_id -> (summary_version, turns). The version is what makes
+        # the cache safe once folding exists: another replica advancing the
+        # cutoff bumps it, and this process notices on the next read instead of
+        # serving history that has since been compacted away.
+        self._cache: dict[str, tuple[int, list[Turn]]] = {}
+        # rows written by turns that are still open, held back from the cache
+        # until the turn closes (or dropped when it is abandoned)
+        self._pending: dict[str, list[Turn]] = {}
+        self._seq: dict[str, int] = {}
+        self._lock = threading.Lock()
+        # set on first successful connection; None while unconnected/failed
+        self._engine = None
+        self._table = None
+        self._meta = None
+        self._sessions = None
+        self._state = None
+        # a failed connect blocks retries until this monotonic deadline, with
+        # exponential backoff — never permanently (see _ensure_engine)
+        self._init_failed_until = 0.0
+        self._init_backoff = 1.0
+        self._last_reap = 0.0
+        self._last_prune = 0.0
+
+    def _mine(self, stmt, table):
+        """Restrict a statement to this deployment's rows.
+
+        Every read, update and delete in this module goes through here. It is a
+        one-line helper on purpose: with one shared table, a query that forgets
+        the deployment filter does not fail — it quietly returns, edits or
+        deletes another agent's memory. Making the filter a named call means a
+        missing one is visible when reading the code, and
+        ``TestDeploymentIsolation`` fails when it is not.
+        """
+        return stmt.where(table.c.deployment_id == self._deployment)
+
+    def _resolve_deployment_id(self) -> str:
+        """Which agent's rows these are.
+
+        Every deployment in a project shares one set of tables, so this value is
+        what keeps them apart — it is not a label, it is the first column of
+        every key and every WHERE clause in this module.
+
+        A deployment must therefore have a real one. The old ``'default'``
+        fallback was survivable when it only meant "share a table name"; now it
+        would mean two agents reading each other's conversations, so it is
+        allowed only for a caller who passed their own ``url`` (tests, local
+        development) and cannot be reached inside a deployment.
+        """
+        if self._deployment_id is not None:
+            value = self._deployment_id
+        else:
+            value = os.environ.get("DEPLOYMENT_ID")
+            if value is None:
+                if self._url is None:
+                    raise RuntimeError(
+                        "DEPLOYMENT_ID is not set, so memory rows cannot be "
+                        "attributed to this agent. Inside a Hopsworks agent "
+                        "deployment this is injected for you; elsewhere pass an "
+                        "explicit deployment_id= (or url=) to "
+                        "PersistentAgentMemory."
+                    )
+                log.warning(
+                    "DEPLOYMENT_ID is not set; falling back to deployment_id "
+                    "'default'. Pass deployment_id= to keep agents apart."
+                )
+                value = "default"
+        if not _TABLE_SUFFIX_RE.match(str(value)):
+            raise RuntimeError(
+                f"Invalid deployment_id {value!r}: must match "
+                "[A-Za-z0-9_]{1,48}."
+            )
+        return str(value)
+
+    def _resolve_table_name(self) -> str:
+        """The shared items table, validated.
+
+        Shared across the project rather than one table per deployment. Four
+        tables per agent meant a project with a hundred agents carried four
+        hundred tables, and every cold start ran DDL to make its own — which is
+        also where the replicas raced each other. One set of tables is created
+        once and found thereafter.
+
+        An explicit ``table_name`` still wins, for tests and for anyone who
+        wants a deployment kept physically apart.
+        """
+        name = self._table_name or ITEMS_TABLE
+        suffix = name[len("agent_memory_items_"):] if name.startswith(
+            "agent_memory_items_"
+        ) else name
+        if suffix and not _TABLE_SUFFIX_RE.match(suffix):
+            raise RuntimeError(
+                f"Invalid memory table name {name!r}: the suffix must "
+                "match [A-Za-z0-9_]{1,48}."
+            )
+        return name
+
+    def _ensure_engine(self) -> bool:
+        """Create the engine + tables. Returns True when the store is usable,
+        False when the database is unreachable (already logged).
+
+        Called by ``healthcheck()``, which the ``/ready`` probe drives — so in a
+        deployment the DDL runs *before* the pod reports ready and the request
+        path only ever finds existing tables. The lazy path stays for direct use
+        (tests, local SQLite) where there is no readiness probe.
+        """
+        if self._engine is not None:
+            return True
+        if time.monotonic() < self._init_failed_until:
+            return False
+        with self._lock:
+            if self._engine is not None:
+                return True
+            if time.monotonic() < self._init_failed_until:
+                return False
+            try:
+                from sqlalchemy import (
+                    Column,
+                    DateTime,
+                    Index,
+                    Integer,
+                    MetaData,
+                    SmallInteger,
+                    String,
+                    Table,
+                    Text,
+                    UniqueConstraint,
+                    create_engine,
+                )
+
+                url = self._url or deployment_mysql_url()
+                deployment = self._resolve_deployment_id()
+                table_name = self._resolve_table_name()
+                # "" for the shared default, so the companion tables are
+                # agent_memory_meta / _sessions / _state rather than
+                # agent_memory_meta_agent_memory_items. Only an explicit
+                # table_name= produces a suffix, and then every table carries it.
+                suffix = _table_suffix(table_name)
+                # index and constraint names still have to be unique and
+                # non-empty, so they get a stem even when the tables do not
+                stem = suffix or "shared"
+                engine = create_engine(url, pool_pre_ping=True)
+                metadata = MetaData()
+                table = Table(
+                    table_name,
+                    metadata,
+                    Column("id", Integer, primary_key=True, autoincrement=True),
+                    # Which deployment's memory this row is. One table now holds
+                    # every agent in the project, so this is not descriptive: it
+                    # is the first column of every index and every WHERE clause,
+                    # and omitting it anywhere is a cross-deployment data leak.
+                    Column("deployment_id", String(64), nullable=False),
+                    Column("conversation_id", String(255), nullable=False),
+                    Column("turn_id", String(64), nullable=False),
+                    # the protocol message id, so anything written during the
+                    # turn can reference the message that caused it
+                    Column("message_id", String(64), nullable=True),
+                    Column("seq", SmallInteger, nullable=False, default=0),
+                    Column("status", String(16), nullable=False),
+                    Column("subject", String(255), nullable=True),
+                    Column("memory_type", String(16), nullable=False),
+                    Column("role", String(16), nullable=False),
+                    Column("content", Text, nullable=False),
+                    Column("created_at", DateTime, nullable=False),
+                    Column("expires_at", DateTime, nullable=True),
+                    # deployment_id leads all of these. A conversation id is
+                    # unique in practice, but an index that does not start with
+                    # the deployment turns every lookup into a scan of every
+                    # other agent's rows in the same table.
+                    Index(
+                        f"idx_{stem}_conv", "deployment_id", "conversation_id", "id"
+                    ),
+                    Index(
+                        f"idx_{stem}_turn",
+                        "deployment_id",
+                        "conversation_id",
+                        "turn_id",
+                    ),
+                    # drives the "oldest open turn" lookup on the fold path
+                    Index(
+                        f"idx_{stem}_open",
+                        "deployment_id",
+                        "conversation_id",
+                        "status",
+                        "id",
+                    ),
+                    Index(f"idx_{stem}_msg", "deployment_id", "message_id"),
+                )
+                meta = Table(
+                    f"agent_memory_meta_{suffix}" if suffix
+                    else "agent_memory_meta",
+                    metadata,
+                    Column("table_name", String(64), primary_key=True),
+                    Column("schema_version", Integer, nullable=False),
+                    Column("updated_at", DateTime, nullable=False),
+                )
+                sessions = None
+                if self._summarize is not None:
+                    # tier 2 only: no summarizer, no bookkeeping to keep
+                    sessions = Table(
+                        f"agent_memory_sessions_{suffix}" if suffix
+                        else "agent_memory_sessions",
+                        metadata,
+                        # composite PK: two deployments may legitimately use
+                        # the same conversation id, and before consolidation
+                        # they were kept apart by living in different tables
+                        Column("deployment_id", String(64), primary_key=True),
+                        Column("conversation_id", String(255), primary_key=True),
+                        Column("subject", String(255), nullable=True),
+                        Column("summary", Text, nullable=True),
+                        # fold cutoff. Meaningful only together with the
+                        # conversation: item ids are a table-wide sequence.
+                        Column(
+                            "last_summarized_item_id",
+                            Integer,
+                            nullable=False,
+                            default=0,
+                        ),
+                        # messages folded so far — the fold threshold is
+                        # measured in messages, not row ids
+                        Column(
+                            "last_summarized_count", Integer, nullable=False, default=0
+                        ),
+                        # optimistic lock: the summarizer runs outside the
+                        # transaction, so this is what makes the fold safe
+                        Column("summary_version", Integer, nullable=False, default=0),
+                        Column("message_count", Integer, nullable=False, default=0),
+                        Column("created_at", DateTime, nullable=False),
+                        Column("last_active_at", DateTime, nullable=False),
+                    )
+                state = None
+                if self._long_term:
+                    # tier 3 only
+                    state = Table(
+                        f"agent_memory_state_{suffix}" if suffix
+                        else "agent_memory_state",
+                        metadata,
+                        Column("id", Integer, primary_key=True, autoincrement=True),
+                        Column("deployment_id", String(64), nullable=False),
+                        Column("scope", String(8), nullable=False),
+                        # subject (user), '' (app), or conversation id (session)
+                        Column("owner", String(255), nullable=False),
+                        # not `key`: reserved word in MySQL 8
+                        Column("state_key", String(255), nullable=False),
+                        Column("value", Text, nullable=False),
+                        # {conversation_id, turn_id, message_id} — resolves to
+                        # the turn that produced this value
+                        Column("source_ref", Text, nullable=True),
+                        # agent | operator. The audit surface shows this: a user
+                        # looking at their own memories needs to know which of
+                        # them their own conversation put there.
+                        Column("written_by", String(16), nullable=False),
+                        Column("updated_at", DateTime, nullable=False),
+                        # agent-written state decays; operator-written does not
+                        Column("expires_at", DateTime, nullable=True),
+                        # `app` scope is owner='' and agent-wide — with a
+                        # shared table that would collapse every deployment's
+                        # app state onto one row without deployment_id here
+                        UniqueConstraint(
+                            "deployment_id",
+                            "scope",
+                            "owner",
+                            "state_key",
+                            name=f"uq_{stem}_state",
+                        ),
+                        Index(
+                            f"idx_{stem}_state_owner",
+                            "deployment_id",
+                            "scope",
+                            "owner",
+                        ),
+                    )
+                # checkfirst=True is create-if-not-exists, but two replicas
+                # starting together can still both pass the check and both
+                # issue CREATE. With one table per deployment that was a rare
+                # cold-start race; with shared tables, finding them already
+                # created by *another deployment* is the ordinary case, so a
+                # duplicate-object error here means someone else succeeded and
+                # is not a failure.
+                if self._create_tables:
+                    try:
+                        metadata.create_all(engine, checkfirst=True)
+                    except Exception as err:  # noqa: BLE001
+                        if not _already_exists(err):
+                            raise
+                        log.debug("Memory tables already created concurrently")
+                    if not self._check_schema_version(engine, meta, table_name):
+                        return False
+                self._engine = engine
+                self._deployment = deployment
+                self._table = table
+                self._meta = meta
+                self._sessions = sessions
+                self._state = state
+                log.info(
+                    "PersistentAgentMemory ready (table=%s, schema_version=%d)",
+                    table_name,
+                    SCHEMA_VERSION,
+                )
+                return True
+            except Exception:  # noqa: BLE001 — degrade to stateless, never crash
+                # Retryable, not sticky. This used to latch permanently, so a
+                # database blip during the first touch left the replica
+                # answering /ready with 503 forever while /health stayed ok —
+                # so Kubernetes never restarted it. A zombie replica is worse
+                # than a slow one.
+                self._init_failed_until = time.monotonic() + self._init_backoff
+                self._init_backoff = min(self._init_backoff * 2, 60.0)
+                log.exception(
+                    "PersistentAgentMemory could not connect to the database; "
+                    "retrying in %.0fs, running without persistent memory until "
+                    "then",
+                    self._init_backoff,
+                )
+                return False
+
+    def _check_schema_version(self, engine, meta, table_name: str) -> bool:
+        """Record our schema version, or refuse to run against a newer one.
+
+        ``create_all`` is create-if-not-exists: against a table an older SDK
+        already created it does nothing at all, so a column added in a later
+        version would be missing and only surface as a query error much later.
+        Recording the version makes that case explicit. Migrating *forward* is a
+        no-op today (v1 is the first shape); the branch that matters now is
+        refusing to write through an older SDK to a newer table, where guessing
+        would corrupt data.
+        """
+        with engine.begin() as conn:
+            row = conn.execute(
+                meta.select().where(meta.c.table_name == table_name)
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    meta.insert().values(
+                        table_name=table_name,
+                        schema_version=SCHEMA_VERSION,
+                        updated_at=_utcnow(),
+                    )
+                )
+                return True
+            if row.schema_version > SCHEMA_VERSION:
+                log.error(
+                    "Memory table %s is at schema version %d but this SDK "
+                    "understands %d. Refusing to use it — upgrade "
+                    "hopsworks-agent-protocol. The agent will run without "
+                    "persistent memory.",
+                    table_name,
+                    row.schema_version,
+                    SCHEMA_VERSION,
+                )
+                return False
+            if row.schema_version < SCHEMA_VERSION:
+                # no forward migrations exist yet; when one does, apply the
+                # ordered ALTERs for (row.schema_version, SCHEMA_VERSION] here
+                conn.execute(
+                    meta.update()
+                    .where(meta.c.table_name == table_name)
+                    .values(schema_version=SCHEMA_VERSION, updated_at=_utcnow())
+                )
+            return True
+
+    def _fold_state(self, conversation_id: str) -> tuple[int, int, int | None]:
+        """``(summary_version, last_summarized_item_id, message_count)``.
+
+        ``message_count`` is ``None`` when there is no session row to read —
+        without a summarizer nothing folds, so paying for that read every turn
+        would buy nothing. It is not ``0``: callers have to tell "this
+        conversation holds no messages" apart from "there is no row to ask",
+        because the second means the cache cannot be validated at all.
+        """
+        if self._summarize is None or self._sessions is None:
+            return (0, 0, None)
+        s = self._sessions
+        try:
+            with self._engine.connect() as conn:
+                row = conn.execute(
+                    self._mine(
+                        s.select().where(s.c.conversation_id == conversation_id), s
+                    )
+                ).fetchone()
+        except Exception:  # noqa: BLE001
+            log.exception("Session read failed; treating conversation as unfolded")
+            return (0, 0, None)
+        if row is None:
+            return (0, 0, 0)
+        return (row.summary_version, row.last_summarized_item_id, row.message_count)
+
+    def get(self, conversation_id: str) -> list[Turn]:
+        if not self._ensure_engine():
+            return []
+        version, cutoff, count = self._fold_state(conversation_id)
+        # Cache identity is (fold version, message count). The version alone
+        # only moves on a fold, so between folds — and always without a
+        # summarizer, where it is pinned at 0 — a replica that cached this
+        # conversation never saw turns written by another replica, and the model
+        # silently lost them under round-robin routing. The count comes from the
+        # session row already read above, so this costs nothing extra.
+        key = (version, count)
+        if count is not None:
+            with self._lock:
+                cached = self._cache.get(conversation_id)
+                if cached is not None and cached[0] == key:
+                    return list(cached[1])
+        t = self._table
+        try:
+            with self._engine.connect() as conn:
+                rows = conn.execute(
+                    self._mine(t.select(), t)
+                    .where(t.c.conversation_id == conversation_id)
+                    # closed turns only: an open turn has no reply yet, and an
+                    # abandoned one is a question we failed to answer — neither
+                    # belongs in what the model reads back
+                    .where(t.c.status == TURN_CLOSED)
+                    .where(t.c.memory_type == ITEM_MESSAGE)
+                    # everything at or below the cutoff is represented by the
+                    # summary. Without this the model would get the summary
+                    # *and* the turns it was built from: more tokens than
+                    # before, and the same content twice.
+                    .where(t.c.id > cutoff)
+                    .order_by(t.c.id.desc())
+                    .limit(self._max)
+                ).fetchall()
+        except Exception:  # noqa: BLE001
+            log.exception("Memory read failed; returning empty history")
+            return []
+        turns = [{"role": r.role, "content": r.content} for r in reversed(rows)]
+        if count is not None:
+            with self._lock:
+                self._cache[conversation_id] = (key, list(turns))
+        return turns
+
+    def clear(self, conversation_id: str) -> None:
+        """Drop a conversation: its messages **and** its session row.
+
+        The session row has to go too. It holds the rolling summary — a
+        distillation of the very messages being deleted — so deleting only the
+        items leaves the content readable through ``get_summary`` and
+        ``system_context()``. It also holds ``message_count`` and the fold
+        cursor, so a reused conversation id would otherwise fold immediately and
+        blend the deleted conversation into the new one's summary.
+
+        Both statements share a transaction: a half-cleared conversation whose
+        summary outlived its messages is the exact state this exists to prevent.
+        """
+        if self._ensure_engine():
+            try:
+                with self._engine.begin() as conn:
+                    conn.execute(
+                        self._mine(
+                            self._table.delete().where(
+                                self._table.c.conversation_id == conversation_id
+                            ),
+                            self._table,
+                        )
+                    )
+                    if self._sessions is not None:
+                        conn.execute(
+                            self._mine(
+                                self._sessions.delete().where(
+                                    self._sessions.c.conversation_id
+                                    == conversation_id
+                                ),
+                                self._sessions,
+                            )
+                        )
+            except Exception:  # noqa: BLE001
+                log.exception("Memory clear failed")
+        with self._lock:
+            self._cache.pop(conversation_id, None)
+
     # ── feature-store registration (optional) ────────────────────────────
 
     #: SQLAlchemy column type -> Hopsworks feature type, for the types this
@@ -1137,111 +1911,172 @@ class PersistentAgentMemory(ChatMemory):
             features.append(Feature(column.name, type=kind))
         return features
 
-    def register_feature_groups(
-        self, feature_store=None, *, version: int = 1, include=None
+    # ── feature-store export (optional) ──────────────────────────────────
+
+    #: What each exported table is keyed on, and which column carries its
+    #: time. The keys are natural, not the autoincrement id alone: a feature
+    #: group holds every deployment's rows, so the deployment has to be part of
+    #: what makes a row unique — the same reason it leads every SQL index here.
+    #: SQLAlchemy column type -> (offline type, online type). Declared rather
+    #: than inferred, for two reasons found the hard way: a column that happens
+    #: to be entirely NULL in a batch infers as dtype 'null' and is rejected,
+    #: and an inferred string lands as varchar(100) online — which would
+    #: silently truncate message content to 100 characters.
+    _FEATURE_TYPES = {
+        # bigint, not int: a pandas frame carries integers as int64, which
+        # hsfs derives as 'bigint', and declaring 'int' (its name for int32)
+        # fails schema verification before a row is written — even though the
+        # SQL columns really are INT and SMALLINT.
+        "INTEGER": ("bigint", "bigint"),
+        "SMALLINTEGER": ("bigint", "bigint"),
+        "TEXT": ("string", "text"),
+        "DATETIME": ("timestamp", "timestamp"),
+    }
+
+    def _features_for(self, table):
+        from hsfs.feature import Feature
+
+        features = []
+        for column in table.columns:
+            name = type(column.type).__name__.upper()
+            if name == "STRING":
+                length = getattr(column.type, "length", None) or 255
+                offline, online = "string", f"varchar({length})"
+            else:
+                mapped = self._FEATURE_TYPES.get(name)
+                if mapped is None:
+                    raise RuntimeError(
+                        f"No feature type for column {column.name!r} ({name}) "
+                        f"of {table.name}. Add it to _FEATURE_TYPES."
+                    )
+                offline, online = mapped
+            features.append(
+                Feature(column.name, type=offline, online_type=online)
+            )
+        return features
+
+    _EXPORT_SHAPE = {
+        "items": (("deployment_id", "id"), "created_at"),
+        "sessions": (("deployment_id", "conversation_id"), "last_active_at"),
+        "state": (("deployment_id", "id"), "updated_at"),
+    }
+
+    def export_feature_groups(
+        self,
+        feature_store=None,
+        *,
+        storage: str | None = EXPORT_STORAGE_ONLINE,
+        since: int | None = None,
+        batch_size: int = 5000,
+        version: int = 1,
+        include=None,
     ) -> dict:
-        """Expose the memory tables to the feature store, for analysis.
+        """Copy memory rows into feature groups, for analysis.
 
-        The tables stay exactly as they are and the agent keeps reading and
-        writing them over SQL. What this adds is **external** feature groups —
-        read-through definitions over a storage connector — so the same rows
-        can be queried with the Hopsworks API alongside the rest of a project's
-        data. Nothing is copied, nothing is materialised, and the serving path
-        is untouched.
+        The database stays the system of record. These tables are read as
+        ordered ranges, closed with predicate updates and erased with row
+        deletes — none of which a feature group offers — so the agent keeps
+        talking to SQL and this copies rows out to where they can be joined,
+        queried and turned into training data.
 
-        External is the load-bearing word. A regular feature group owns its
-        storage and expects hsfs to do the writing, which this data cannot
-        tolerate: history is read as an ordered range, turns are closed with a
-        predicate update, and erasure is a row delete — none of which the
-        online feature-group API offers. Read-through gives the analysis story
-        without any of that.
+        Writes go through ``fg.insert(..., write_options={"mode": "append"})``,
+        with ``storage`` defaulting to online only. Offline is a Delta write:
+        worth doing on a schedule, wasteful per batch. Pass ``"both"`` to fill
+        both stores as you go, or run this again later with ``"offline"`` to
+        backfill.
 
-        The connector is the project's own online feature store, which is where
-        these tables already live, so no new credentials are involved.
-
-        Call it deliberately — from a notebook or a setup job, not at startup.
-        It is an operator action, so unlike everything else in this class it
-        raises on failure instead of degrading: a registration that silently
-        did nothing would be discovered as an empty feature group weeks later.
-
-        Note that this makes the rows readable by anyone with feature-store
-        access to the project, which is wider than the agent's own audience.
-        For transcripts (``agent_memory_items``) that means end-user
-        conversations become project-visible.
+        Re-exporting a range is safe. Feature groups upsert on the primary key,
+        and the keys here are stable, so a job that overlaps its previous run —
+        or does not track a watermark at all — produces the same rows rather
+        than duplicates.
 
         Args:
-            feature_store: an existing feature store handle; logs in if omitted.
-            version: feature group version to create.
-            include: table short names to register — any of "items",
-                "sessions", "state". Defaults to all that exist.
+            feature_store: an existing handle; logs in if omitted.
+            storage: "online" (default), "offline", or "both".
+            since: only rows with a higher id. None exports everything.
+            batch_size: rows per insert.
+            version: feature group version.
+            include: any of "items", "sessions", "state". Defaults to all.
 
         Returns:
-            ``{short_name: feature_group}`` for what was registered.
+            ``{name: rows_exported}``.
         """
         if not self._ensure_engine():
             raise RuntimeError(
                 "Memory tables are not reachable, so there is nothing to "
-                "register. Check the database connection first."
+                "export. Check the database connection first."
             )
+        storage_arg = _storage_arg(storage)
         if feature_store is None:
             import hopsworks
 
             feature_store = hopsworks.login().get_feature_store()
 
-        # event_time points at the column that says when the row happened, so
-        # the feature store can reason about time without being told again
-        candidates = {
-            "items": (self._table, "created_at"),
-            "sessions": (self._sessions, "last_active_at"),
-            "state": (self._state, "updated_at"),
-        }
-        wanted = list(candidates) if include is None else list(include)
-        unknown = [name for name in wanted if name not in candidates]
-        if unknown:
-            raise ValueError(
-                f"Unknown table(s) {unknown}. Choose from {sorted(candidates)}."
-            )
-
-        from sqlalchemy import inspect as sqlalchemy_inspect
+        import pandas as pd
+        from sqlalchemy import inspect as sqlalchemy_inspect, select
 
         inspector = sqlalchemy_inspect(self._engine)
-        connector = feature_store.get_online_storage_connector()
-        registered = {}
-        for name in wanted:
-            table, event_time = candidates[name]
-            if table is None or not inspector.has_table(table.name):
-                # Asked of the database, not of this object's configuration: a
-                # store constructed without a summarizer still has no
-                # `sessions` attribute even when the table is sitting there,
-                # written by the agent that does have one. Registering what
-                # exists is the useful behaviour; registering what this
-                # particular handle was configured for is not.
-                log.info("Skipping %s: no such table in the database", name)
-                continue
-            existing = feature_store.get_external_feature_group(
-                name=table.name, version=version
+        tables = {
+            "items": self._table,
+            "sessions": self._sessions,
+            "state": self._state,
+        }
+        wanted = list(tables) if include is None else list(include)
+        unknown = [name for name in wanted if name not in tables]
+        if unknown:
+            raise ValueError(
+                f"Unknown table(s) {unknown}. Choose from {sorted(tables)}."
             )
-            if existing is not None:
-                registered[name] = existing
+
+        exported = {}
+        for name in wanted:
+            table = tables[name]
+            if table is None or not inspector.has_table(table.name):
+                # asked of the database, not of this handle's configuration
+                log.info("Skipping %s: no such table", name)
                 continue
-            registered[name] = feature_store.create_external_feature_group(
+            keys, event_time = self._EXPORT_SHAPE[name]
+            stmt = select(table)
+            if since is not None and "id" in table.c:
+                stmt = stmt.where(table.c.id > since)
+            if "id" in table.c:
+                stmt = stmt.order_by(table.c.id)
+            with self._engine.connect() as conn:
+                rows = [dict(r._mapping) for r in conn.execute(stmt)]
+            if not rows:
+                exported[table.name] = 0
+                continue
+
+            fg = feature_store.get_or_create_feature_group(
                 name=table.name,
                 version=version,
-                storage_connector=connector,
-                query=f"SELECT * FROM {table.name}",
-                description=(
-                    f"Agent memory ({name}), read through to the project "
-                    "database. Written by hopsworks-agent-protocol over SQL; "
-                    "do not write through this feature group."
-                ),
-                primary_key=[c.name for c in table.primary_key.columns],
+                description=f"Agent memory ({name}), exported from the "
+                "project database by hopsworks-agent-protocol",
+                primary_key=list(keys),
                 event_time=event_time,
+                online_enabled=True,
                 features=self._features_for(table),
-                # statistics would scan the serving database on a schedule
-                statistics_config=False,
             )
-            registered[name].save()
-        return registered
+            for start in range(0, len(rows), batch_size):
+                frame = pd.DataFrame(rows[start : start + batch_size])
+                # A nullable DATETIME (expires_at, and any turn that never
+                # expires) arrives as None, which pandas turns into NaT inside
+                # a datetime64 column — and hsfs raises "NaTType does not
+                # support timetuple" rather than writing a NULL. Object dtype
+                # holding real datetimes and Nones converts cleanly.
+                for column in frame.columns:
+                    if pd.api.types.is_datetime64_any_dtype(frame[column]):
+                        values = frame[column]
+                        if values.isna().any():
+                            frame[column] = values.astype(object).where(
+                                values.notna(), None
+                            )
+                insert_kwargs = {"write_options": {"mode": "append"}}
+                if storage_arg is not None:
+                    insert_kwargs["storage"] = storage_arg
+                fg.insert(frame, **insert_kwargs)
+            exported[table.name] = len(rows)
+        return exported
 
     def healthcheck(self) -> bool:
         # ready once the engine + tables are established and reachable; this is
