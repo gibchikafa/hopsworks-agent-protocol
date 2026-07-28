@@ -95,15 +95,23 @@ SCHEMA_VERSION = 1
 
 _TABLE_SUFFIX_RE = re.compile(r"^[A-Za-z0-9_]{1,48}$")
 
-#: The shared items table. Companion tables derive their names from it.
-ITEMS_TABLE = "agent_memory_items"
+#: Table names, each saying what it holds rather than what layer wrote it.
+#:
+#: ``messages``      every user message, agent reply and tool event
+#: ``conversations`` one row per conversation: its summary and fold bookkeeping
+#: ``facts``         durable scoped state — what the agent knows about someone
+#: ``schema``        the schema version, so an upgraded SDK knows what it found
+ITEMS_TABLE = "agent_memory_messages"
+CONVERSATIONS_TABLE = "agent_memory_conversations"
+FACTS_TABLE = "agent_memory_facts"
+SCHEMA_TABLE = "agent_memory_schema"
 
 
 def _table_suffix(table_name: str) -> str:
     """What to append to the companion table names, or "" for the default.
 
-    ``agent_memory_items`` -> ``""``      (agent_memory_state)
-    ``agent_memory_items_42`` -> ``"42"`` (agent_memory_state_42)
+    ``agent_memory_messages`` -> ``""``      (agent_memory_facts)
+    ``agent_memory_messages_42`` -> ``"42"`` (agent_memory_facts_42)
     ``something_else`` -> ``"something_else"``
     """
     if table_name == ITEMS_TABLE:
@@ -112,6 +120,10 @@ def _table_suffix(table_name: str) -> str:
     if table_name.startswith(prefix):
         return table_name[len(prefix):]
     return table_name
+
+
+def _companion(base: str, suffix: str) -> str:
+    return f"{base}_{suffix}" if suffix else base
 
 #: Fragments MySQL, SQLite and Postgres use for "this object is already there".
 #: Matched on the message because SQLAlchemy does not normalise the DBAPI code
@@ -600,7 +612,7 @@ class PersistentAgentMemory(ChatMemory):
     A per-conversation cache avoids a read round-trip on every turn for the
     lifetime of the process.
 
-    Rows live in ``agent_memory_items_<DEPLOYMENT_ID>`` and carry turn identity
+    Rows live in ``agent_memory_messages`` and carry turn identity
     (``turn_id``, ``seq``, ``status``, ``message_id``) so the SDK can record the
     user message before the handler runs without ever exposing a half-written
     turn: only ``closed`` turns are returned by :meth:`get`. See
@@ -764,9 +776,8 @@ class PersistentAgentMemory(ChatMemory):
         wants a deployment kept physically apart.
         """
         name = self._table_name or ITEMS_TABLE
-        suffix = name[len("agent_memory_items_"):] if name.startswith(
-            "agent_memory_items_"
-        ) else name
+        # one definition of how a name splits, shared with the companions
+        suffix = _table_suffix(name)
         if suffix and not _TABLE_SUFFIX_RE.match(suffix):
             raise RuntimeError(
                 f"Invalid memory table name {name!r}: the suffix must "
@@ -810,10 +821,9 @@ class PersistentAgentMemory(ChatMemory):
                 url = self._url or deployment_mysql_url()
                 deployment = self._resolve_deployment_id()
                 table_name = self._resolve_table_name()
-                # "" for the shared default, so the companion tables are
-                # agent_memory_meta / _sessions / _state rather than
-                # agent_memory_meta_agent_memory_items. Only an explicit
-                # table_name= produces a suffix, and then every table carries it.
+                # "" for the shared default, so the companion tables keep
+                # their plain names. Only an explicit table_name= produces a
+                # suffix, and then every table carries it.
                 suffix = _table_suffix(table_name)
                 # index and constraint names still have to be unique and
                 # non-empty, so they get a stem even when the tables do not
@@ -866,8 +876,7 @@ class PersistentAgentMemory(ChatMemory):
                     Index(f"idx_{stem}_msg", "deployment_id", "message_id"),
                 )
                 meta = Table(
-                    f"agent_memory_meta_{suffix}" if suffix
-                    else "agent_memory_meta",
+                    _companion(SCHEMA_TABLE, suffix),
                     metadata,
                     Column("table_name", String(64), primary_key=True),
                     Column("schema_version", Integer, nullable=False),
@@ -877,8 +886,7 @@ class PersistentAgentMemory(ChatMemory):
                 if self._summarize is not None:
                     # tier 2 only: no summarizer, no bookkeeping to keep
                     sessions = Table(
-                        f"agent_memory_sessions_{suffix}" if suffix
-                        else "agent_memory_sessions",
+                        _companion(CONVERSATIONS_TABLE, suffix),
                         metadata,
                         # composite PK: two deployments may legitimately use
                         # the same conversation id, and before consolidation
@@ -911,8 +919,7 @@ class PersistentAgentMemory(ChatMemory):
                 if self._long_term:
                     # tier 3 only
                     state = Table(
-                        f"agent_memory_state_{suffix}" if suffix
-                        else "agent_memory_state",
+                        _companion(FACTS_TABLE, suffix),
                         metadata,
                         Column("id", Integer, primary_key=True, autoincrement=True),
                         Column("deployment_id", String(64), nullable=False),
@@ -1329,7 +1336,7 @@ class PersistentAgentMemory(ChatMemory):
     A per-conversation cache avoids a read round-trip on every turn for the
     lifetime of the process.
 
-    Rows live in ``agent_memory_items_<DEPLOYMENT_ID>`` and carry turn identity
+    Rows live in ``agent_memory_messages`` and carry turn identity
     (``turn_id``, ``seq``, ``status``, ``message_id``) so the SDK can record the
     user message before the handler runs without ever exposing a half-written
     turn: only ``closed`` turns are returned by :meth:`get`. See
@@ -1493,9 +1500,8 @@ class PersistentAgentMemory(ChatMemory):
         wants a deployment kept physically apart.
         """
         name = self._table_name or ITEMS_TABLE
-        suffix = name[len("agent_memory_items_"):] if name.startswith(
-            "agent_memory_items_"
-        ) else name
+        # one definition of how a name splits, shared with the companions
+        suffix = _table_suffix(name)
         if suffix and not _TABLE_SUFFIX_RE.match(suffix):
             raise RuntimeError(
                 f"Invalid memory table name {name!r}: the suffix must "
@@ -1539,10 +1545,9 @@ class PersistentAgentMemory(ChatMemory):
                 url = self._url or deployment_mysql_url()
                 deployment = self._resolve_deployment_id()
                 table_name = self._resolve_table_name()
-                # "" for the shared default, so the companion tables are
-                # agent_memory_meta / _sessions / _state rather than
-                # agent_memory_meta_agent_memory_items. Only an explicit
-                # table_name= produces a suffix, and then every table carries it.
+                # "" for the shared default, so the companion tables keep
+                # their plain names. Only an explicit table_name= produces a
+                # suffix, and then every table carries it.
                 suffix = _table_suffix(table_name)
                 # index and constraint names still have to be unique and
                 # non-empty, so they get a stem even when the tables do not
@@ -1595,8 +1600,7 @@ class PersistentAgentMemory(ChatMemory):
                     Index(f"idx_{stem}_msg", "deployment_id", "message_id"),
                 )
                 meta = Table(
-                    f"agent_memory_meta_{suffix}" if suffix
-                    else "agent_memory_meta",
+                    _companion(SCHEMA_TABLE, suffix),
                     metadata,
                     Column("table_name", String(64), primary_key=True),
                     Column("schema_version", Integer, nullable=False),
@@ -1606,8 +1610,7 @@ class PersistentAgentMemory(ChatMemory):
                 if self._summarize is not None:
                     # tier 2 only: no summarizer, no bookkeeping to keep
                     sessions = Table(
-                        f"agent_memory_sessions_{suffix}" if suffix
-                        else "agent_memory_sessions",
+                        _companion(CONVERSATIONS_TABLE, suffix),
                         metadata,
                         # composite PK: two deployments may legitimately use
                         # the same conversation id, and before consolidation
@@ -1640,8 +1643,7 @@ class PersistentAgentMemory(ChatMemory):
                 if self._long_term:
                     # tier 3 only
                     state = Table(
-                        f"agent_memory_state_{suffix}" if suffix
-                        else "agent_memory_state",
+                        _companion(FACTS_TABLE, suffix),
                         metadata,
                         Column("id", Integer, primary_key=True, autoincrement=True),
                         Column("deployment_id", String(64), nullable=False),

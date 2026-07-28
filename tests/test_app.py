@@ -953,7 +953,7 @@ class TestTurnLifecycle:
         from hopsworks_agent_protocol import PersistentAgentMemory
 
         return PersistentAgentMemory(
-            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_items_t", **kw
+            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t", **kw
         )
 
     def test_open_turn_is_invisible_until_closed(self, tmp_path):
@@ -1128,7 +1128,7 @@ class TestMemorySchemaGuards:
         monkeypatch.setenv("DEPLOYMENT_ID", "42")
         memory = PersistentAgentMemory(url=f"sqlite:///{tmp_path}/m.db")
         assert memory._resolve_deployment_id() == "42"
-        assert memory._resolve_table_name() == "agent_memory_items"
+        assert memory._resolve_table_name() == "agent_memory_messages"
 
     def test_rejects_a_deployment_id_that_is_not_an_identifier(
         self, monkeypatch, tmp_path
@@ -1147,7 +1147,7 @@ class TestMemorySchemaGuards:
         from hopsworks_agent_protocol.memory import SCHEMA_VERSION
 
         memory = PersistentAgentMemory(
-            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_items_t"
+            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t"
         )
         assert memory.healthcheck() is True
         with memory._engine.connect() as conn:
@@ -1159,14 +1159,14 @@ class TestMemorySchemaGuards:
         from hopsworks_agent_protocol.memory import SCHEMA_VERSION
 
         url = f"sqlite:///{tmp_path}/m.db"
-        first = PersistentAgentMemory(url=url, table_name="agent_memory_items_t")
+        first = PersistentAgentMemory(url=url, table_name="agent_memory_messages_t")
         assert first.healthcheck() is True
         with first._engine.begin() as conn:
             conn.execute(
                 first._meta.update().values(schema_version=SCHEMA_VERSION + 1)
             )
         # a second process on an older SDK must not write through it
-        second = PersistentAgentMemory(url=url, table_name="agent_memory_items_t")
+        second = PersistentAgentMemory(url=url, table_name="agent_memory_messages_t")
         assert second.healthcheck() is False
         second.begin_turn("c1", "t1", "user", "hi")
         assert second.get("c1") == []
@@ -1183,7 +1183,7 @@ class TestStreamAbort:
         from hopsworks_agent_protocol import PersistentAgentMemory
 
         memory = PersistentAgentMemory(
-            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_items_t"
+            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t"
         )
         app = AgentApp(memory=memory)
 
@@ -1236,7 +1236,7 @@ class TestSummarization:
         kw.setdefault("summarize_after_messages", 4)
         kw.setdefault("keep_recent_messages", 2)
         return PersistentAgentMemory(
-            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_items_t", **kw
+            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t", **kw
         )
 
     def _turn(self, memory, cid, q, a):
@@ -1372,7 +1372,7 @@ class TestSummarization:
 
         url = f"sqlite:///{tmp_path}/m.db"
         kw = dict(
-            table_name="agent_memory_items_t",
+            table_name="agent_memory_messages_t",
             summarize=_fake_summarizer([]),
             summarize_after_messages=4,
             keep_recent_messages=2,
@@ -1411,7 +1411,7 @@ class TestSummaryOnContext:
 
         memory = PersistentAgentMemory(
             url=f"sqlite:///{tmp_path}/m.db",
-            table_name="agent_memory_items_t",
+            table_name="agent_memory_messages_t",
             summarize=_fake_summarizer([]),
             summarize_after_messages=2,
             keep_recent_messages=0,
@@ -1442,7 +1442,7 @@ class TestSummaryOnContext:
         from hopsworks_agent_protocol import PersistentAgentMemory
 
         memory = PersistentAgentMemory(
-            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_items_t"
+            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t"
         )
         memory.healthcheck()
         assert memory._sessions is None  # tier-2 table is not created
@@ -1455,7 +1455,7 @@ class TestRetention:
         from hopsworks_agent_protocol import PersistentAgentMemory
 
         return PersistentAgentMemory(
-            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_items_t", **kw
+            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t", **kw
         )
 
     def test_messages_keep_forever_events_expire(self, tmp_path):
@@ -1505,7 +1505,7 @@ class TestTranscriptEndpoint:
 
         memory = PersistentAgentMemory(
             url=f"sqlite:///{tmp_path}/m.db",
-            table_name="agent_memory_items_t",
+            table_name="agent_memory_messages_t",
             summarize=_fake_summarizer([]),
             summarize_after_messages=2,
             keep_recent_messages=0,
@@ -1534,7 +1534,7 @@ class TestTranscriptEndpoint:
         from hopsworks_agent_protocol import PersistentAgentMemory
 
         memory = PersistentAgentMemory(
-            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_items_t"
+            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t"
         )
         app = AgentApp(memory=memory, tool_events=True)
 
@@ -1560,7 +1560,7 @@ class TestDurableState:
 
         kw.setdefault("long_term", True)
         return PersistentAgentMemory(
-            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_items_t", **kw
+            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t", **kw
         )
 
     def test_upsert_does_not_accumulate(self, tmp_path):
@@ -1648,7 +1648,7 @@ class TestMemoryTools:
 
         memory = PersistentAgentMemory(
             url=f"sqlite:///{tmp_path}/m.db",
-            table_name="agent_memory_items_t",
+            table_name="agent_memory_messages_t",
             long_term=True,
         )
         return AgentApp(memory=memory), memory
@@ -1760,7 +1760,7 @@ class TestSubjectIdentity:
 
         memory = PersistentAgentMemory(
             url=f"sqlite:///{tmp_path}/m.db",
-            table_name="agent_memory_items_t",
+            table_name="agent_memory_messages_t",
             long_term=True,
         )
         return AgentApp(memory=memory), memory
@@ -1806,7 +1806,7 @@ class TestStateAuditEndpoints:
 
         memory = PersistentAgentMemory(
             url=f"sqlite:///{tmp_path}/m.db",
-            table_name="agent_memory_items_t",
+            table_name="agent_memory_messages_t",
             long_term=True,
         )
         app = AgentApp(memory=memory)
@@ -1919,7 +1919,7 @@ class TestSemanticSearch:
         kw.setdefault("embedder", _toy_embedder)
         kw.setdefault("vector_store", InMemoryVectorStore())
         return PersistentAgentMemory(
-            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_items_t", **kw
+            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t", **kw
         )
 
     def _turn(self, memory, cid, q, a, subject=None):
@@ -2119,7 +2119,7 @@ class TestReviewRegressions:
 
         return PersistentAgentMemory(
             url=f"sqlite:///{tmp_path}/m.db",
-            table_name="agent_memory_items_r",
+            table_name="agent_memory_messages_r",
             **kw,
         )
 
@@ -2185,7 +2185,7 @@ class TestReviewRegressions:
 
     def test_replica_sees_turns_written_by_another_replica(self, tmp_path):
         url = f"sqlite:///{tmp_path}/m.db"
-        kw = {"table_name": "agent_memory_items_r", "summarize": lambda *a, **k: "s"}
+        kw = {"table_name": "agent_memory_messages_r", "summarize": lambda *a, **k: "s"}
         from hopsworks_agent_protocol import PersistentAgentMemory
 
         one = PersistentAgentMemory(url=url, **kw)
@@ -2258,7 +2258,7 @@ class TestRetrievalAndReconciliation:
 
         return PersistentAgentMemory(
             url=f"sqlite:///{tmp_path}/m.db",
-            table_name="agent_memory_items_rr",
+            table_name="agent_memory_messages_rr",
             long_term=True,
             **kw,
         )
@@ -2515,25 +2515,25 @@ class TestSharedTableNames:
         )
         assert memory.healthcheck() is True
         # not agent_memory_meta_agent_memory_items
-        assert memory._table.name == "agent_memory_items"
-        assert memory._meta.name == "agent_memory_meta"
-        assert memory._sessions.name == "agent_memory_sessions"
-        assert memory._state.name == "agent_memory_state"
+        assert memory._table.name == "agent_memory_messages"
+        assert memory._meta.name == "agent_memory_schema"
+        assert memory._sessions.name == "agent_memory_conversations"
+        assert memory._state.name == "agent_memory_facts"
 
     def test_explicit_table_name_suffixes_every_companion(self, tmp_path):
         from hopsworks_agent_protocol import PersistentAgentMemory
 
         memory = PersistentAgentMemory(
             url=f"sqlite:///{tmp_path}/m.db",
-            table_name="agent_memory_items_42",
+            table_name="agent_memory_messages_42",
             deployment_id="d1",
             long_term=True,
             summarize=lambda prev, turns: "s",
         )
         assert memory.healthcheck() is True
-        assert memory._meta.name == "agent_memory_meta_42"
-        assert memory._sessions.name == "agent_memory_sessions_42"
-        assert memory._state.name == "agent_memory_state_42"
+        assert memory._meta.name == "agent_memory_schema_42"
+        assert memory._sessions.name == "agent_memory_conversations_42"
+        assert memory._state.name == "agent_memory_facts_42"
 
 
 
@@ -2604,8 +2604,8 @@ class TestFeatureGroupExport:
 
         counts = memory.export_feature_groups(fs)
 
-        assert counts["agent_memory_items"] == 1
-        assert counts["agent_memory_state"] == 1
+        assert counts["agent_memory_messages"] == 1
+        assert counts["agent_memory_facts"] == 1
         for fg in fs.groups.values():
             for frame, kwargs in fg.inserts:
                 assert kwargs["write_options"] == {"mode": "append"}
@@ -2618,7 +2618,7 @@ class TestFeatureGroupExport:
         memory.append("c1", "user", "hello")
         fs = self.FakeStore()
         memory.export_feature_groups(fs, storage="both", include=("items",))
-        _, kwargs = fs.groups[("agent_memory_items", 1)].inserts[0]
+        _, kwargs = fs.groups[("agent_memory_messages", 1)].inserts[0]
         # hsfs writes both stores when the argument is absent
         assert "storage" not in kwargs
 
@@ -2627,7 +2627,7 @@ class TestFeatureGroupExport:
         memory.append("c1", "user", "hello")
         fs = self.FakeStore()
         memory.export_feature_groups(fs, storage="offline", include=("items",))
-        _, kwargs = fs.groups[("agent_memory_items", 1)].inserts[0]
+        _, kwargs = fs.groups[("agent_memory_messages", 1)].inserts[0]
         assert kwargs["storage"] == "offline"
 
     def test_unknown_storage_is_refused(self, tmp_path):
@@ -2642,11 +2642,11 @@ class TestFeatureGroupExport:
         fs = self.FakeStore()
 
         counts = memory.export_feature_groups(fs, include=("items",))
-        assert counts["agent_memory_items"] == 2
+        assert counts["agent_memory_messages"] == 2
 
         fs2 = self.FakeStore()
         counts = memory.export_feature_groups(fs2, include=("items",), since=1)
-        assert counts["agent_memory_items"] == 1
+        assert counts["agent_memory_messages"] == 1
 
     def test_keys_include_the_deployment(self, tmp_path):
         memory = self._store(tmp_path)
@@ -2658,8 +2658,8 @@ class TestFeatureGroupExport:
         keys = {name: fg.kw["primary_key"] for (name, _), fg in fs.groups.items()}
         # one feature group holds every deployment's rows, so the deployment
         # has to be part of what makes a row unique
-        assert keys["agent_memory_items"] == ["deployment_id", "id"]
-        assert keys["agent_memory_sessions"] == [
+        assert keys["agent_memory_messages"] == ["deployment_id", "id"]
+        assert keys["agent_memory_conversations"] == [
             "deployment_id",
             "conversation_id",
         ]
@@ -2670,7 +2670,7 @@ class TestFeatureGroupExport:
             memory.append("c1", "user", f"m{i}")
         fs = self.FakeStore()
         memory.export_feature_groups(fs, include=("items",), batch_size=2)
-        inserts = fs.groups[("agent_memory_items", 1)].inserts
+        inserts = fs.groups[("agent_memory_messages", 1)].inserts
         assert [len(frame) for frame, _ in inserts] == [2, 2, 1]
 
     def test_nothing_to_export_is_not_a_feature_group(self, tmp_path):
@@ -2678,7 +2678,7 @@ class TestFeatureGroupExport:
         fs = self.FakeStore()
         counts = memory.export_feature_groups(fs, include=("items",))
         # an empty table should not leave an empty feature group behind
-        assert counts["agent_memory_items"] == 0
+        assert counts["agent_memory_messages"] == 0
         assert fs.groups == {}
 
     def test_content_is_not_truncated_to_varchar_100(self, tmp_path):
