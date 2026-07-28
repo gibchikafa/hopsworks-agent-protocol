@@ -54,7 +54,7 @@ class TestManifestAndHealth:
         client = TestClient(build_basic_app())
         manifest = client.get("/.well-known/hopsworks-agent.json").json()
         assert manifest["protocol"] == "hopsworks-agent"
-        assert manifest["protocol_version"] == "1.2"
+        assert manifest["protocol_version"] == "1.3"
         assert manifest["agent"]["name"] == "Test agent"
         assert manifest["endpoints"] == {"chat": "/v1/chat"}
         assert manifest["capabilities"]["streaming"] is False
@@ -2750,3 +2750,89 @@ class TestConversationListing:
             return "ok"
 
         return app
+
+
+class TestConversationSubject:
+    """Who a conversation is filed under is a server fact, not a client one."""
+
+    def _store(self, tmp_path, deployment_id="d1"):
+        from hopsworks_agent_protocol import ManagedMemoryService
+
+        memory = ManagedMemoryService(
+            url=f"sqlite:///{tmp_path}/m.db", deployment_id=deployment_id
+        )
+        assert memory.healthcheck() is True
+        return memory
+
+    def test_reports_the_subject_the_turn_was_stamped_with(self, tmp_path):
+        memory = self._store(tmp_path)
+        memory.begin_turn("c1", "t1", "user", "hi", subject="alice")
+        memory.end_turn("c1", "t1")
+        assert memory.conversation_subject("c1") == "alice"
+
+    def test_reports_the_rebound_subject_not_the_asserted_one(self, tmp_path):
+        # The case the client cannot answer for itself: it asserted one subject
+        # and the agent worked out another while the turn ran.
+        memory = self._store(tmp_path)
+        memory.begin_turn("c1", "t1", "user", "I'm Patrick", subject="meb10000")
+        memory.rebind_turn_subject("c1", "t1", "customer:14")
+        memory.end_turn("c1", "t1")
+        assert memory.conversation_subject("c1") == "customer:14"
+
+    def test_later_turns_win(self, tmp_path):
+        memory = self._store(tmp_path)
+        memory.begin_turn("c1", "t1", "user", "hi", subject="alice")
+        memory.end_turn("c1", "t1")
+        memory.begin_turn("c1", "t2", "user", "actually", subject="bob")
+        memory.end_turn("c1", "t2")
+        assert memory.conversation_subject("c1") == "bob"
+
+    def test_scoped_to_the_deployment(self, tmp_path):
+        # Another deployment's conversation must not leak an identity, even to
+        # a caller who guessed the conversation id.
+        url_dir = tmp_path
+        a = self._store(url_dir, deployment_id="a")
+        b = self._store(url_dir, deployment_id="b")
+        a.begin_turn("shared-id", "t1", "user", "hi", subject="alice")
+        a.end_turn("shared-id", "t1")
+        assert b.conversation_subject("shared-id") is None
+
+    def test_none_when_no_subject_was_ever_stamped(self, tmp_path):
+        memory = self._store(tmp_path)
+        memory.append("c1", "user", "hello")
+        assert memory.conversation_subject("c1") is None
+
+    def test_none_for_an_unknown_conversation(self, tmp_path):
+        memory = self._store(tmp_path)
+        assert memory.conversation_subject("nope") is None
+
+    def test_endpoint_exposes_it_on_the_transcript(self, tmp_path):
+        from hopsworks_agent_protocol import AgentApp
+
+        memory = self._store(tmp_path)
+        memory.begin_turn("c1", "t1", "user", "hi", subject="meb10000")
+        memory.rebind_turn_subject("c1", "t1", "customer:14")
+        memory.end_turn("c1", "t1")
+
+        app = AgentApp(name="t", memory=memory)
+
+        @app.chat
+        async def handler(request, ctx):  # pragma: no cover - not exercised
+            return "ok"
+
+        body = TestClient(app).get("/v1/conversations/c1/messages").json()
+        assert body["subject"] == "customer:14"
+
+    def test_endpoint_reports_null_rather_than_guessing(self, tmp_path):
+        from hopsworks_agent_protocol import AgentApp, InMemoryAgentMemory
+
+        # A store with no per-row subject must say so, so the client falls back
+        # to its own value instead of being handed a fabricated identity.
+        app = AgentApp(name="t", memory=InMemoryAgentMemory())
+
+        @app.chat
+        async def handler(request, ctx):  # pragma: no cover - not exercised
+            return "ok"
+
+        body = TestClient(app).get("/v1/conversations/c1/messages").json()
+        assert body["subject"] is None

@@ -437,6 +437,21 @@ class ChatMemory(ABC):
         """
         return []
 
+    def conversation_subject(self, conversation_id: str) -> str | None:
+        """Who this conversation's durable memory is keyed by, per the server.
+
+        The client cannot answer this for itself. It knows which subject it
+        *asserted* on the request, but an agent that identifies the caller
+        mid-turn — see :meth:`rebind_turn_subject` — replaces that with
+        something the client was never told, and a client that has since
+        reloaded has forgotten even the assertion. Asking the store is the only
+        way to find out what memory is actually filed under.
+
+        Returns ``None`` for a store with no per-row subject, and for an
+        unknown conversation.
+        """
+        return None
+
     def rebind_turn_subject(
         self, conversation_id: str, turn_id: str, subject: str
     ) -> None:
@@ -1414,17 +1429,17 @@ class ManagedMemoryService(ChatMemory):
     ) -> dict:
         """Copy memory rows into feature groups, for analysis.
 
-        The database stays the system of record. These tables are read as
-        ordered ranges, closed with predicate updates and erased with row
-        deletes — none of which a feature group offers — so the agent keeps
-        talking to SQL and this copies rows out to where they can be joined,
-        queried and turned into training data.
+        The agent already writes to the feature groups' online tables as it
+        runs — that is where its memory lives, read back as ordered ranges,
+        closed with predicate updates and erased with row deletes, none of
+        which a feature group API offers. So this does not move memory
+        anywhere; it fills the *offline* store from those same rows, which is
+        what makes them joinable, queryable and usable as training data.
 
-        Writes go through ``fg.insert(..., write_options={"mode": "append"})``,
-        with ``storage`` defaulting to online only. Offline is a Delta write:
-        worth doing on a schedule, wasteful per batch. Pass ``"both"`` to fill
-        both stores as you go, or run this again later with ``"offline"`` to
-        backfill.
+        Hence ``storage`` defaults to offline: the online side is already
+        current by construction, and the offline write is a Delta write worth
+        doing on a schedule rather than per turn. Pass ``"both"`` only when
+        rebuilding an online table that was dropped.
 
         Re-exporting a range is safe. Feature groups upsert on the primary key,
         and the keys here are stable, so a job that overlaps its previous run —
@@ -1433,7 +1448,7 @@ class ManagedMemoryService(ChatMemory):
 
         Args:
             feature_store: an existing handle; logs in if omitted.
-            storage: "online" (default), "offline", or "both".
+            storage: "offline" (default), "online", or "both".
             since: only rows with a higher id. None exports everything.
             batch_size: rows per insert.
             version: feature group version.
@@ -1636,17 +1651,33 @@ class ManagedMemoryService(ChatMemory):
                         {"role": role, "content": content}
                     )
 
-    def list_conversations(
-        self, *, subject: str | None = None, limit: int = 50
-    ) -> list[dict]:
-        """Conversations this store holds, most recently active first.
+    def conversation_subject(self, conversation_id: str) -> str | None:
+        """The subject most recently stamped on this conversation's messages.
 
-        The transcript lives on the server, so a client that loses its own
-        record of which conversations exist — cleared storage, a different
-        browser, a colleague looking at the same deployment — can still find
-        them. Returns ``[]`` for a store that cannot enumerate.
+        Most recent rather than first: an agent that identifies the caller
+        mid-conversation rebinds, and it is the identity it arrived at that
+        durable memory is filed under. Reads messages rather than session rows
+        so it answers for a store with no summarizer configured.
         """
-        return []
+        if not self._ensure_engine():
+            return None
+        from sqlalchemy import select
+
+        t = self._table
+        stmt = (
+            self._mine(select(t.c.subject), t)
+            .where(t.c.conversation_id == conversation_id)
+            .where(t.c.subject != "")
+            .order_by(t.c.id.desc())
+            .limit(1)
+        )
+        try:
+            with self._engine.connect() as conn:
+                row = conn.execute(stmt).first()
+        except Exception:  # noqa: BLE001
+            log.exception("Looking up conversation subject failed")
+            return None
+        return row[0] if row and row[0] else None
 
     def list_conversations(
         self, *, subject: str | None = None, limit: int = 50

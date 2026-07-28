@@ -550,11 +550,19 @@ class AgentApp(FastAPI):
             cutoff = await asyncio.to_thread(
                 self.memory.summarized_through, conversation_id
             )
+            # The subject the server actually filed this conversation under,
+            # which a client cannot derive: it may have been rebound mid-turn
+            # to an identity the client was never told, and a client that
+            # reloaded has forgotten even the subject it asserted.
+            subject = await asyncio.to_thread(
+                self.memory.conversation_subject, conversation_id
+            )
             return {
                 "conversation_id": conversation_id,
                 "messages": messages,
                 "summary": summary,
                 "summarized_through": cutoff,
+                "subject": subject,
             }
 
         @self.delete("/v1/conversations/{conversation_id}")
