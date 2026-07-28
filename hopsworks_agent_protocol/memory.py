@@ -425,6 +425,18 @@ class ChatMemory(ABC):
     def clear(self, conversation_id: str) -> None:
         """Drop a conversation."""
 
+    def list_conversations(
+        self, *, subject: str | None = None, limit: int = 50
+    ) -> list[dict]:
+        """Conversations this store holds, most recently active first.
+
+        The transcript lives on the server, so a client that loses its own
+        record of which conversations exist — cleared storage, a different
+        browser, a colleague looking at the same deployment — can still find
+        them. Returns ``[]`` for a store that cannot enumerate.
+        """
+        return []
+
     def rebind_turn_subject(
         self, conversation_id: str, turn_id: str, subject: str
     ) -> None:
@@ -1623,6 +1635,85 @@ class PersistentAgentMemory(ChatMemory):
                     self._pending[turn_id].append(
                         {"role": role, "content": content}
                     )
+
+    def list_conversations(
+        self, *, subject: str | None = None, limit: int = 50
+    ) -> list[dict]:
+        """Conversations this store holds, most recently active first.
+
+        The transcript lives on the server, so a client that loses its own
+        record of which conversations exist — cleared storage, a different
+        browser, a colleague looking at the same deployment — can still find
+        them. Returns ``[]`` for a store that cannot enumerate.
+        """
+        return []
+
+    def list_conversations(
+        self, *, subject: str | None = None, limit: int = 50
+    ) -> list[dict]:
+        """Conversations this deployment holds, most recently active first.
+
+        Derived from the messages rather than the conversation rows, because
+        those only exist once a summarizer is configured — a Tier-1 store has
+        conversations and no session bookkeeping at all. The summary, when
+        there is one, is merged in afterwards.
+        """
+        if not self._ensure_engine():
+            return []
+        from sqlalchemy import func, select
+
+        t = self._table
+        stmt = (
+            self._mine(select(
+                t.c.conversation_id,
+                func.count().label("message_count"),
+                func.max(t.c.created_at).label("last_active_at"),
+                func.max(t.c.subject).label("subject"),
+            ), t)
+            .where(t.c.memory_type == ITEM_MESSAGE)
+            .where(t.c.status == TURN_CLOSED)
+        )
+        if subject is not None:
+            stmt = stmt.where(t.c.subject == subject)
+        stmt = (
+            stmt.group_by(t.c.conversation_id)
+            .order_by(func.max(t.c.created_at).desc())
+            .limit(limit)
+        )
+        try:
+            with self._engine.connect() as conn:
+                rows = conn.execute(stmt).fetchall()
+        except Exception:  # noqa: BLE001
+            log.exception("Listing conversations failed")
+            return []
+
+        summaries: dict[str, str] = {}
+        if self._sessions is not None and rows:
+            s = self._sessions
+            try:
+                with self._engine.connect() as conn:
+                    for row in conn.execute(
+                        self._mine(s.select(), s).where(
+                            s.c.conversation_id.in_([r.conversation_id for r in rows])
+                        )
+                    ):
+                        if row.summary:
+                            summaries[row.conversation_id] = row.summary
+            except Exception:  # noqa: BLE001 — a missing summary is not a failure
+                log.exception("Reading conversation summaries failed")
+
+        return [
+            {
+                "conversation_id": r.conversation_id,
+                "subject": r.subject,
+                "message_count": r.message_count,
+                "last_active_at": (
+                    r.last_active_at.isoformat() if r.last_active_at else None
+                ),
+                "has_summary": r.conversation_id in summaries,
+            }
+            for r in rows
+        ]
 
     def rebind_turn_subject(
         self, conversation_id: str, turn_id: str, subject: str

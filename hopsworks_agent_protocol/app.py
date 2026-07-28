@@ -509,6 +509,23 @@ class AgentApp(FastAPI):
                 return self._graph_spec
 
     def _register_conversation_routes(self) -> None:
+        @self.get("/v1/conversations")
+        async def list_conversations(
+            subject: str = "", limit: int = 50
+        ) -> dict[str, Any]:
+            # The manifest has always advertised this path; without it a client
+            # can only show conversations it happens to remember locally, so
+            # clearing a browser's storage loses a transcript the server still
+            # holds in full.
+            if self.memory is None:
+                return {"conversations": []}
+            conversations = await asyncio.to_thread(
+                self.memory.list_conversations,
+                subject=subject or None,
+                limit=max(1, min(limit, 500)),
+            )
+            return {"conversations": conversations}
+
         @self.get("/v1/conversations/{conversation_id}/messages")
         async def list_messages(
             conversation_id: str, include: str = ""

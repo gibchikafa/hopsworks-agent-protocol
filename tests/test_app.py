@@ -2683,3 +2683,70 @@ class TestFeatureGroupExport:
         assert prepared["a"].tolist() == [""]
         # an all-NaT datetime keeps its dtype: that is the type information
         assert pd.api.types.is_datetime64_any_dtype(prepared["t"])
+
+
+class TestConversationListing:
+    """The server knows which conversations exist; a client need not remember."""
+
+    def _store(self, tmp_path, **kw):
+        from hopsworks_agent_protocol import PersistentAgentMemory
+
+        memory = PersistentAgentMemory(
+            url=f"sqlite:///{tmp_path}/m.db", deployment_id="d1", **kw
+        )
+        assert memory.healthcheck() is True
+        return memory
+
+    def test_lists_most_recently_active_first(self, tmp_path):
+        memory = self._store(tmp_path)
+        memory.append("older", "user", "first")
+        memory.append("newer", "user", "second")
+        listed = memory.list_conversations()
+        assert [c["conversation_id"] for c in listed] == ["newer", "older"]
+        assert listed[0]["message_count"] == 1
+
+    def test_scoped_to_the_deployment(self, tmp_path):
+        from hopsworks_agent_protocol import PersistentAgentMemory
+
+        url = f"sqlite:///{tmp_path}/m.db"
+        a = PersistentAgentMemory(url=url, deployment_id="a")
+        b = PersistentAgentMemory(url=url, deployment_id="b")
+        a.append("mine", "user", "hello")
+        b.append("theirs", "user", "hello")
+        assert [c["conversation_id"] for c in a.list_conversations()] == ["mine"]
+
+    def test_filters_by_subject(self, tmp_path):
+        memory = self._store(tmp_path)
+        memory.begin_turn("c1", "t1", "user", "hi", subject="alice")
+        memory.end_turn("c1", "t1")
+        memory.begin_turn("c2", "t2", "user", "hi", subject="bob")
+        memory.end_turn("c2", "t2")
+        assert [c["conversation_id"] for c in memory.list_conversations(subject="bob")] == ["c2"]
+
+    def test_open_turns_are_not_listed_as_conversations(self, tmp_path):
+        memory = self._store(tmp_path)
+        memory.begin_turn("c1", "t1", "user", "still going")
+        # an unanswered question is not yet a conversation to show
+        assert memory.list_conversations() == []
+
+    def test_endpoint_returns_the_list(self, tmp_path):
+        from hopsworks_agent_protocol import PersistentAgentMemory
+
+        memory = PersistentAgentMemory(
+            url=f"sqlite:///{tmp_path}/m.db", deployment_id="d1"
+        )
+        memory.append("c1", "user", "hello")
+        client = TestClient(self.build_app(memory))
+        body = client.get("/v1/conversations").json()
+        assert [c["conversation_id"] for c in body["conversations"]] == ["c1"]
+
+    def build_app(self, memory):
+        from hopsworks_agent_protocol import AgentApp
+
+        app = AgentApp(name="t", memory=memory)
+
+        @app.chat
+        async def handler(request, ctx):  # pragma: no cover - not exercised
+            return "ok"
+
+        return app
