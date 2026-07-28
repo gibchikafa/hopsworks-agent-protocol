@@ -360,16 +360,16 @@ class TestMemory:
         ]
 
     def test_sql_memory_roundtrip(self, tmp_path):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
         url = f"sqlite:///{tmp_path}/memory.db"
-        memory = PersistentAgentMemory(url)
+        memory = AgentMemoryService(url)
         client = TestClient(self.build_memory_app(memory))
         cid = client.post("/v1/chat", json=make_request("hi")).json()[
             "conversation_id"
         ]
         # a fresh store over the same db sees the persisted turns (no cache)
-        fresh = PersistentAgentMemory(url)
+        fresh = AgentMemoryService(url)
         assert fresh.get(cid) == [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "history=0: hi"},
@@ -427,19 +427,19 @@ class TestDeploymentMysqlUrl:
 
 class TestSqlMemoryResilience:
     def test_unreachable_db_does_not_crash_construction_or_turns(self):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        memory = PersistentAgentMemory(url="mysql+pymysql://x:y@127.0.0.1:1/nope")
+        memory = AgentMemoryService(url="mysql+pymysql://x:y@127.0.0.1:1/nope")
         assert memory.get("c1") == []
         memory.append("c1", "user", "hi")
         assert memory.get("c1") == []
         memory.clear("c1")
 
     def test_lazy_url_resolution_defers_env_errors(self, monkeypatch):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
         monkeypatch.delenv("MYSQL_USER", raising=False)
-        memory = PersistentAgentMemory()
+        memory = AgentMemoryService()
         assert memory.get("c1") == []
 
 
@@ -501,9 +501,9 @@ class TestReadiness:
         assert result.json()["checks"]["handler"] is False
 
     def test_not_ready_when_memory_unreachable(self):
-        from hopsworks_agent_protocol import AgentApp, PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentApp, AgentMemoryService
 
-        app = AgentApp(memory=PersistentAgentMemory(url="mysql+pymysql://x:y@127.0.0.1:1/no"))
+        app = AgentApp(memory=AgentMemoryService(url="mysql+pymysql://x:y@127.0.0.1:1/no"))
 
         @app.chat
         async def chat(request):
@@ -950,9 +950,9 @@ class TestTurnLifecycle:
             return conn.execute(stmt).fetchall()
 
     def _store(self, tmp_path, **kw):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        return PersistentAgentMemory(
+        return AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t", **kw
         )
 
@@ -1102,19 +1102,19 @@ class TestTurnLifecycle:
 
 class TestMemorySchemaGuards:
     def test_rejects_table_name_with_invalid_suffix(self, tmp_path):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        memory = PersistentAgentMemory(
+        memory = AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db", table_name="items; DROP TABLE x"
         )
         # degrades to stateless rather than creating a junk table
         assert memory.healthcheck() is False
 
     def test_requires_deployment_id_when_url_is_derived(self, monkeypatch):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
         monkeypatch.delenv("DEPLOYMENT_ID", raising=False)
-        memory = PersistentAgentMemory()
+        memory = AgentMemoryService()
         # tables are shared now, so an agent with no identity would read and
         # write every other agent's rows rather than merely share a table name
         with pytest.raises(RuntimeError, match="DEPLOYMENT_ID"):
@@ -1123,30 +1123,30 @@ class TestMemorySchemaGuards:
     def test_deployment_id_scopes_rows_not_the_table_name(
         self, monkeypatch, tmp_path
     ):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
         monkeypatch.setenv("DEPLOYMENT_ID", "42")
-        memory = PersistentAgentMemory(url=f"sqlite:///{tmp_path}/m.db")
+        memory = AgentMemoryService(url=f"sqlite:///{tmp_path}/m.db")
         assert memory._resolve_deployment_id() == "42"
         assert memory._resolve_table_name() == "agent_memory_messages_1"
 
     def test_rejects_a_deployment_id_that_is_not_an_identifier(
         self, monkeypatch, tmp_path
     ):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
         monkeypatch.setenv("DEPLOYMENT_ID", "42; DROP TABLE x")
-        memory = PersistentAgentMemory(url=f"sqlite:///{tmp_path}/m.db")
+        memory = AgentMemoryService(url=f"sqlite:///{tmp_path}/m.db")
         with pytest.raises(RuntimeError, match="Invalid deployment_id"):
             memory._resolve_deployment_id()
 
     def test_records_schema_version(self, tmp_path):
         from sqlalchemy import select
 
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
         from hopsworks_agent_protocol.memory import SCHEMA_VERSION
 
-        memory = PersistentAgentMemory(
+        memory = AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t"
         )
         assert memory.healthcheck() is True
@@ -1155,18 +1155,18 @@ class TestMemorySchemaGuards:
         assert row.schema_version == SCHEMA_VERSION
 
     def test_refuses_table_written_by_a_newer_sdk(self, tmp_path):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
         from hopsworks_agent_protocol.memory import SCHEMA_VERSION
 
         url = f"sqlite:///{tmp_path}/m.db"
-        first = PersistentAgentMemory(url=url, table_name="agent_memory_messages_t")
+        first = AgentMemoryService(url=url, table_name="agent_memory_messages_t")
         assert first.healthcheck() is True
         with first._engine.begin() as conn:
             conn.execute(
                 first._meta.update().values(schema_version=SCHEMA_VERSION + 1)
             )
         # a second process on an older SDK must not write through it
-        second = PersistentAgentMemory(url=url, table_name="agent_memory_messages_t")
+        second = AgentMemoryService(url=url, table_name="agent_memory_messages_t")
         assert second.healthcheck() is False
         second.begin_turn("c1", "t1", "user", "hi")
         assert second.get("c1") == []
@@ -1180,9 +1180,9 @@ class TestStreamAbort:
     def test_closing_the_stream_early_abandons_the_turn(self, tmp_path):
         import asyncio
 
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        memory = PersistentAgentMemory(
+        memory = AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t"
         )
         app = AgentApp(memory=memory)
@@ -1230,12 +1230,12 @@ def _fake_summarizer(calls):
 
 class TestSummarization:
     def _store(self, tmp_path, calls=None, **kw):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
         kw.setdefault("summarize", _fake_summarizer(calls if calls is not None else []))
         kw.setdefault("summarize_after_messages", 4)
         kw.setdefault("keep_recent_messages", 2)
-        return PersistentAgentMemory(
+        return AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t", **kw
         )
 
@@ -1368,7 +1368,7 @@ class TestSummarization:
         assert memory.get_summary("c1") == "winner"
 
     def test_fold_invalidates_cache_across_replicas(self, tmp_path):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
         url = f"sqlite:///{tmp_path}/m.db"
         kw = dict(
@@ -1377,8 +1377,8 @@ class TestSummarization:
             summarize_after_messages=4,
             keep_recent_messages=2,
         )
-        a = PersistentAgentMemory(url=url, **kw)
-        b = PersistentAgentMemory(url=url, **kw)
+        a = AgentMemoryService(url=url, **kw)
+        b = AgentMemoryService(url=url, **kw)
 
         for i in range(3):
             self._turn(a, "c1", f"q{i}", f"a{i}")
@@ -1407,9 +1407,9 @@ class TestSummarization:
 
 class TestSummaryOnContext:
     def test_summary_and_system_context(self, tmp_path):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        memory = PersistentAgentMemory(
+        memory = AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db",
             table_name="agent_memory_messages_t",
             summarize=_fake_summarizer([]),
@@ -1439,9 +1439,9 @@ class TestSummaryOnContext:
         assert seen["history"] == []
 
     def test_no_summarizer_means_no_summary(self, tmp_path):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        memory = PersistentAgentMemory(
+        memory = AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t"
         )
         memory.healthcheck()
@@ -1452,9 +1452,9 @@ class TestSummaryOnContext:
 
 class TestRetention:
     def _store(self, tmp_path, **kw):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        return PersistentAgentMemory(
+        return AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t", **kw
         )
 
@@ -1501,9 +1501,9 @@ class TestRetention:
 
 class TestTranscriptEndpoint:
     def test_transcript_keeps_folded_turns_and_reports_the_cutoff(self, tmp_path):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        memory = PersistentAgentMemory(
+        memory = AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db",
             table_name="agent_memory_messages_t",
             summarize=_fake_summarizer([]),
@@ -1531,9 +1531,9 @@ class TestTranscriptEndpoint:
         assert body["summarized_through"] > 0
 
     def test_events_excluded_by_default(self, tmp_path):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        memory = PersistentAgentMemory(
+        memory = AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t"
         )
         app = AgentApp(memory=memory, tool_events=True)
@@ -1556,10 +1556,10 @@ class TestTranscriptEndpoint:
 
 class TestDurableState:
     def _store(self, tmp_path, **kw):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
         kw.setdefault("long_term", True)
-        return PersistentAgentMemory(
+        return AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t", **kw
         )
 
@@ -1644,9 +1644,9 @@ class TestDurableState:
 
 class TestMemoryTools:
     def _app(self, tmp_path):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        memory = PersistentAgentMemory(
+        memory = AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db",
             table_name="agent_memory_messages_t",
             long_term=True,
@@ -1756,9 +1756,9 @@ class TestMemoryTools:
 
 class TestSubjectIdentity:
     def _app(self, tmp_path):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        memory = PersistentAgentMemory(
+        memory = AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db",
             table_name="agent_memory_messages_t",
             long_term=True,
@@ -1802,9 +1802,9 @@ class TestSubjectIdentity:
 
 class TestStateAuditEndpoints:
     def _app(self, tmp_path):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        memory = PersistentAgentMemory(
+        memory = AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db",
             table_name="agent_memory_messages_t",
             long_term=True,
@@ -1913,12 +1913,12 @@ class TestVectorStoreContract:
 
 class TestSemanticSearch:
     def _store(self, tmp_path, **kw):
-        from hopsworks_agent_protocol import InMemoryVectorStore, PersistentAgentMemory
+        from hopsworks_agent_protocol import InMemoryVectorStore, AgentMemoryService
 
         kw.setdefault("long_term", True)
         kw.setdefault("embedder", _toy_embedder)
         kw.setdefault("vector_store", InMemoryVectorStore())
-        return PersistentAgentMemory(
+        return AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t", **kw
         )
 
@@ -2115,9 +2115,9 @@ class TestReviewRegressions:
     """
 
     def _store(self, tmp_path, **kw):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        return PersistentAgentMemory(
+        return AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db",
             table_name="agent_memory_messages_r",
             **kw,
@@ -2186,10 +2186,10 @@ class TestReviewRegressions:
     def test_replica_sees_turns_written_by_another_replica(self, tmp_path):
         url = f"sqlite:///{tmp_path}/m.db"
         kw = {"table_name": "agent_memory_messages_r", "summarize": lambda *a, **k: "s"}
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        one = PersistentAgentMemory(url=url, **kw)
-        two = PersistentAgentMemory(url=url, **kw)
+        one = AgentMemoryService(url=url, **kw)
+        two = AgentMemoryService(url=url, **kw)
 
         one.append("c1", "user", "first")
         assert one.get("c1") == [{"role": "user", "content": "first"}]  # caches
@@ -2254,9 +2254,9 @@ class TestRetrievalAndReconciliation:
     """Ranking and key-sprawl features taken from the SDK comparison."""
 
     def _store(self, tmp_path, **kw):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        return PersistentAgentMemory(
+        return AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db",
             table_name="agent_memory_messages_rr",
             long_term=True,
@@ -2414,13 +2414,13 @@ class TestDeploymentIsolation:
     """
 
     def _pair(self, tmp_path, **kw):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
         url = f"sqlite:///{tmp_path}/shared.db"
         common = dict(url=url, long_term=True, **kw)
         return (
-            PersistentAgentMemory(deployment_id="agent_a", **common),
-            PersistentAgentMemory(deployment_id="agent_b", **common),
+            AgentMemoryService(deployment_id="agent_a", **common),
+            AgentMemoryService(deployment_id="agent_b", **common),
         )
 
     def test_same_conversation_id_in_two_deployments_stays_apart(self, tmp_path):
@@ -2505,9 +2505,9 @@ class TestDeploymentIsolation:
 
 class TestSharedTableNames:
     def test_tables_are_the_feature_groups_own(self, tmp_path):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        memory = PersistentAgentMemory(
+        memory = AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db",
             deployment_id="d1",
             long_term=True,
@@ -2530,9 +2530,9 @@ class TestSharedTableNames:
         assert _feature_group_name("something_else") == "something_else"
 
     def test_explicit_table_name_suffixes_every_companion(self, tmp_path):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        memory = PersistentAgentMemory(
+        memory = AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db",
             table_name="agent_memory_messages_42",
             deployment_id="d1",
@@ -2591,9 +2591,9 @@ class TestFeatureGroupExport:
             )
 
     def _store(self, tmp_path, **kw):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        memory = PersistentAgentMemory(
+        memory = AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db",
             deployment_id="d1",
             long_term=True,
@@ -2689,9 +2689,9 @@ class TestConversationListing:
     """The server knows which conversations exist; a client need not remember."""
 
     def _store(self, tmp_path, **kw):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        memory = PersistentAgentMemory(
+        memory = AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db", deployment_id="d1", **kw
         )
         assert memory.healthcheck() is True
@@ -2706,11 +2706,11 @@ class TestConversationListing:
         assert listed[0]["message_count"] == 1
 
     def test_scoped_to_the_deployment(self, tmp_path):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
         url = f"sqlite:///{tmp_path}/m.db"
-        a = PersistentAgentMemory(url=url, deployment_id="a")
-        b = PersistentAgentMemory(url=url, deployment_id="b")
+        a = AgentMemoryService(url=url, deployment_id="a")
+        b = AgentMemoryService(url=url, deployment_id="b")
         a.append("mine", "user", "hello")
         b.append("theirs", "user", "hello")
         assert [c["conversation_id"] for c in a.list_conversations()] == ["mine"]
@@ -2730,9 +2730,9 @@ class TestConversationListing:
         assert memory.list_conversations() == []
 
     def test_endpoint_returns_the_list(self, tmp_path):
-        from hopsworks_agent_protocol import PersistentAgentMemory
+        from hopsworks_agent_protocol import AgentMemoryService
 
-        memory = PersistentAgentMemory(
+        memory = AgentMemoryService(
             url=f"sqlite:///{tmp_path}/m.db", deployment_id="d1"
         )
         memory.append("c1", "user", "hello")

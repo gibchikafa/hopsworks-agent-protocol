@@ -112,12 +112,12 @@ storage. One store, three tiers — each opt-in, all served by the same object:
 
 ```python
 from hopsworks_agent_protocol import (
-    AgentApp, PersistentAgentMemory, anthropic_summarizer,
+    AgentApp, AgentMemoryService, anthropic_summarizer,
 )
 
 agent_app = AgentApp(
     name="My agent",
-    memory=PersistentAgentMemory(          # zero-config in a deployment
+    memory=AgentMemoryService(          # zero-config in a deployment
         summarize=anthropic_summarizer(),  # tier 2
         long_term=True,                    # tier 3
     ),
@@ -181,7 +181,7 @@ change:
 from hopsworks_agent_protocol import sentence_transformer_embedder, vector_store_for
 
 embedder = sentence_transformer_embedder()          # [memory-search] extra
-PersistentAgentMemory(long_term=True, embedder=embedder,
+AgentMemoryService(long_term=True, embedder=embedder,
                       vector_store=vector_store_for(embedder))
 ```
 
@@ -190,7 +190,7 @@ PersistentAgentMemory(long_term=True, embedder=embedder,
 - `InMemoryChatMemory()` — zero-config for development. Lost on restart and
   per-replica; agent deployments can scale to zero, so not for production.
   Tiers 2 and 3 are no-ops on it.
-- `PersistentAgentMemory()` — inside a Hopsworks agent deployment this is
+- `AgentMemoryService()` — inside a Hopsworks agent deployment this is
   zero-config: the project MySQL URL is built from the platform-injected
   `MYSQL_*` env vars (password via the `MYSQL_PASSWORD_SECRET_NAME` secret)
   and table names are derived from `DEPLOYMENT_ID`. Outside a deployment pass

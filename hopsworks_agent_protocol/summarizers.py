@@ -1,4 +1,4 @@
-"""Ready-made summarizers for :class:`PersistentAgentMemory`.
+"""Ready-made summarizers for :class:`AgentMemoryService`.
 
 The SDK owns *when* to summarize (the trigger, the fold cutoff, the
 transaction); the model call itself is yours, so the SDK stays LLM-agnostic.
@@ -60,7 +60,7 @@ def anthropic_summarizer(
 ):
     """An async summarizer backed by the Claude API.
 
-        memory = PersistentAgentMemory(summarize=anthropic_summarizer())
+        memory = AgentMemoryService(summarize=anthropic_summarizer())
 
     Requires ``pip install anthropic``.
 
@@ -141,7 +141,7 @@ def sentence_transformer_embedder(
 ):
     """The shipped default embedder: a local sentence-transformers model.
 
-        memory = PersistentAgentMemory(embedder=sentence_transformer_embedder(), ...)
+        memory = AgentMemoryService(embedder=sentence_transformer_embedder(), ...)
 
     Requires ``pip install sentence-transformers``.
 
