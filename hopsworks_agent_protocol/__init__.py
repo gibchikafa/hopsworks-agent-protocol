@@ -3,7 +3,7 @@ from .context import HandlerContext
 from .memory import (
     ChatMemory,
     InMemoryChatMemory,
-    AgentMemoryService,
+    ManagedMemoryService,
     deployment_mysql_url,
 )
 from .summarizers import anthropic_summarizer, sentence_transformer_embedder
@@ -41,7 +41,7 @@ __all__ = [
     "ImageContent",
     "InMemoryChatMemory",
     "InMemoryVectorStore",
-    "AgentMemoryService",
+    "ManagedMemoryService",
     "TextContent",
     "VectorStore",
     "anthropic_summarizer",

@@ -11,7 +11,7 @@ Backends:
 - :class:`InMemoryChatMemory` — zero-config, for development. Conversations
   are lost on restart and not shared between replicas; note that Hopsworks
   agent deployments can scale to zero, so this is NOT for production.
-- :class:`AgentMemoryService` — any SQLAlchemy URL (e.g. the project's MySQL).
+- :class:`ManagedMemoryService` — any SQLAlchemy URL (e.g. the project's MySQL).
   Survives restarts and works across replicas.
 
 If your framework already persists conversation state (a LangGraph
@@ -188,7 +188,7 @@ def deployment_mysql_url() -> str:
         raise RuntimeError(
             f"MySQL env var {err.args[0]} is not set — not running in a "
             "Hopsworks agent deployment? Pass an explicit url= to "
-            "AgentMemoryService instead."
+            "ManagedMemoryService instead."
         ) from err
     port = os.environ.get("MYSQL_PORT", "3306")
 
@@ -328,7 +328,7 @@ def export_feature_groups(
     The entry point for a job or notebook: it needs nothing but a Hopsworks
     login, deriving the database URL from the project's own online storage
     connector when one is not passed. See
-    :meth:`AgentMemoryService.export_feature_groups`.
+    :meth:`ManagedMemoryService.export_feature_groups`.
 
         import hopsworks
         from hopsworks_agent_protocol.memory import export_feature_groups
@@ -347,7 +347,7 @@ def export_feature_groups(
             url = _url_from_connector(
                 feature_store.get_online_storage_connector()
             )
-    memory = AgentMemoryService(
+    memory = ManagedMemoryService(
         url=url,
         deployment_id="export",
         long_term=True,
@@ -634,13 +634,13 @@ class InMemoryChatMemory(ChatMemory):
             self._conversations.pop(conversation_id, None)
 
 
-class AgentMemoryService(ChatMemory):
+class ManagedMemoryService(ChatMemory):
     """SQLAlchemy-backed store (MySQL, Postgres, SQLite, ...).
 
     ``pip install 'hopsworks-agent-protocol[memory-sql]'``
 
     Inside a Hopsworks agent deployment both arguments are optional:
-    ``AgentMemoryService()`` connects to the project MySQL using the
+    ``ManagedMemoryService()`` connects to the project MySQL using the
     platform-injected env vars and derives a per-deployment table name from
     ``DEPLOYMENT_ID``.
 
@@ -690,7 +690,7 @@ class AgentMemoryService(ChatMemory):
             import sqlalchemy  # noqa: F401 — fail fast if the extra is missing
         except ImportError as err:
             raise ImportError(
-                "AgentMemoryService requires SQLAlchemy: "
+                "ManagedMemoryService requires SQLAlchemy: "
                 "pip install 'hopsworks-agent-protocol[memory-sql]'"
             ) from err
 
@@ -869,7 +869,7 @@ class AgentMemoryService(ChatMemory):
                         "attributed to this agent. Inside a Hopsworks agent "
                         "deployment this is injected for you; elsewhere pass an "
                         "explicit deployment_id= (or url=) to "
-                        "AgentMemoryService."
+                        "ManagedMemoryService."
                     )
                 log.warning(
                     "DEPLOYMENT_ID is not set; falling back to deployment_id "
@@ -1104,7 +1104,7 @@ class AgentMemoryService(ChatMemory):
                 self._sessions = sessions
                 self._state = state
                 log.info(
-                    "AgentMemoryService ready (table=%s, schema_version=%d)",
+                    "ManagedMemoryService ready (table=%s, schema_version=%d)",
                     table_name,
                     SCHEMA_VERSION,
                 )
@@ -1118,7 +1118,7 @@ class AgentMemoryService(ChatMemory):
                 self._init_failed_until = time.monotonic() + self._init_backoff
                 self._init_backoff = min(self._init_backoff * 2, 60.0)
                 log.exception(
-                    "AgentMemoryService could not connect to the database; "
+                    "ManagedMemoryService could not connect to the database; "
                     "retrying in %.0fs, running without persistent memory until "
                     "then",
                     self._init_backoff,
