@@ -1128,7 +1128,7 @@ class TestMemorySchemaGuards:
         monkeypatch.setenv("DEPLOYMENT_ID", "42")
         memory = PersistentAgentMemory(url=f"sqlite:///{tmp_path}/m.db")
         assert memory._resolve_deployment_id() == "42"
-        assert memory._resolve_table_name() == "agent_memory_messages"
+        assert memory._resolve_table_name() == "agent_memory_messages_1"
 
     def test_rejects_a_deployment_id_that_is_not_an_identifier(
         self, monkeypatch, tmp_path
@@ -2504,7 +2504,7 @@ class TestDeploymentIsolation:
 
 
 class TestSharedTableNames:
-    def test_default_tables_have_no_suffix(self, tmp_path):
+    def test_tables_are_the_feature_groups_own(self, tmp_path):
         from hopsworks_agent_protocol import PersistentAgentMemory
 
         memory = PersistentAgentMemory(
@@ -2514,11 +2514,20 @@ class TestSharedTableNames:
             summarize=lambda prev, turns: "s",
         )
         assert memory.healthcheck() is True
-        # not agent_memory_meta_agent_memory_items
-        assert memory._table.name == "agent_memory_messages"
-        assert memory._meta.name == "agent_memory_schema"
-        assert memory._sessions.name == "agent_memory_conversations"
-        assert memory._state.name == "agent_memory_facts"
+        # Hopsworks names an online feature group's table <name>_<version>, and
+        # the agent writes into that table, so there is one copy of the data
+        assert memory._table.name == "agent_memory_messages_1"
+        assert memory._sessions.name == "agent_memory_conversations_1"
+        assert memory._state.name == "agent_memory_facts_1"
+        assert memory._meta.name == "agent_memory_schema_1"
+
+    def test_feature_group_name_drops_the_version_suffix(self):
+        from hopsworks_agent_protocol.memory import _feature_group_name
+
+        assert _feature_group_name("agent_memory_messages_1") == "agent_memory_messages"
+        assert _feature_group_name("agent_memory_facts_2") == "agent_memory_facts"
+        # a table with no version suffix is not a feature group's
+        assert _feature_group_name("something_else") == "something_else"
 
     def test_explicit_table_name_suffixes_every_companion(self, tmp_path):
         from hopsworks_agent_protocol import PersistentAgentMemory
@@ -2534,21 +2543,16 @@ class TestSharedTableNames:
         assert memory._meta.name == "agent_memory_schema_42"
         assert memory._sessions.name == "agent_memory_conversations_42"
         assert memory._state.name == "agent_memory_facts_42"
-
-
-
-
 class TestFeatureGroupExport:
-    """Copying memory rows into feature groups.
+    """Filling the offline half of the feature groups.
 
-    The database stays the system of record; this is the path that makes the
-    rows analysable without the serving path giving up ordered reads, predicate
-    updates or deletes.
+    The agent writes into the feature groups' own online tables, so an export
+    is not a copy between stores — it is materialising what is already online
+    into Delta, where it can be queried over time.
     """
 
     @pytest.fixture(autouse=True)
     def fake_hsfs(self, monkeypatch):
-        """hsfs is not a test dependency; the export only needs Feature."""
         import sys
         import types
 
@@ -2567,21 +2571,24 @@ class TestFeatureGroupExport:
         return Feature
 
     class FakeFG:
-        def __init__(self, **kw):
-            self.kw = kw
+        def __init__(self, name):
+            self.name = name
             self.inserts = []
 
         def insert(self, frame, **kwargs):
             self.inserts.append((frame, kwargs))
 
     class FakeStore:
-        def __init__(self):
+        def __init__(self, missing=()):
+            self.missing = set(missing)
             self.groups = {}
 
-        def get_or_create_feature_group(self, **kw):
-            key = (kw["name"], kw["version"])
-            self.groups.setdefault(key, TestFeatureGroupExport.FakeFG(**kw))
-            return self.groups[key]
+        def get_feature_group(self, name, version):
+            if name in self.missing:
+                return None
+            return self.groups.setdefault(
+                (name, version), TestFeatureGroupExport.FakeFG(name)
+            )
 
     def _store(self, tmp_path, **kw):
         from hopsworks_agent_protocol import PersistentAgentMemory
@@ -2596,22 +2603,34 @@ class TestFeatureGroupExport:
         assert memory.healthcheck() is True
         return memory
 
-    def test_exports_rows_with_append_and_online_by_default(self, tmp_path):
+    def test_exports_to_offline_by_default(self, tmp_path):
         memory = self._store(tmp_path)
         memory.append("c1", "user", "hello")
-        memory.set_state("user", "alice", "tone", "formal")
         fs = self.FakeStore()
 
-        counts = memory.export_feature_groups(fs)
+        counts = memory.export_feature_groups(fs, include=("items",))
 
-        assert counts["agent_memory_messages"] == 1
-        assert counts["agent_memory_facts"] == 1
-        for fg in fs.groups.values():
-            for frame, kwargs in fg.inserts:
-                assert kwargs["write_options"] == {"mode": "append"}
-                # offline is a Delta write: worth a schedule, not every batch
-                assert kwargs["storage"] == "online"
-        assert all(fg.kw["online_enabled"] is True for fg in fs.groups.values())
+        assert counts["agent_memory_messages_1"] == 1
+        _, kwargs = fs.groups[("agent_memory_messages", 1)].inserts[0]
+        # online is already live — the agent wrote it. Offline is what is missing.
+        assert kwargs["storage"] == "offline"
+        assert kwargs["write_options"] == {"mode": "append"}
+
+    def test_looks_up_the_feature_group_by_its_own_name(self, tmp_path):
+        memory = self._store(tmp_path)
+        memory.append("c1", "user", "hello")
+        fs = self.FakeStore()
+        memory.export_feature_groups(fs, include=("items",))
+        # the table is agent_memory_messages_1; the feature group is version 1
+        # of agent_memory_messages
+        assert ("agent_memory_messages", 1) in fs.groups
+
+    def test_missing_feature_group_is_refused(self, tmp_path):
+        memory = self._store(tmp_path)
+        memory.append("c1", "user", "hello")
+        fs = self.FakeStore(missing={"agent_memory_messages"})
+        with pytest.raises(RuntimeError, match="provisioned by Hopsworks"):
+            memory.export_feature_groups(fs, include=("items",))
 
     def test_both_omits_the_storage_argument(self, tmp_path):
         memory = self._store(tmp_path)
@@ -2619,16 +2638,7 @@ class TestFeatureGroupExport:
         fs = self.FakeStore()
         memory.export_feature_groups(fs, storage="both", include=("items",))
         _, kwargs = fs.groups[("agent_memory_messages", 1)].inserts[0]
-        # hsfs writes both stores when the argument is absent
         assert "storage" not in kwargs
-
-    def test_offline_backfill(self, tmp_path):
-        memory = self._store(tmp_path)
-        memory.append("c1", "user", "hello")
-        fs = self.FakeStore()
-        memory.export_feature_groups(fs, storage="offline", include=("items",))
-        _, kwargs = fs.groups[("agent_memory_messages", 1)].inserts[0]
-        assert kwargs["storage"] == "offline"
 
     def test_unknown_storage_is_refused(self, tmp_path):
         memory = self._store(tmp_path)
@@ -2640,29 +2650,11 @@ class TestFeatureGroupExport:
         memory.append("c1", "user", "first")
         memory.append("c1", "user", "second")
         fs = self.FakeStore()
-
-        counts = memory.export_feature_groups(fs, include=("items",))
-        assert counts["agent_memory_messages"] == 2
-
+        assert memory.export_feature_groups(
+            fs, include=("items",))["agent_memory_messages_1"] == 2
         fs2 = self.FakeStore()
-        counts = memory.export_feature_groups(fs2, include=("items",), since=1)
-        assert counts["agent_memory_messages"] == 1
-
-    def test_keys_include_the_deployment(self, tmp_path):
-        memory = self._store(tmp_path)
-        memory.append("c1", "user", "hello")
-        memory.set_state("user", "alice", "tone", "formal")
-        fs = self.FakeStore()
-        memory.export_feature_groups(fs)
-
-        keys = {name: fg.kw["primary_key"] for (name, _), fg in fs.groups.items()}
-        # one feature group holds every deployment's rows, so the deployment
-        # has to be part of what makes a row unique
-        assert keys["agent_memory_messages"] == ["deployment_id", "id"]
-        assert keys["agent_memory_conversations"] == [
-            "deployment_id",
-            "conversation_id",
-        ]
+        assert memory.export_feature_groups(
+            fs2, include=("items",), since=1)["agent_memory_messages_1"] == 1
 
     def test_batches_large_exports(self, tmp_path):
         memory = self._store(tmp_path)
@@ -2673,29 +2665,21 @@ class TestFeatureGroupExport:
         inserts = fs.groups[("agent_memory_messages", 1)].inserts
         assert [len(frame) for frame, _ in inserts] == [2, 2, 1]
 
-    def test_nothing_to_export_is_not_a_feature_group(self, tmp_path):
+    def test_nothing_to_export_touches_no_feature_group(self, tmp_path):
         memory = self._store(tmp_path)
         fs = self.FakeStore()
         counts = memory.export_feature_groups(fs, include=("items",))
-        # an empty table should not leave an empty feature group behind
-        assert counts["agent_memory_messages"] == 0
+        assert counts["agent_memory_messages_1"] == 0
         assert fs.groups == {}
 
-    def test_content_is_not_truncated_to_varchar_100(self, tmp_path):
-        memory = self._store(tmp_path)
-        features = {
-            f.name: f.online_type for f in memory._features_for(memory._table)
-        }
-        # inferred strings land as varchar(100) online, which would silently
-        # cut message content; TEXT columns must stay TEXT
-        assert features["content"] == "text"
-        assert features["conversation_id"] == "varchar(255)"
-        assert features["status"] == "varchar(16)"
+    def test_all_null_column_is_typed_before_insert(self, tmp_path):
+        import pandas as pd
 
-    def test_integers_are_bigint(self, tmp_path):
         memory = self._store(tmp_path)
-        features = {f.name: f.type for f in memory._features_for(memory._table)}
-        # a pandas frame carries integers as int64; declaring 'int' fails
-        # schema verification before a row is written
-        assert features["id"] == "bigint"
-        assert features["seq"] == "bigint"
+        frame = pd.DataFrame([{"a": None, "b": "x", "t": pd.NaT}])
+        prepared = memory._prepare_for_insert(frame)
+        # an all-null string column would reach Arrow untyped and be dropped by
+        # the online writer, silently
+        assert prepared["a"].tolist() == [""]
+        # an all-NaT datetime keeps its dtype: that is the type information
+        assert pd.api.types.is_datetime64_any_dtype(prepared["t"])

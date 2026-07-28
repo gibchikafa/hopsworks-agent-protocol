@@ -95,28 +95,51 @@ SCHEMA_VERSION = 1
 
 _TABLE_SUFFIX_RE = re.compile(r"^[A-Za-z0-9_]{1,48}$")
 
+#: Feature group version these tables belong to. Hopsworks names an online
+#: feature group's table ``<name>_<version>``, and the agent writes into that
+#: table directly — so the rows are in the feature store as they are written,
+#: with no copy and no export step.
+FEATURE_GROUP_VERSION = 1
+
 #: Table names, each saying what it holds rather than what layer wrote it.
 #:
 #: ``messages``      every user message, agent reply and tool event
 #: ``conversations`` one row per conversation: its summary and fold bookkeeping
 #: ``facts``         durable scoped state — what the agent knows about someone
 #: ``schema``        the schema version, so an upgraded SDK knows what it found
-ITEMS_TABLE = "agent_memory_messages"
-CONVERSATIONS_TABLE = "agent_memory_conversations"
-FACTS_TABLE = "agent_memory_facts"
-SCHEMA_TABLE = "agent_memory_schema"
+#: Feature group names. The table each one lives in carries the version.
+MESSAGES_FG = "agent_memory_messages"
+CONVERSATIONS_FG = "agent_memory_conversations"
+FACTS_FG = "agent_memory_facts"
+SCHEMA_FG = "agent_memory_schema"
+
+ITEMS_TABLE = f"{MESSAGES_FG}_{FEATURE_GROUP_VERSION}"
+CONVERSATIONS_TABLE = CONVERSATIONS_FG
+FACTS_TABLE = FACTS_FG
+SCHEMA_TABLE = SCHEMA_FG
+
+
+def _feature_group_name(table_name: str) -> str:
+    """The feature group whose online table this is.
+
+    Hopsworks names an online feature group's table ``<name>_<version>``, and
+    the agent writes into that table, so the mapping back is dropping the
+    version suffix. A table that does not carry one is not a feature group's.
+    """
+    stem, _, version = table_name.rpartition("_")
+    if stem and version.isdigit():
+        return stem
+    return table_name
 
 
 def _table_suffix(table_name: str) -> str:
     """What to append to the companion table names, or "" for the default.
 
-    ``agent_memory_messages`` -> ``""``      (agent_memory_facts)
+    ``agent_memory_messages_1`` -> ``"1"``   (agent_memory_facts_1)
     ``agent_memory_messages_42`` -> ``"42"`` (agent_memory_facts_42)
     ``something_else`` -> ``"something_else"``
     """
-    if table_name == ITEMS_TABLE:
-        return ""
-    prefix = f"{ITEMS_TABLE}_"
+    prefix = f"{MESSAGES_FG}_"
     if table_name.startswith(prefix):
         return table_name[len(prefix):]
     return table_name
@@ -725,729 +748,90 @@ class PersistentAgentMemory(ChatMemory):
         """
         return stmt.where(table.c.deployment_id == self._deployment)
 
-    def _resolve_deployment_id(self) -> str:
-        """Which agent's rows these are.
+    def _adopt_feature_group_tables(self, engine, tables) -> bool:
+        """Make the feature store's tables usable as the agent's live store.
 
-        Every deployment in a project shares one set of tables, so this value is
-        what keeps them apart — it is not a label, it is the first column of
-        every key and every WHERE clause in this module.
+        Hopsworks creates an online feature group's table for us, which is why
+        the agent can write straight into it — but it creates it for a feature
+        store's access pattern, not ours. Two things are missing and both are
+        load-bearing:
 
-        A deployment must therefore have a real one. The old ``'default'``
-        fallback was survivable when it only meant "share a table name"; now it
-        would mean two agents reading each other's conversations, so it is
-        allowed only for a caller who passed their own ``url`` (tests, local
-        development) and cannot be reached inside a deployment.
+        * ``id`` has no ``AUTO_INCREMENT``. It is not decoration: it orders
+          history and is the fold cursor. Without it every insert fails, so a
+          store that cannot add it reports itself unusable rather than failing
+          on the first turn.
+        * There are no secondary indexes, and the primary key is ``USING HASH``,
+          which cannot serve ``id > ?`` or ``ORDER BY id`` at all. Reading one
+          conversation's history would scan every agent's rows in the project.
+
+        Both are added here, idempotently, at readiness. Note the consequence
+        of living in someone else's table: a feature group that is deleted and
+        recreated comes back without them, and the symptom is slowness rather
+        than an error, so this runs on every connect rather than once.
+
+        Returns False when the table is unusable, which degrades the store to
+        stateless instead of breaking turns.
         """
-        if self._deployment_id is not None:
-            value = self._deployment_id
-        else:
-            value = os.environ.get("DEPLOYMENT_ID")
-            if value is None:
-                if self._url is None:
-                    raise RuntimeError(
-                        "DEPLOYMENT_ID is not set, so memory rows cannot be "
-                        "attributed to this agent. Inside a Hopsworks agent "
-                        "deployment this is injected for you; elsewhere pass an "
-                        "explicit deployment_id= (or url=) to "
-                        "PersistentAgentMemory."
-                    )
-                log.warning(
-                    "DEPLOYMENT_ID is not set; falling back to deployment_id "
-                    "'default'. Pass deployment_id= to keep agents apart."
-                )
-                value = "default"
-        if not _TABLE_SUFFIX_RE.match(str(value)):
-            raise RuntimeError(
-                f"Invalid deployment_id {value!r}: must match "
-                "[A-Za-z0-9_]{1,48}."
-            )
-        return str(value)
+        from sqlalchemy import text
 
-    def _resolve_table_name(self) -> str:
-        """The shared items table, validated.
+        if engine.dialect.name != "mysql":
+            return True  # SQLite (tests, local dev) creates our own schema
 
-        Shared across the project rather than one table per deployment. Four
-        tables per agent meant a project with a hundred agents carried four
-        hundred tables, and every cold start ran DDL to make its own — which is
-        also where the replicas raced each other. One set of tables is created
-        once and found thereafter.
-
-        An explicit ``table_name`` still wins, for tests and for anyone who
-        wants a deployment kept physically apart.
-        """
-        name = self._table_name or ITEMS_TABLE
-        # one definition of how a name splits, shared with the companions
-        suffix = _table_suffix(name)
-        if suffix and not _TABLE_SUFFIX_RE.match(suffix):
-            raise RuntimeError(
-                f"Invalid memory table name {name!r}: the suffix must "
-                "match [A-Za-z0-9_]{1,48}."
-            )
-        return name
-
-    def _ensure_engine(self) -> bool:
-        """Create the engine + tables. Returns True when the store is usable,
-        False when the database is unreachable (already logged).
-
-        Called by ``healthcheck()``, which the ``/ready`` probe drives — so in a
-        deployment the DDL runs *before* the pod reports ready and the request
-        path only ever finds existing tables. The lazy path stays for direct use
-        (tests, local SQLite) where there is no readiness probe.
-        """
-        if self._engine is not None:
-            return True
-        if time.monotonic() < self._init_failed_until:
-            return False
-        with self._lock:
-            if self._engine is not None:
-                return True
-            if time.monotonic() < self._init_failed_until:
-                return False
+        ok = True
+        for table in tables:
+            if table is None:
+                continue
             try:
-                from sqlalchemy import (
-                    Column,
-                    DateTime,
-                    Index,
-                    Integer,
-                    MetaData,
-                    SmallInteger,
-                    String,
-                    Table,
-                    Text,
-                    UniqueConstraint,
-                    create_engine,
-                )
-
-                url = self._url or deployment_mysql_url()
-                deployment = self._resolve_deployment_id()
-                table_name = self._resolve_table_name()
-                # "" for the shared default, so the companion tables keep
-                # their plain names. Only an explicit table_name= produces a
-                # suffix, and then every table carries it.
-                suffix = _table_suffix(table_name)
-                # index and constraint names still have to be unique and
-                # non-empty, so they get a stem even when the tables do not
-                stem = suffix or "shared"
-                engine = create_engine(url, pool_pre_ping=True)
-                metadata = MetaData()
-                table = Table(
-                    table_name,
-                    metadata,
-                    Column("id", Integer, primary_key=True, autoincrement=True),
-                    # Which deployment's memory this row is. One table now holds
-                    # every agent in the project, so this is not descriptive: it
-                    # is the first column of every index and every WHERE clause,
-                    # and omitting it anywhere is a cross-deployment data leak.
-                    Column("deployment_id", String(64), nullable=False),
-                    Column("conversation_id", String(255), nullable=False),
-                    Column("turn_id", String(64), nullable=False),
-                    # the protocol message id, so anything written during the
-                    # turn can reference the message that caused it
-                    Column("message_id", String(64), nullable=True),
-                    Column("seq", SmallInteger, nullable=False, default=0),
-                    Column("status", String(16), nullable=False),
-                    Column("subject", String(255), nullable=True),
-                    Column("memory_type", String(16), nullable=False),
-                    Column("role", String(16), nullable=False),
-                    Column("content", Text, nullable=False),
-                    Column("created_at", DateTime, nullable=False),
-                    Column("expires_at", DateTime, nullable=True),
-                    # deployment_id leads all of these. A conversation id is
-                    # unique in practice, but an index that does not start with
-                    # the deployment turns every lookup into a scan of every
-                    # other agent's rows in the same table.
-                    Index(
-                        f"idx_{stem}_conv", "deployment_id", "conversation_id", "id"
-                    ),
-                    Index(
-                        f"idx_{stem}_turn",
-                        "deployment_id",
-                        "conversation_id",
-                        "turn_id",
-                    ),
-                    # drives the "oldest open turn" lookup on the fold path
-                    Index(
-                        f"idx_{stem}_open",
-                        "deployment_id",
-                        "conversation_id",
-                        "status",
-                        "id",
-                    ),
-                    Index(f"idx_{stem}_msg", "deployment_id", "message_id"),
-                )
-                meta = Table(
-                    _companion(SCHEMA_TABLE, suffix),
-                    metadata,
-                    Column("table_name", String(64), primary_key=True),
-                    Column("schema_version", Integer, nullable=False),
-                    Column("updated_at", DateTime, nullable=False),
-                )
-                sessions = None
-                if self._summarize is not None:
-                    # tier 2 only: no summarizer, no bookkeeping to keep
-                    sessions = Table(
-                        _companion(CONVERSATIONS_TABLE, suffix),
-                        metadata,
-                        # composite PK: two deployments may legitimately use
-                        # the same conversation id, and before consolidation
-                        # they were kept apart by living in different tables
-                        Column("deployment_id", String(64), primary_key=True),
-                        Column("conversation_id", String(255), primary_key=True),
-                        Column("subject", String(255), nullable=True),
-                        Column("summary", Text, nullable=True),
-                        # fold cutoff. Meaningful only together with the
-                        # conversation: item ids are a table-wide sequence.
-                        Column(
-                            "last_summarized_item_id",
-                            Integer,
-                            nullable=False,
-                            default=0,
+                with engine.connect() as conn:
+                    existing = {
+                        row[2]
+                        for row in conn.execute(text(f"SHOW INDEX FROM `{table.name}`"))
+                    }
+                    auto = conn.execute(
+                        text(
+                            "SELECT extra FROM information_schema.columns "
+                            "WHERE table_schema = DATABASE() AND table_name = :t "
+                            "AND column_name = 'id'"
                         ),
-                        # messages folded so far — the fold threshold is
-                        # measured in messages, not row ids
-                        Column(
-                            "last_summarized_count", Integer, nullable=False, default=0
-                        ),
-                        # optimistic lock: the summarizer runs outside the
-                        # transaction, so this is what makes the fold safe
-                        Column("summary_version", Integer, nullable=False, default=0),
-                        Column("message_count", Integer, nullable=False, default=0),
-                        Column("created_at", DateTime, nullable=False),
-                        Column("last_active_at", DateTime, nullable=False),
-                    )
-                state = None
-                if self._long_term:
-                    # tier 3 only
-                    state = Table(
-                        _companion(FACTS_TABLE, suffix),
-                        metadata,
-                        Column("id", Integer, primary_key=True, autoincrement=True),
-                        Column("deployment_id", String(64), nullable=False),
-                        Column("scope", String(8), nullable=False),
-                        # subject (user), '' (app), or conversation id (session)
-                        Column("owner", String(255), nullable=False),
-                        # not `key`: reserved word in MySQL 8
-                        Column("state_key", String(255), nullable=False),
-                        Column("value", Text, nullable=False),
-                        # {conversation_id, turn_id, message_id} — resolves to
-                        # the turn that produced this value
-                        Column("source_ref", Text, nullable=True),
-                        # agent | operator. The audit surface shows this: a user
-                        # looking at their own memories needs to know which of
-                        # them their own conversation put there.
-                        Column("written_by", String(16), nullable=False),
-                        Column("updated_at", DateTime, nullable=False),
-                        # agent-written state decays; operator-written does not
-                        Column("expires_at", DateTime, nullable=True),
-                        # `app` scope is owner='' and agent-wide — with a
-                        # shared table that would collapse every deployment's
-                        # app state onto one row without deployment_id here
-                        UniqueConstraint(
-                            "deployment_id",
-                            "scope",
-                            "owner",
-                            "state_key",
-                            name=f"uq_{stem}_state",
-                        ),
-                        Index(
-                            f"idx_{stem}_state_owner",
-                            "deployment_id",
-                            "scope",
-                            "owner",
-                        ),
-                    )
-                # checkfirst=True is create-if-not-exists, but two replicas
-                # starting together can still both pass the check and both
-                # issue CREATE. With one table per deployment that was a rare
-                # cold-start race; with shared tables, finding them already
-                # created by *another deployment* is the ordinary case, so a
-                # duplicate-object error here means someone else succeeded and
-                # is not a failure.
-                if self._create_tables:
-                    try:
-                        metadata.create_all(engine, checkfirst=True)
-                    except Exception as err:  # noqa: BLE001
-                        if not _already_exists(err):
-                            raise
-                        log.debug("Memory tables already created concurrently")
-                    if not self._check_schema_version(engine, meta, table_name):
-                        return False
-                self._engine = engine
-                self._deployment = deployment
-                self._table = table
-                self._meta = meta
-                self._sessions = sessions
-                self._state = state
-                log.info(
-                    "PersistentAgentMemory ready (table=%s, schema_version=%d)",
-                    table_name,
-                    SCHEMA_VERSION,
-                )
-                return True
-            except Exception:  # noqa: BLE001 — degrade to stateless, never crash
-                # Retryable, not sticky. This used to latch permanently, so a
-                # database blip during the first touch left the replica
-                # answering /ready with 503 forever while /health stayed ok —
-                # so Kubernetes never restarted it. A zombie replica is worse
-                # than a slow one.
-                self._init_failed_until = time.monotonic() + self._init_backoff
-                self._init_backoff = min(self._init_backoff * 2, 60.0)
-                log.exception(
-                    "PersistentAgentMemory could not connect to the database; "
-                    "retrying in %.0fs, running without persistent memory until "
-                    "then",
-                    self._init_backoff,
-                )
-                return False
-
-    def _check_schema_version(self, engine, meta, table_name: str) -> bool:
-        """Record our schema version, or refuse to run against a newer one.
-
-        ``create_all`` is create-if-not-exists: against a table an older SDK
-        already created it does nothing at all, so a column added in a later
-        version would be missing and only surface as a query error much later.
-        Recording the version makes that case explicit. Migrating *forward* is a
-        no-op today (v1 is the first shape); the branch that matters now is
-        refusing to write through an older SDK to a newer table, where guessing
-        would corrupt data.
-        """
-        with engine.begin() as conn:
-            row = conn.execute(
-                meta.select().where(meta.c.table_name == table_name)
-            ).fetchone()
-            if row is None:
-                conn.execute(
-                    meta.insert().values(
-                        table_name=table_name,
-                        schema_version=SCHEMA_VERSION,
-                        updated_at=_utcnow(),
-                    )
-                )
-                return True
-            if row.schema_version > SCHEMA_VERSION:
-                log.error(
-                    "Memory table %s is at schema version %d but this SDK "
-                    "understands %d. Refusing to use it — upgrade "
-                    "hopsworks-agent-protocol. The agent will run without "
-                    "persistent memory.",
-                    table_name,
-                    row.schema_version,
-                    SCHEMA_VERSION,
-                )
-                return False
-            if row.schema_version < SCHEMA_VERSION:
-                # no forward migrations exist yet; when one does, apply the
-                # ordered ALTERs for (row.schema_version, SCHEMA_VERSION] here
-                conn.execute(
-                    meta.update()
-                    .where(meta.c.table_name == table_name)
-                    .values(schema_version=SCHEMA_VERSION, updated_at=_utcnow())
-                )
-            return True
-
-    def _fold_state(self, conversation_id: str) -> tuple[int, int, int | None]:
-        """``(summary_version, last_summarized_item_id, message_count)``.
-
-        ``message_count`` is ``None`` when there is no session row to read —
-        without a summarizer nothing folds, so paying for that read every turn
-        would buy nothing. It is not ``0``: callers have to tell "this
-        conversation holds no messages" apart from "there is no row to ask",
-        because the second means the cache cannot be validated at all.
-        """
-        if self._summarize is None or self._sessions is None:
-            return (0, 0, None)
-        s = self._sessions
-        try:
-            with self._engine.connect() as conn:
-                row = conn.execute(
-                    self._mine(
-                        s.select().where(s.c.conversation_id == conversation_id), s
-                    )
-                ).fetchone()
-        except Exception:  # noqa: BLE001
-            log.exception("Session read failed; treating conversation as unfolded")
-            return (0, 0, None)
-        if row is None:
-            return (0, 0, 0)
-        return (row.summary_version, row.last_summarized_item_id, row.message_count)
-
-    def get(self, conversation_id: str) -> list[Turn]:
-        if not self._ensure_engine():
-            return []
-        version, cutoff, count = self._fold_state(conversation_id)
-        # Cache identity is (fold version, message count). The version alone
-        # only moves on a fold, so between folds — and always without a
-        # summarizer, where it is pinned at 0 — a replica that cached this
-        # conversation never saw turns written by another replica, and the model
-        # silently lost them under round-robin routing. The count comes from the
-        # session row already read above, so this costs nothing extra.
-        key = (version, count)
-        if count is not None:
-            with self._lock:
-                cached = self._cache.get(conversation_id)
-                if cached is not None and cached[0] == key:
-                    return list(cached[1])
-        t = self._table
-        try:
-            with self._engine.connect() as conn:
-                rows = conn.execute(
-                    self._mine(t.select(), t)
-                    .where(t.c.conversation_id == conversation_id)
-                    # closed turns only: an open turn has no reply yet, and an
-                    # abandoned one is a question we failed to answer — neither
-                    # belongs in what the model reads back
-                    .where(t.c.status == TURN_CLOSED)
-                    .where(t.c.memory_type == ITEM_MESSAGE)
-                    # everything at or below the cutoff is represented by the
-                    # summary. Without this the model would get the summary
-                    # *and* the turns it was built from: more tokens than
-                    # before, and the same content twice.
-                    .where(t.c.id > cutoff)
-                    .order_by(t.c.id.desc())
-                    .limit(self._max)
-                ).fetchall()
-        except Exception:  # noqa: BLE001
-            log.exception("Memory read failed; returning empty history")
-            return []
-        turns = [{"role": r.role, "content": r.content} for r in reversed(rows)]
-        if count is not None:
-            with self._lock:
-                self._cache[conversation_id] = (key, list(turns))
-        return turns
-
-    def clear(self, conversation_id: str) -> None:
-        """Drop a conversation: its messages **and** its session row.
-
-        The session row has to go too. It holds the rolling summary — a
-        distillation of the very messages being deleted — so deleting only the
-        items leaves the content readable through ``get_summary`` and
-        ``system_context()``. It also holds ``message_count`` and the fold
-        cursor, so a reused conversation id would otherwise fold immediately and
-        blend the deleted conversation into the new one's summary.
-
-        Both statements share a transaction: a half-cleared conversation whose
-        summary outlived its messages is the exact state this exists to prevent.
-        """
-        if self._ensure_engine():
-            try:
-                with self._engine.begin() as conn:
-                    conn.execute(
-                        self._mine(
-                            self._table.delete().where(
-                                self._table.c.conversation_id == conversation_id
-                            ),
-                            self._table,
-                        )
-                    )
-                    if self._sessions is not None:
+                        {"t": table.name},
+                    ).fetchone()
+                with engine.begin() as conn:
+                    for index in table.indexes:
+                        if index.name in existing:
+                            continue
+                        columns = ", ".join(f"`{c.name}`" for c in index.columns)
+                        unique = "UNIQUE " if index.unique else ""
                         conn.execute(
-                            self._mine(
-                                self._sessions.delete().where(
-                                    self._sessions.c.conversation_id
-                                    == conversation_id
-                                ),
-                                self._sessions,
+                            text(
+                                f"ALTER TABLE `{table.name}` ADD {unique}INDEX "
+                                f"`{index.name}` ({columns})"
                             )
                         )
+                        log.info("Added index %s on %s", index.name, table.name)
+                    if auto is not None and "auto_increment" not in (auto[0] or ""):
+                        # MySQL requires the auto column to lead some index, and
+                        # the feature group's primary key starts with
+                        # deployment_id — so give `id` an index of its own first
+                        seed = f"idx_{table.name}_id"
+                        if seed not in existing:
+                            conn.execute(
+                                text(f"ALTER TABLE `{table.name}` ADD INDEX `{seed}` (`id`)")
+                            )
+                        conn.execute(
+                            text(
+                                f"ALTER TABLE `{table.name}` "
+                                "MODIFY `id` BIGINT NOT NULL AUTO_INCREMENT"
+                            )
+                        )
+                        log.info("Enabled AUTO_INCREMENT on %s.id", table.name)
             except Exception:  # noqa: BLE001
-                log.exception("Memory clear failed")
-        with self._lock:
-            self._cache.pop(conversation_id, None)
-
-    def healthcheck(self) -> bool:
-        """Whether the store is currently usable. Used by the readiness probe;
-        default assumes always ready."""
-        return True
-
-    def maybe_reap(self) -> None:
-        """Sweep turns that were never closed. No-op for stores whose open
-        turns cannot outlive the process."""
-
-    def transcript(
-        self, conversation_id: str, *, include_events: bool = False
-    ) -> list[dict]:
-        """The human-facing record of a conversation.
-
-        Deliberately not the same thing as :meth:`get`. ``get`` returns what the
-        model reads — bounded, and shrinking as turns are folded into the
-        summary. This returns the whole conversation, including turns that have
-        been folded away, because it is what a person reads in the panel and
-        what an operator reads during an incident.
-        """
-        return [dict(turn, memory_type=ITEM_MESSAGE) for turn in self.get(conversation_id)]
-
-    def summarized_through(self, conversation_id: str) -> int:
-        """Highest item id represented by the summary rather than by
-        :meth:`get`. ``0`` when nothing has been folded — lets a UI draw the
-        line between "the agent still sees this" and "this is only in the
-        summary now"."""
-        return 0
-
-    # ── summarization (tier 2) ───────────────────────────────────────────
-
-    def get_summary(self, conversation_id: str) -> str | None:
-        """The rolling summary of folded-away turns, or None."""
-        return None
-
-    async def maybe_summarize(self, conversation_id: str) -> bool:
-        """Fold old turns into the summary if enough have accumulated.
-
-        Called after the response has been sent, so its cost lands on request
-        duration every Nth turn rather than on time-to-answer. Returns whether
-        a fold happened.
-        """
-        return False
-
-    # ── scoped durable state (tier 3) ────────────────────────────────────
-
-    def set_state(
-        self,
-        scope: str,
-        owner: str,
-        key: str,
-        value: str,
-        *,
-        source_ref: str | None = None,
-        written_by: str = WRITTEN_BY_AGENT,
-    ) -> None:
-        """Upsert one scoped durable value."""
-
-    def get_state(self, scope: str, owner: str, key: str) -> str | None:
-        return None
-
-    def list_state(
-        self,
-        scope: str,
-        owner: str,
-        *,
-        key: str | None = None,
-        limit: int | None = None,
-    ) -> list[dict]:
-        return []
-
-    def delete_state(self, scope: str, owner: str, key: str | None = None) -> int:
-        return 0
-
-    def state_block(self, subject: str, conversation_id: str) -> str:
-        """Scoped state rendered for ``ctx.system_context()``."""
-        return ""
-
-    # ── semantic search (tier 3) ─────────────────────────────────────────
-
-    def search(
-        self,
-        query: str,
-        *,
-        subject: str | None = None,
-        conversation_id: str | None = None,
-        k: int = 5,
-    ) -> list[dict]:
-        """Older messages relevant to ``query``, most relevant first."""
-        return []
-
-    async def ingest_turn(self, conversation_id: str, turn_id: str) -> int:
-        """Embed a completed turn into the vector store. Returns rows sent."""
-        return 0
-
-    def purge_vectors(
-        self, *, conversation_id: str | None = None, subject: str | None = None
-    ) -> int:
-        return 0
-
-
-class InMemoryChatMemory(ChatMemory):
-    """Process-local store for development: lost on restart (agent
-    deployments can scale to zero) and not shared between replicas."""
-
-    def __init__(self, max_messages: int = 50):
-        self._max = max_messages
-        self._conversations: dict[str, list[Turn]] = {}
-        # open turns buffer their messages here; they land in the conversation
-        # on close and are dropped on abandon, so history never shows a
-        # question whose answer never arrived
-        self._open: dict[str, list[Turn]] = {}
-        self._lock = threading.Lock()
-
-    def get(self, conversation_id: str) -> list[Turn]:
-        with self._lock:
-            return list(self._conversations.get(conversation_id, []))
-
-    def begin_turn(
-        self,
-        conversation_id: str,
-        turn_id: str,
-        role: str,
-        content: str,
-        *,
-        message_id: str | None = None,
-        subject: str | None = None,
-    ) -> None:
-        with self._lock:
-            self._open[turn_id] = [{"role": role, "content": content}]
-
-    def record_item(
-        self,
-        conversation_id: str,
-        turn_id: str,
-        role: str,
-        content: str,
-        *,
-        memory_type: str = ITEM_MESSAGE,
-        seq: int | None = None,
-        message_id: str | None = None,
-        subject: str | None = None,
-    ) -> None:
-        if memory_type != ITEM_MESSAGE:
-            # the dev store keeps history only; tool/event rows are debug
-            # telemetry and are dropped rather than half-modelled
-            return
-        with self._lock:
-            buffered = self._open.get(turn_id)
-            if buffered is not None:
-                buffered.append({"role": role, "content": content})
-
-    def end_turn(
-        self, conversation_id: str, turn_id: str, *, status: str = TURN_CLOSED
-    ) -> None:
-        with self._lock:
-            buffered = self._open.pop(turn_id, None)
-            if not buffered or status != TURN_CLOSED:
-                return
-            turns = self._conversations.setdefault(conversation_id, [])
-            turns.extend(buffered)
-            if len(turns) > self._max:
-                del turns[: len(turns) - self._max]
-
-    def clear(self, conversation_id: str) -> None:
-        with self._lock:
-            self._conversations.pop(conversation_id, None)
-
-
-class PersistentAgentMemory(ChatMemory):
-    """SQLAlchemy-backed store (MySQL, Postgres, SQLite, ...).
-
-    ``pip install 'hopsworks-agent-protocol[memory-sql]'``
-
-    Inside a Hopsworks agent deployment both arguments are optional:
-    ``PersistentAgentMemory()`` connects to the project MySQL using the
-    platform-injected env vars and derives a per-deployment table name from
-    ``DEPLOYMENT_ID``.
-
-    A per-conversation cache avoids a read round-trip on every turn for the
-    lifetime of the process.
-
-    Rows live in ``agent_memory_messages`` and carry turn identity
-    (``turn_id``, ``seq``, ``status``, ``message_id``) so the SDK can record the
-    user message before the handler runs without ever exposing a half-written
-    turn: only ``closed`` turns are returned by :meth:`get`. See
-    :meth:`begin_turn`.
-
-    Connection is **lazy and non-fatal**: construction never touches the
-    database (missing SQLAlchemy is the only hard error), the engine + tables
-    are created on first use — in a deployment that happens via the ``/ready``
-    probe, off the request path — and if the database is unreachable the store
-    degrades to statelessness — reads return empty, writes are dropped, both
-    with a warning — so a down database never crashes the agent at startup or
-    on a turn.
-    """
-
-    def __init__(
-        self,
-        url: str | None = None,
-        table_name: str | None = None,
-        max_messages: int = 50,
-        turn_timeout_seconds: int = 300,
-        summarize: Summarizer | None = None,
-        summarize_after_messages: int = 20,
-        keep_recent_messages: int = 10,
-        tool_event_retention_days: int | None = 30,
-        message_retention_days: int | None = None,
-        long_term: bool = False,
-        embedder: Embedder | None = None,
-        vector_store: "VectorStore | None" = None,
-        state_ttl_days: int | None = 90,
-        max_state_value_chars: int = 4096,
-        max_state_keys_written: int = 128,
-        max_state_keys_injected: int = 32,
-        state_inject_value_chars: int = 1024,
-        recency_half_life_days: float | None = 30.0,
-        search_oversample: int = 3,
-        deployment_id: str | None = None,
-        create_tables: bool = True,
-    ):
-        try:
-            import sqlalchemy  # noqa: F401 — fail fast if the extra is missing
-        except ImportError as err:
-            raise ImportError(
-                "PersistentAgentMemory requires SQLAlchemy: "
-                "pip install 'hopsworks-agent-protocol[memory-sql]'"
-            ) from err
-
-        self._max = max_messages
-        self._turn_timeout = turn_timeout_seconds
-        self._summarize = summarize
-        self._summarize_every = summarize_after_messages
-        self._keep_recent = keep_recent_messages
-        self._tool_event_retention = tool_event_retention_days
-        self._message_retention = message_retention_days
-        self._long_term = long_term
-        self._embedder = embedder
-        self._vector_store = vector_store
-        self._state_ttl = state_ttl_days
-        self._max_value_chars = max_state_value_chars
-        self._max_keys_written = max_state_keys_written
-        self._max_keys_injected = max_state_keys_injected
-        self._inject_value_chars = state_inject_value_chars
-        # How fast similarity gives way to age in search ranking. A support
-        # agent wants recent context; an agent whose one relevant fact is a year
-        # old does not, so this is a knob and `None` turns it off entirely,
-        # restoring pure similarity order.
-        self._half_life = recency_half_life_days
-        self._search_oversample = max(1, search_oversample)
-        self._url = url  # resolved lazily (may read env/secrets)
-        self._table_name = table_name
-        self._deployment_id = deployment_id
-        # False for a handle that only wants to look at the schema — feature
-        # group registration, say. Inspecting a database should never be the
-        # thing that creates a table in it, and a tier this agent does not run
-        # would otherwise be conjured into existence by the act of listing it.
-        self._create_tables = create_tables
-        # resolved on first connect, then constant for the process
-        self._deployment: str | None = None
-        # conversation_id -> (summary_version, turns). The version is what makes
-        # the cache safe once folding exists: another replica advancing the
-        # cutoff bumps it, and this process notices on the next read instead of
-        # serving history that has since been compacted away.
-        self._cache: dict[str, tuple[int, list[Turn]]] = {}
-        # rows written by turns that are still open, held back from the cache
-        # until the turn closes (or dropped when it is abandoned)
-        self._pending: dict[str, list[Turn]] = {}
-        self._seq: dict[str, int] = {}
-        self._lock = threading.Lock()
-        # set on first successful connection; None while unconnected/failed
-        self._engine = None
-        self._table = None
-        self._meta = None
-        self._sessions = None
-        self._state = None
-        # a failed connect blocks retries until this monotonic deadline, with
-        # exponential backoff — never permanently (see _ensure_engine)
-        self._init_failed_until = 0.0
-        self._init_backoff = 1.0
-        self._last_reap = 0.0
-        self._last_prune = 0.0
-
-    def _mine(self, stmt, table):
-        """Restrict a statement to this deployment's rows.
-
-        Every read, update and delete in this module goes through here. It is a
-        one-line helper on purpose: with one shared table, a query that forgets
-        the deployment filter does not fail — it quietly returns, edits or
-        deletes another agent's memory. Making the filter a named call means a
-        missing one is visible when reading the code, and
-        ``TestDeploymentIsolation`` fails when it is not.
-        """
-        return stmt.where(table.c.deployment_id == self._deployment)
+                log.exception(
+                    "Could not prepare %s for writing; memory is unavailable "
+                    "until it has an AUTO_INCREMENT id and its indexes",
+                    table.name,
+                )
+                ok = False
+        return ok
 
     def _resolve_deployment_id(self) -> str:
         """Which agent's rows these are.
@@ -1696,6 +1080,11 @@ class PersistentAgentMemory(ChatMemory):
                         log.debug("Memory tables already created concurrently")
                     if not self._check_schema_version(engine, meta, table_name):
                         return False
+                # The messages and facts tables are the feature groups' own,
+                # created by Hopsworks without the id sequence or the indexes
+                # the agent reads through. Adopt them before serving.
+                if not self._adopt_feature_group_tables(engine, (table, state)):
+                    return False
                 self._engine = engine
                 self._deployment = deployment
                 self._table = table
@@ -2005,7 +1394,7 @@ class PersistentAgentMemory(ChatMemory):
         self,
         feature_store=None,
         *,
-        storage: str | None = EXPORT_STORAGE_ONLINE,
+        storage: str | None = EXPORT_STORAGE_OFFLINE,
         since: int | None = None,
         batch_size: int = 5000,
         version: int = 1,
@@ -2087,16 +1476,15 @@ class PersistentAgentMemory(ChatMemory):
                 exported[table.name] = 0
                 continue
 
-            fg = feature_store.get_or_create_feature_group(
-                name=table.name,
-                version=version,
-                description=f"Agent memory ({name}), exported from the "
-                "project database by hopsworks-agent-protocol",
-                primary_key=list(keys),
-                event_time=event_time,
-                online_enabled=True,
-                features=self._features_for(table),
+            fg = feature_store.get_feature_group(
+                name=_feature_group_name(table.name), version=version
             )
+            if fg is None:
+                raise RuntimeError(
+                    f"No feature group for {table.name}. These are provisioned "
+                    "by Hopsworks when an agent deployment starts, not by this "
+                    "SDK — start the deployment first."
+                )
             for start in range(0, len(rows), batch_size):
                 frame = pd.DataFrame(rows[start : start + batch_size])
                 frame = self._prepare_for_insert(frame)
