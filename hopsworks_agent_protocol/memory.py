@@ -1963,6 +1963,44 @@ class PersistentAgentMemory(ChatMemory):
         "state": (("deployment_id", "id"), "updated_at"),
     }
 
+    @staticmethod
+    def _prepare_for_insert(frame):
+        """Make a batch's null columns survive the trip to the online store.
+
+        Two distinct traps, and the fix for one must not create the other.
+
+        A *mixed* datetime column — some rows expiring, some never — carries
+        NaT, and hsfs raises "NaTType does not support timetuple" instead of
+        writing NULL. Object dtype holding real datetimes and Nones converts
+        cleanly.
+
+        A column that is *entirely* null in the batch has no type at all once
+        it reaches Arrow, and the online writer rejects it — silently and
+        asynchronously: the insert returns, and the rows never appear, with
+        only an `online_ingestion_result` row of status FAILED to say so. That
+        is why the datetime fix above is conditional. Applying it to an
+        all-NaT column would strip the one piece of type information the column
+        still had and turn a working write into a vanishing one.
+
+        For strings there is no typed empty value to fall back on, so an
+        all-null string column is written as empty strings. Within such a batch
+        nothing is lost — every value was null — but a null and an empty string
+        are not distinguishable in the feature group afterwards.
+        """
+        import pandas as pd
+
+        for column in frame.columns:
+            values = frame[column]
+            if values.notna().any():
+                if pd.api.types.is_datetime64_any_dtype(values) and values.isna().any():
+                    frame[column] = values.astype(object).where(values.notna(), None)
+                continue
+            # entirely null: give Arrow something to type
+            if pd.api.types.is_datetime64_any_dtype(values):
+                continue  # datetime64 is already typed; leave NaT alone
+            frame[column] = ""
+        return frame
+
     def export_feature_groups(
         self,
         feature_store=None,
@@ -2061,18 +2099,7 @@ class PersistentAgentMemory(ChatMemory):
             )
             for start in range(0, len(rows), batch_size):
                 frame = pd.DataFrame(rows[start : start + batch_size])
-                # A nullable DATETIME (expires_at, and any turn that never
-                # expires) arrives as None, which pandas turns into NaT inside
-                # a datetime64 column — and hsfs raises "NaTType does not
-                # support timetuple" rather than writing a NULL. Object dtype
-                # holding real datetimes and Nones converts cleanly.
-                for column in frame.columns:
-                    if pd.api.types.is_datetime64_any_dtype(frame[column]):
-                        values = frame[column]
-                        if values.isna().any():
-                            frame[column] = values.astype(object).where(
-                                values.notna(), None
-                            )
+                frame = self._prepare_for_insert(frame)
                 insert_kwargs = {"write_options": {"mode": "append"}}
                 if storage_arg is not None:
                     insert_kwargs["storage"] = storage_arg
