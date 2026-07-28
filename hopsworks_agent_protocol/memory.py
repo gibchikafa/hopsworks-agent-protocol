@@ -8,7 +8,7 @@ already in the ``{"role", "content"}`` shape LangChain/LangGraph/LlamaIndex
 accept.
 
 Backends:
-- :class:`InMemoryChatMemory` — zero-config, for development. Conversations
+- :class:`InMemoryAgentMemory` — zero-config, for development. Conversations
   are lost on restart and not shared between replicas; note that Hopsworks
   agent deployments can scale to zero, so this is NOT for production.
 - :class:`ManagedMemoryService` — any SQLAlchemy URL (e.g. the project's MySQL).
@@ -566,7 +566,7 @@ class ChatMemory(ABC):
         return 0
 
 
-class InMemoryChatMemory(ChatMemory):
+class InMemoryAgentMemory(ChatMemory):
     """Process-local store for development: lost on restart (agent
     deployments can scale to zero) and not shared between replicas."""
 

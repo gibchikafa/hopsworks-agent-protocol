@@ -334,9 +334,9 @@ class TestMemory:
         return app
 
     def test_in_memory_auto_records_and_serves_history(self):
-        from hopsworks_agent_protocol import InMemoryChatMemory
+        from hopsworks_agent_protocol import InMemoryAgentMemory
 
-        memory = InMemoryChatMemory()
+        memory = InMemoryAgentMemory()
         client = TestClient(self.build_memory_app(memory))
         first = client.post("/v1/chat", json=make_request("hello")).json()
         cid = first["conversation_id"]
@@ -349,9 +349,9 @@ class TestMemory:
         assert second["message"]["content"][0]["text"] == "history=2: again"
 
     def test_in_memory_trims_to_max(self):
-        from hopsworks_agent_protocol import InMemoryChatMemory
+        from hopsworks_agent_protocol import InMemoryAgentMemory
 
-        memory = InMemoryChatMemory(max_messages=2)
+        memory = InMemoryAgentMemory(max_messages=2)
         for i in range(4):
             memory.append("c1", "user", f"m{i}")
         assert memory.get("c1") == [
@@ -378,9 +378,9 @@ class TestMemory:
         assert fresh.get(cid) == []
 
     def test_memory_failure_does_not_break_chat(self):
-        from hopsworks_agent_protocol import InMemoryChatMemory
+        from hopsworks_agent_protocol import InMemoryAgentMemory
 
-        class BrokenMemory(InMemoryChatMemory):
+        class BrokenMemory(InMemoryAgentMemory):
             def begin_turn(self, *a, **k):
                 raise RuntimeError("db down")
 
@@ -389,9 +389,9 @@ class TestMemory:
         assert result.status_code == 200
 
     def test_close_failure_does_not_break_chat(self):
-        from hopsworks_agent_protocol import InMemoryChatMemory
+        from hopsworks_agent_protocol import InMemoryAgentMemory
 
-        class BrokenMemory(InMemoryChatMemory):
+        class BrokenMemory(InMemoryAgentMemory):
             def end_turn(self, *a, **k):
                 raise RuntimeError("db down")
 
@@ -445,9 +445,9 @@ class TestSqlMemoryResilience:
 
 class TestContextObject:
     def test_two_param_handler_receives_context(self):
-        from hopsworks_agent_protocol import AgentApp, InMemoryChatMemory
+        from hopsworks_agent_protocol import AgentApp, InMemoryAgentMemory
 
-        app = AgentApp(memory=InMemoryChatMemory())
+        app = AgentApp(memory=InMemoryAgentMemory())
         seen = {}
 
         @app.chat
@@ -516,9 +516,9 @@ class TestReadiness:
 
 class TestConversationEndpoints:
     def test_history_and_clear(self):
-        from hopsworks_agent_protocol import AgentApp, InMemoryChatMemory
+        from hopsworks_agent_protocol import AgentApp, InMemoryAgentMemory
 
-        app = AgentApp(memory=InMemoryChatMemory())
+        app = AgentApp(memory=InMemoryAgentMemory())
 
         @app.chat
         async def chat(request):
@@ -554,9 +554,9 @@ class TestConversationEndpoints:
         assert "conversations" not in manifest["endpoints"]
 
     def test_manifest_advertises_conversations_with_memory(self):
-        from hopsworks_agent_protocol import AgentApp, InMemoryChatMemory
+        from hopsworks_agent_protocol import AgentApp, InMemoryAgentMemory
 
-        app = AgentApp(memory=InMemoryChatMemory())
+        app = AgentApp(memory=InMemoryAgentMemory())
 
         @app.chat
         async def chat(request):

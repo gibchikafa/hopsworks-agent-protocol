@@ -2,7 +2,7 @@ from .app import AgentApp
 from .context import HandlerContext
 from .memory import (
     ChatMemory,
-    InMemoryChatMemory,
+    InMemoryAgentMemory,
     ManagedMemoryService,
     deployment_mysql_url,
 )
@@ -39,7 +39,7 @@ __all__ = [
     "HandlerContext",
     "HopsworksVectorStore",
     "ImageContent",
-    "InMemoryChatMemory",
+    "InMemoryAgentMemory",
     "InMemoryVectorStore",
     "ManagedMemoryService",
     "TextContent",

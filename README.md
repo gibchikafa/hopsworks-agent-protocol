@@ -187,7 +187,7 @@ ManagedMemoryService(long_term=True, embedder=embedder,
 
 ### Backends and behaviour
 
-- `InMemoryChatMemory()` — zero-config for development. Lost on restart and
+- `InMemoryAgentMemory()` — zero-config for development. Lost on restart and
   per-replica; agent deployments can scale to zero, so not for production.
   Tiers 2 and 3 are no-ops on it.
 - `ManagedMemoryService()` — inside a Hopsworks agent deployment this is

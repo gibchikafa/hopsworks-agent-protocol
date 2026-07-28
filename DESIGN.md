@@ -79,7 +79,7 @@ retention split by row type, and why the `app` scope is not model-writable —
 lives in `~/Work/hopsworks-agent-memory-design.md`.
 
 
-The protocol makes history server-side (clients send only the new message + a `conversation_id`), so the SDK can own storage. `ChatMemory` has two backends: `InMemoryChatMemory` (dev — documented as unfit for production since deployments scale to zero and replicas don't share it) and `ManagedMemoryService` (any SQLAlchemy URL; zero-config inside a deployment, resolving the project MySQL from injected `MYSQL_*` env vars + the password secret, table name from `DEPLOYMENT_ID`).
+The protocol makes history server-side (clients send only the new message + a `conversation_id`), so the SDK can own storage. `ChatMemory` has two backends: `InMemoryAgentMemory` (dev — documented as unfit for production since deployments scale to zero and replicas don't share it) and `ManagedMemoryService` (any SQLAlchemy URL; zero-config inside a deployment, resolving the project MySQL from injected `MYSQL_*` env vars + the password secret, table name from `DEPLOYMENT_ID`).
 
 Design choices:
 
