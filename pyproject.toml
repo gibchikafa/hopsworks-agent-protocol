@@ -34,6 +34,14 @@ memory-search = [
     "sentence-transformers>=2.2.0",
     "pandas>=1.5",
 ]
+# The evaluation side: runs in a Hopsworks job, never in a serving pod. Kept
+# behind an extra so an agent image does not carry judges and detectors, and
+# so `import hopsworks_agent_protocol` cannot reach them (see
+# tests/test_import_isolation.py).
+eval = [
+    "pandas>=1.5",
+    "requests>=2.28",
+]
 dev = [
     "pytest",
     "httpx",
@@ -45,4 +53,4 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["hopsworks_agent_protocol"]
+packages = ["hopsworks_agent_protocol", "hopsworks_agent_eval"]
