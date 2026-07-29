@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hopsworks-agent-protocol"
-version = "1.5.0"
+version = "1.6.0"
 description = "Server helpers for the Hopsworks Agent Protocol: make any Python agent chat-ready in the Hopsworks UI"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -39,6 +39,9 @@ dev = [
     "httpx",
     "uvicorn",
     "sqlalchemy>=2.0.0",
+    # the turn span and baggage propagation are only exercisable with a real
+    # tracer provider and an in-memory exporter
+    "opentelemetry-sdk>=1.0.0",
 ]
 
 [tool.hatch.build.targets.wheel]

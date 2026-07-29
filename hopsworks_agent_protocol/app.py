@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -26,6 +27,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from . import conventions
 from .context import HandlerContext
 from .models import (
     PROTOCOL,
@@ -37,7 +39,7 @@ from .models import (
     new_response_id,
 )
 from .memory import TURN_ABANDONED, TURN_CLOSED, ChatMemory
-from .tracing import resolve_framework, setup_tracing
+from .tracing import resolve_framework, setup_tracing, turn_span
 
 ChatHandler = Callable[..., Awaitable[ChatResponse | str] | ChatResponse | str]
 StreamHandler = Callable[..., AsyncIterator["str | ChatResponse"]]
@@ -106,6 +108,12 @@ class AgentApp(FastAPI):
         # framework: explicit arg > AGENT_FRAMEWORK env (platform-injected) >
         # 'custom'. Drives which OpenInference instrumentor tracing activates.
         self.framework = resolve_framework(framework)
+        # platform-injected when the deployment runs with tools mocked or
+        # pointed at scratch resources; reported in the manifest so an eval
+        # runner can verify it rather than trust a naming convention
+        self._eval_mode = os.environ.get(
+            conventions.EVAL_MODE_ENV, ""
+        ).strip().lower() in ("1", "true", "yes")
         # tracing: None auto-detects from the platform-injected OTLP endpoint
         # env var (set iff tracing is enabled on the deployment)
         self.tracer_provider = setup_tracing(self.framework, enabled=tracing)
@@ -236,6 +244,20 @@ class AgentApp(FastAPI):
                 "tool_events": self._tool_events,
                 # a structure graph is available to visualize the agent
                 "graph": self._graph_spec is not None,
+                # This agent continues an incoming W3C trace context and
+                # propagates hopsworks.eval.* baggage onto its spans, so a
+                # caller that generated the traceparent can find the trace
+                # afterwards. False means tracing is off on the deployment;
+                # *absent* means an SDK too old to do it at all. The eval
+                # runner checks this before running a suite, rather than
+                # discovering afterwards that every trial points at a trace
+                # that was never created.
+                "trace_correlation": self.tracer_provider is not None,
+                # Running with tools mocked or pointed at scratch resources.
+                # Lets the runner refuse to fire a sandboxed suite — one full
+                # of injection and exfiltration attempts — at a deployment
+                # whose tools can still mutate production systems.
+                "eval_mode": self._eval_mode,
             },
             "ui": {
                 "welcome_message": self._welcome_message,
@@ -244,6 +266,36 @@ class AgentApp(FastAPI):
                 "allow_markdown": True,
             },
         }
+
+    def _turn_span_name(self) -> str:
+        # OTel GenAI convention: "{operation} {target}"
+        return f"{conventions.OPERATION_INVOKE_AGENT} {self._agent_name}"
+
+    def _turn_span_attributes(self, ctx: HandlerContext) -> dict[str, Any]:
+        """What is known before the handler runs.
+
+        ``input.value`` matters more than it looks: it is the sidecar's
+        last-resort message source, so a root span that sets it produces a
+        correct transcript with no sidecar change — and retires the
+        reconstruct-the-root-span-from-its-children heuristics for SDK agents.
+        """
+        attributes: dict[str, Any] = {
+            conventions.SPAN_KIND: conventions.SPAN_KIND_AGENT,
+            conventions.GEN_AI_OPERATION_NAME: conventions.OPERATION_INVOKE_AGENT,
+            conventions.GEN_AI_AGENT_NAME: self._agent_name,
+            conventions.GEN_AI_AGENT_VERSION: self._agent_version,
+            conventions.GEN_AI_CONVERSATION_ID: ctx.conversation_id,
+            conventions.CONVERSATION_ID: ctx.conversation_id,
+            conventions.FRAMEWORK: ctx.framework,
+        }
+        if ctx.message_id:
+            attributes[conventions.MESSAGE_ID] = ctx.message_id
+        if ctx.deployment_id:
+            attributes[conventions.DEPLOYMENT_ID] = ctx.deployment_id
+        text = ctx.request.text
+        if text:
+            attributes[conventions.INPUT_VALUE] = text
+        return attributes
 
     def _prepare(self, request: ChatRequest) -> HandlerContext:
         # handlers can always rely on conversation_id being present
@@ -473,7 +525,7 @@ class AgentApp(FastAPI):
             )
 
         @self.post("/v1/chat")
-        async def chat_route(request: ChatRequest) -> JSONResponse:
+        async def chat_route(request: ChatRequest, raw: Request) -> JSONResponse:
             if self._chat_handler is None and self._stream_handler is None:
                 return _error_response(
                     AgentError("No chat handler registered.", "not_implemented", 501)
@@ -481,14 +533,22 @@ class AgentApp(FastAPI):
             ctx = self._prepare(request)
             await self._open_turn(ctx)
             response: ChatResponse | None = None
-            try:
-                response = await self._run_chat(ctx)
-            except AgentError as err:
-                return _error_response(err)
-            finally:
-                # in a finally because an AgentError must not leave the turn
-                # open: its user message is already recorded
-                await self._finalize_turn(ctx, response)
+            with turn_span(
+                self.tracer_provider,
+                name=self._turn_span_name(),
+                headers=raw.headers,
+                attributes=self._turn_span_attributes(ctx),
+            ) as span:
+                ctx._span = span
+                try:
+                    response = await self._run_chat(ctx)
+                except AgentError as err:
+                    _record_span_error(span, err)
+                    return _error_response(err)
+                finally:
+                    # in a finally because an AgentError must not leave the turn
+                    # open: its user message is already recorded
+                    await self._finalize_turn(ctx, response)
             return JSONResponse(response.model_dump())
 
         @self.post("/v1/chat/stream")
@@ -619,81 +679,104 @@ class AgentApp(FastAPI):
         # Every exit below — normal completion, AgentError, handler crash,
         # client disconnect — has to end the turn, because its user message is
         # already in the store. Hence one finally around the whole generator.
-        completed: ChatResponse | None = None
-        try:
-            if self._stream_handler is None:
-                try:
-                    response = await self._run_chat(ctx)
-                except AgentError as err:
-                    yield _sse("error", err.detail())
+        #
+        # One generator, deliberately: delegating the body to an inner async
+        # generator reads better but breaks the disconnect path. GeneratorExit
+        # at the yield unwinds this frame, and an inner generator's finally
+        # would then be deferred to async-generator finalization instead of
+        # running here — leaving the turn open with its question already
+        # recorded, until the stale-turn reaper eventually caught it.
+        #
+        # The span is opened here rather than in the route for the
+        # mirror-image reason: the route returns as soon as the
+        # StreamingResponse is constructed, so a span opened there would
+        # close before the first token.
+        with turn_span(
+            self.tracer_provider,
+            name=self._turn_span_name(),
+            headers=raw.headers,
+            attributes=self._turn_span_attributes(ctx),
+        ) as span:
+            ctx._span = span
+            completed: ChatResponse | None = None
+            try:
+                if self._stream_handler is None:
+                    try:
+                        response = await self._run_chat(ctx)
+                    except AgentError as err:
+                        _record_span_error(span, err)
+                        yield _sse("error", err.detail())
+                        return
+                    completed = response
+                    yield _sse("message.completed", response.model_dump())
                     return
+
+                # Run the handler as a task that feeds a queue, so ctx.emit_event
+                # (tool_event frames) interleaves with the handler's own yields.
+                from .autoevents import current_context
+
+                queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+                ctx._event_queue = queue
+                ctx._loop = asyncio.get_running_loop()
+
+                async def pump() -> None:
+                    token = current_context.set(ctx)
+                    try:
+                        async for item in self._invoke_stream(ctx):
+                            await queue.put(("item", item))
+                    except AgentError as err:
+                        await queue.put(("error", err.detail()))
+                    except Exception as err:  # noqa: BLE001 — surfaced to the client
+                        await queue.put(
+                            (
+                                "error",
+                                {
+                                    "code": "agent_error",
+                                    "message": str(err),
+                                    "retryable": False,
+                                },
+                            )
+                        )
+                    finally:
+                        current_context.reset(token)
+                        await queue.put(("done", None))
+
+                task = asyncio.create_task(pump())
+                chunks: list[str] = []
+                final: ChatResponse | None = None
+                try:
+                    while True:
+                        kind, payload = await queue.get()
+                        if kind == "done":
+                            break
+                        if await raw.is_disconnected():
+                            task.cancel()
+                            return
+                        if kind == "error":
+                            _record_span_error(
+                                span, AgentError(str(payload.get("message", "")))
+                            )
+                            yield _sse("error", payload)
+                            return
+                        if kind == "tool_event":
+                            yield _sse("tool_event", payload)
+                        elif isinstance(payload, ChatResponse):
+                            final = payload
+                        else:
+                            chunks.append(payload)
+                            yield _sse("message.delta", {"delta": {"text": payload}})
+                finally:
+                    if not task.done():
+                        task.cancel()
+
+                response = self._merge_stream_result(chunks, final, ctx)
                 completed = response
                 yield _sse("message.completed", response.model_dump())
-                return
-
-            # Run the handler as a task that feeds a queue, so ctx.emit_event
-            # (tool_event frames) interleaves with the handler's own yields.
-            from .autoevents import current_context
-
-            queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
-            ctx._event_queue = queue
-            ctx._loop = asyncio.get_running_loop()
-
-            async def pump() -> None:
-                token = current_context.set(ctx)
-                try:
-                    async for item in self._invoke_stream(ctx):
-                        await queue.put(("item", item))
-                except AgentError as err:
-                    await queue.put(("error", err.detail()))
-                except Exception as err:  # noqa: BLE001 — surfaced to the client
-                    await queue.put(
-                        (
-                            "error",
-                            {
-                                "code": "agent_error",
-                                "message": str(err),
-                                "retryable": False,
-                            },
-                        )
-                    )
-                finally:
-                    current_context.reset(token)
-                    await queue.put(("done", None))
-
-            task = asyncio.create_task(pump())
-            chunks: list[str] = []
-            final: ChatResponse | None = None
-            try:
-                while True:
-                    kind, payload = await queue.get()
-                    if kind == "done":
-                        break
-                    if await raw.is_disconnected():
-                        task.cancel()
-                        return
-                    if kind == "error":
-                        yield _sse("error", payload)
-                        return
-                    if kind == "tool_event":
-                        yield _sse("tool_event", payload)
-                    elif isinstance(payload, ChatResponse):
-                        final = payload
-                    else:
-                        chunks.append(payload)
-                        yield _sse("message.delta", {"delta": {"text": payload}})
             finally:
-                if not task.done():
-                    task.cancel()
-
-            response = self._merge_stream_result(chunks, final, ctx)
-            completed = response
-            yield _sse("message.completed", response.model_dump())
-        finally:
-            # Best effort: if the whole task tree is being cancelled this may
-            # not get to run, which is what the store's stale-turn reaper is
-            # there to catch.
-            await self._finalize_turn(ctx, completed)
+                # Best effort: if the whole task tree is being cancelled this may
+                # not get to run, which is what the store's stale-turn reaper is
+                # there to catch.
+                await self._finalize_turn(ctx, completed)
 
 
 def contentful(response: ChatResponse) -> bool:
@@ -707,27 +790,72 @@ def _error_response(err: AgentError) -> JSONResponse:
     return JSONResponse({"detail": err.detail()}, status_code=err.status_code)
 
 
+def _record_span_error(span: Any, err: Exception) -> None:
+    """Mark the turn span as failed. Trace status is how the sidecar's error
+    metrics and the eval runner's failure classification tell a broken turn
+    from a slow one, so a handled AgentError still has to land on the span."""
+    if span is None:
+        return
+    try:
+        from opentelemetry.trace import Status, StatusCode
+
+        span.set_status(Status(StatusCode.ERROR, str(err)))
+        span.record_exception(err)
+    except Exception:  # noqa: BLE001 — never let telemetry break a turn
+        pass
+
+
 def _annotate_span(ctx: HandlerContext, response: ChatResponse) -> None:
-    """Best-effort correlation: stamp conversation/message/response ids on the
-    active OTel span and surface the trace id in the response metadata, so
-    downstream evaluation can join chat turns to traces. No-op when tracing is
-    not active."""
+    """Close out the turn span with what only the finished response knows, and
+    surface the trace id in the response metadata so a caller can join this
+    turn to its trace without parsing headers.
+
+    Prefers the turn span the route opened over the ambient current span: by
+    the time this runs the framework's own spans have ended, so
+    ``get_current_span()`` is only right because the turn span is still open —
+    and relying on that was what made this function a silent no-op before the
+    turn span existed. No-op when tracing is not active.
+    """
     try:
         from opentelemetry import trace
     except ImportError:
         return
-    span = trace.get_current_span()
+    span = ctx._span if ctx._span is not None else trace.get_current_span()
+    if span is None:
+        return
     ctxt = span.get_span_context()
     if not getattr(ctxt, "is_valid", False):
         return
     try:
-        span.set_attribute("hopsworks.conversation_id", ctx.conversation_id)
-        span.set_attribute("hopsworks.response_id", response.id)
+        # Re-stamped rather than left to the turn span's start attributes: when
+        # the SDK is untraced but the agent instruments itself, the span found
+        # here is the agent's own and has never seen them.
+        span.set_attribute(conventions.CONVERSATION_ID, ctx.conversation_id)
+        span.set_attribute(conventions.FRAMEWORK, ctx.framework)
         if ctx.message_id:
-            span.set_attribute("hopsworks.message_id", ctx.message_id)
+            span.set_attribute(conventions.MESSAGE_ID, ctx.message_id)
         if ctx.deployment_id:
-            span.set_attribute("hopsworks.deployment_id", ctx.deployment_id)
-        span.set_attribute("hopsworks.framework", ctx.framework)
+            span.set_attribute(conventions.DEPLOYMENT_ID, ctx.deployment_id)
+        span.set_attribute(conventions.RESPONSE_ID, response.id)
+        # the authoritative final answer, straight from the response object,
+        # rather than reconstructed downstream from whichever child span
+        # happened to look most like an answer
+        answer = "".join(
+            part.text for part in response.message.content if part.type == "text"
+        )
+        if answer:
+            span.set_attribute(conventions.OUTPUT_VALUE, answer)
+        usage = response.usage or {}
+        for key, attr in (
+            ("input_tokens", conventions.GEN_AI_USAGE_INPUT_TOKENS),
+            ("prompt_tokens", conventions.GEN_AI_USAGE_INPUT_TOKENS),
+            ("output_tokens", conventions.GEN_AI_USAGE_OUTPUT_TOKENS),
+            ("completion_tokens", conventions.GEN_AI_USAGE_OUTPUT_TOKENS),
+        ):
+            if isinstance(usage.get(key), int):
+                span.set_attribute(attr, usage[key])
+        if response.status == "failed":
+            _record_span_error(span, AgentError("Handler returned status=failed"))
         response.metadata.setdefault("trace_id", format(ctxt.trace_id, "032x"))
     except Exception:  # noqa: BLE001 — correlation is best-effort
         pass

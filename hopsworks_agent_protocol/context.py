@@ -62,6 +62,9 @@ class HandlerContext:
         # turn lifecycle bookkeeping, owned by AgentApp
         self._turn_open = False
         self._next_seq = 1
+        # the turn's root OTel span, set by the route when tracing is active.
+        # None when untraced, so every read must tolerate it.
+        self._span: Any = None
         # emit plumbing, wired by the route: a queue while streaming, else a
         # buffer surfaced in the response metadata
         self._event_queue: asyncio.Queue[Any] | None = None

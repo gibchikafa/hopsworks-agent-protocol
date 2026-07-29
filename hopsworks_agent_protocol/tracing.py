@@ -11,6 +11,11 @@ Frameworks:
 - ``llamaindex`` -> openinference-instrumentation-llama-index
 - ``custom``     -> provider only; instrument manually via ``app.tracer_provider``
 
+It also owns the *turn span*: one SERVER span per request, continuing whatever
+trace context the caller sent. Without it the agent starts a fresh trace on
+every request, which means a caller that knows the trace id it asked for — the
+eval runner — cannot find the trace the agent actually produced.
+
 All imports are lazy and failures are non-fatal: a missing instrumentation
 package logs a warning and the agent runs untraced.
 """
@@ -19,7 +24,11 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any
+
+from .conventions import BAGGAGE_PREFIXES
 
 log = logging.getLogger(__name__)
 
@@ -83,10 +92,146 @@ def setup_tracing(framework: str, enabled: bool | None = None) -> Any | None:
     # SimpleSpanProcessor on purpose: the Hopsworks OTLP sidecar relies on
     # spans arriving individually for its span propagation.
     provider.add_span_processor(SimpleSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
+    install_baggage_propagation(provider)
 
     _instrument(framework, provider)
     log.info("Tracing enabled (framework=%s, endpoint=%s)", framework, endpoint)
     return provider
+
+
+def install_baggage_propagation(tracer_provider: Any) -> bool:
+    """Copy allowlisted baggage entries onto every span as attributes.
+
+    Baggage rides the request context but does not become span attributes on
+    its own, so the eval runner's ``hopsworks.eval.*`` ids would reach the
+    agent and stop there — never reaching the sidecar, which only sees spans.
+
+    Only entries under :data:`BAGGAGE_PREFIXES` are copied. Baggage arrives
+    over the wire from whoever called the agent, so copying it wholesale would
+    let any caller write arbitrary attributes into the project's trace tables.
+
+    Returns True when installed. Best-effort: any failure logs and returns
+    False without disturbing tracing.
+    """
+    try:
+        from opentelemetry import baggage
+        from opentelemetry.sdk.trace import SpanProcessor
+    except ImportError:
+        return False
+
+    class _BaggageSpanProcessor(SpanProcessor):
+        def on_start(self, span: Any, parent_context: Any = None) -> None:
+            try:
+                entries = baggage.get_all(parent_context)
+            except Exception:  # noqa: BLE001 — never disturb the span
+                log.debug("baggage read failed", exc_info=True)
+                return
+            for key, value in entries.items():
+                if not str(key).startswith(BAGGAGE_PREFIXES):
+                    continue
+                try:
+                    span.set_attribute(str(key), str(value))
+                except Exception:  # noqa: BLE001
+                    log.debug("baggage attribute failed", exc_info=True)
+
+        def on_end(self, span: Any) -> None:
+            pass
+
+        def shutdown(self) -> None:
+            pass
+
+        def force_flush(self, timeout_millis: int = 30000) -> bool:
+            return True
+
+    try:
+        tracer_provider.add_span_processor(_BaggageSpanProcessor())
+        return True
+    except Exception:  # noqa: BLE001
+        log.warning("Could not install the baggage span processor", exc_info=True)
+        return False
+
+
+def extract_context(headers: Mapping[str, str] | None) -> Any | None:
+    """W3C ``traceparent`` + ``baggage`` from request headers as an OTel
+    Context, or None when unavailable."""
+    if not headers:
+        return None
+    try:
+        from opentelemetry.propagate import extract
+    except ImportError:
+        return None
+    try:
+        return extract({str(k).lower(): v for k, v in headers.items()})
+    except Exception:  # noqa: BLE001 — a malformed header must not fail a turn
+        log.debug("trace context extraction failed", exc_info=True)
+        return None
+
+
+@contextmanager
+def turn_span(
+    tracer_provider: Any,
+    *,
+    name: str,
+    headers: Mapping[str, str] | None = None,
+    attributes: dict[str, Any] | None = None,
+) -> Iterator[Any]:
+    """One SERVER span for the whole turn, parented to the caller's trace.
+
+    Yields the span, or None when tracing is off or the OTel SDK is missing —
+    so every call site is written the same way and degrades silently.
+
+    The extracted context is *attached* rather than only passed as the span's
+    parent: that keeps the caller's baggage active for the whole turn, so the
+    baggage span processor sees it on child spans the framework creates too.
+    """
+    token, span_cm = _begin_turn_span(tracer_provider, name, headers, attributes)
+    try:
+        if span_cm is None:
+            yield None
+        else:
+            with span_cm as span:
+                yield span
+    finally:
+        if token is not None:
+            try:
+                from opentelemetry import context as context_api
+
+                context_api.detach(token)
+            except Exception:  # noqa: BLE001
+                log.debug("context detach failed", exc_info=True)
+
+
+def _begin_turn_span(
+    tracer_provider: Any,
+    name: str,
+    headers: Mapping[str, str] | None,
+    attributes: dict[str, Any] | None,
+) -> tuple[Any | None, Any | None]:
+    """Attach the caller's context and build the span context manager.
+
+    Returns ``(detach_token, span_context_manager)``, either of which may be
+    None. Kept separate from :func:`turn_span` so that a failure here yields
+    None once rather than twice — a generator context manager cannot.
+    """
+    if tracer_provider is None:
+        return None, None
+    token = None
+    try:
+        from opentelemetry import context as context_api
+        from opentelemetry import trace
+
+        extracted = extract_context(headers)
+        if extracted is not None:
+            token = context_api.attach(extracted)
+        tracer = tracer_provider.get_tracer("hopsworks_agent_protocol")
+        return token, tracer.start_as_current_span(
+            name,
+            kind=trace.SpanKind.SERVER,
+            attributes=attributes or {},
+        )
+    except Exception:  # noqa: BLE001 — tracing must never break a turn
+        log.warning("Could not start the turn span", exc_info=True)
+        return token, None
 
 
 def _instrument(framework: str, provider: Any) -> None:

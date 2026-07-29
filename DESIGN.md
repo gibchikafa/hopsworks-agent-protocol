@@ -67,7 +67,21 @@ Handlers may declare a second parameter (`def chat(request, ctx)`); the SDK insp
 
 ### 3c. Correlation, not evaluation
 
-The SDK guarantees stable `response_id` / `message_id` (generated up front so `ctx.response_id` matches the response the client receives) and, when tracing is active, stamps `conversation_id` / `response_id` / `message_id` / `deployment_id` / framework on the current span and surfaces `trace_id` in the response metadata. This makes it *possible* for a separate evaluation system to join chat turns, feedback, and traces — but feedback/ratings/scores are deliberately **not** in the SDK (see non-goals). The SDK's job ends at emitting correlatable ids.
+The SDK owns one **turn span** per request: a `SERVER` span opened from the caller's extracted W3C context and held open for the whole turn (for streaming, around the generator — the route returns before the first token, so a span opened there would close too early). It carries agent identity, `conversation_id` / `response_id` / `message_id` / `deployment_id` / framework, and — via `input.value` / `output.value` — the **authoritative** input and final answer, taken from the request and response objects rather than reconstructed downstream from whichever child span looked most like an answer.
+
+Three things follow, and none of them work without it:
+
+- **Continuation.** Before, the SDK built a `TracerProvider` but installed no server instrumentation, so an incoming `traceparent` was ignored and every request began a fresh trace. A caller that generated a trace id — an eval runner — could never find the trace the agent produced.
+- **Correlation actually firing.** `_annotate_span` stamped `trace.get_current_span()`, which by finalize time is the invalid default span: the framework's spans have already ended. It was a silent no-op. It now prefers the turn span.
+- **Baggage reaching storage.** A `BaggageSpanProcessor` copies `hopsworks.eval.*` entries onto every span, since baggage rides the request context but never becomes span attributes on its own — and the OTLP sidecar only ever sees spans. Only allowlisted prefixes are copied: baggage is caller-controlled, and copying it wholesale would let any caller write arbitrary attributes into the project's trace tables.
+
+The manifest reports `capabilities.trace_correlation` and `capabilities.eval_mode` so a runner can check a deployment *before* firing a suite at it instead of inferring from broken results — absent means an SDK too old to correlate at all.
+
+Attribute names live in `conventions.py`, which is deliberately dependency-free so the sidecar and the eval runner can import it. Three components agreeing on string literals by copy-paste is how they stop agreeing.
+
+This makes it *possible* for a separate evaluation system to join chat turns, feedback, and traces — but feedback/ratings/scores are deliberately **not** in the SDK (see non-goals). The SDK's job ends at emitting correlatable ids.
+
+One consequence for existing deployments: the turn span is now the root, where previously the framework's outermost span was. Trace latency in `otel_trace_metrics` therefore starts including SDK overhead and post-answer memory finalization — which is what the client actually waits for, but it will shift the numbers when a deployment upgrades.
 
 ### 4. Memory is opt-in, keyed by `conversation_id`, and tiered
 

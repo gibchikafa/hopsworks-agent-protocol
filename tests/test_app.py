@@ -54,7 +54,7 @@ class TestManifestAndHealth:
         client = TestClient(build_basic_app())
         manifest = client.get("/.well-known/hopsworks-agent.json").json()
         assert manifest["protocol"] == "hopsworks-agent"
-        assert manifest["protocol_version"] == "1.3"
+        assert manifest["protocol_version"] == "1.4"
         assert manifest["agent"]["name"] == "Test agent"
         assert manifest["endpoints"] == {"chat": "/v1/chat"}
         assert manifest["capabilities"]["streaming"] is False
@@ -1201,6 +1201,8 @@ class TestStreamAbort:
             await app._open_turn(ctx)
 
             class _Raw:
+                headers: dict = {}
+
                 async def is_disconnected(self):
                     return False
 
@@ -1215,6 +1217,57 @@ class TestStreamAbort:
             rows = conn.execute(memory._table.select()).fetchall()
         assert [r.status for r in rows] == ["abandoned"]
         assert memory.get("c1") == []
+
+    def test_the_turn_closes_inside_aclose_not_at_loop_shutdown(self, tmp_path):
+        """Assert while the loop is still running.
+
+        The test above reads the store after ``asyncio.run`` returns, and
+        ``asyncio.run`` calls ``shutdown_asyncgens()`` on its way out — which
+        closes any async generator whose cleanup was still pending and makes
+        the turn look finalized even when the disconnect path did not do it.
+        Under uvicorn the loop is never shut down per request, so cleanup
+        deferred to generator finalization means the turn stays open with its
+        question already recorded. This asserts the finalization happened by
+        the time ``aclose()`` returned.
+        """
+        import asyncio
+
+        from hopsworks_agent_protocol import ManagedMemoryService
+
+        memory = ManagedMemoryService(
+            url=f"sqlite:///{tmp_path}/m.db", table_name="agent_memory_messages_t"
+        )
+        app = AgentApp(memory=memory)
+
+        @app.stream
+        async def stream(request):
+            yield "first"
+            await asyncio.sleep(10)
+            yield "never"
+
+        async def scenario():
+            from hopsworks_agent_protocol.models import ChatRequest
+
+            request = ChatRequest.model_validate(make_request("question", "c1"))
+            ctx = app._prepare(request)
+            await app._open_turn(ctx)
+
+            class _Raw:
+                headers: dict = {}
+
+                async def is_disconnected(self):
+                    return False
+
+            agen = app._stream_events(ctx, _Raw())
+            await agen.__anext__()
+            await agen.aclose()
+            with memory._engine.connect() as conn:
+                return [
+                    r.status
+                    for r in conn.execute(memory._table.select()).fetchall()
+                ]
+
+        assert asyncio.run(scenario()) == ["abandoned"]
 
 
 def _fake_summarizer(calls):
@@ -2836,3 +2889,166 @@ class TestConversationSubject:
 
         body = TestClient(app).get("/v1/conversations/c1/messages").json()
         assert body["subject"] is None
+
+
+class TestTurnSpan:
+    """The turn span is what makes a trace findable by the caller that asked
+    for it. Without it the agent starts a fresh trace per request and the eval
+    runner's trial rows point at trace ids that were never created."""
+
+    def _traced_app(self, **kwargs):
+        pytest.importorskip("opentelemetry.sdk")
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+            InMemorySpanExporter,
+        )
+
+        from hopsworks_agent_protocol.tracing import install_baggage_propagation
+
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        install_baggage_propagation(provider)
+
+        app = AgentApp(name="Traced agent", tracing=False, **kwargs)
+        app.tracer_provider = provider
+
+        @app.chat
+        async def chat(request):
+            return AgentResponse.text(
+                text=f"echo: {request.text}",
+                usage={"input_tokens": 11, "output_tokens": 7},
+            )
+
+        return app, exporter
+
+    @staticmethod
+    def _attrs(exporter):
+        spans = exporter.get_finished_spans()
+        assert spans, "no span was exported"
+        return dict(spans[-1].attributes)
+
+    def test_continues_the_callers_trace(self):
+        app, exporter = self._traced_app()
+        trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
+        client = TestClient(app)
+        body = client.post(
+            "/v1/chat",
+            json=make_request("hi"),
+            headers={"traceparent": f"00-{trace_id}-00f067aa0ba902b7-01"},
+        ).json()
+
+        span = exporter.get_finished_spans()[-1]
+        assert format(span.get_span_context().trace_id, "032x") == trace_id
+        # and the caller can find it from the response alone
+        assert body["metadata"]["trace_id"] == trace_id
+
+    def test_copies_eval_baggage_onto_the_span(self):
+        app, exporter = self._traced_app()
+        TestClient(app).post(
+            "/v1/chat",
+            json=make_request("hi"),
+            headers={
+                "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                "baggage": "hopsworks.eval.run_id=run_7,hopsworks.eval.trial_index=2",
+            },
+        )
+        attrs = self._attrs(exporter)
+        assert attrs["hopsworks.eval.run_id"] == "run_7"
+        assert attrs["hopsworks.eval.trial_index"] == "2"
+
+    def test_drops_baggage_outside_the_allowlist(self):
+        # baggage is caller-controlled, so an arbitrary key must not become an
+        # attribute in the project's trace tables
+        app, exporter = self._traced_app()
+        TestClient(app).post(
+            "/v1/chat",
+            json=make_request("hi"),
+            headers={"baggage": "attacker=1,hopsworks.eval.run_id=run_7"},
+        )
+        attrs = self._attrs(exporter)
+        assert "attacker" not in attrs
+        assert attrs["hopsworks.eval.run_id"] == "run_7"
+
+    def test_carries_authoritative_input_and_output(self):
+        app, exporter = self._traced_app()
+        TestClient(app).post("/v1/chat", json=make_request("what is attention?"))
+        attrs = self._attrs(exporter)
+        assert attrs["input.value"] == "what is attention?"
+        assert attrs["output.value"] == "echo: what is attention?"
+        assert attrs["openinference.span.kind"] == "AGENT"
+        assert attrs["gen_ai.usage.input_tokens"] == 11
+        assert attrs["gen_ai.usage.output_tokens"] == 7
+
+    def test_failed_turn_is_an_error_span(self):
+        app, exporter = self._traced_app()
+
+        @app.chat
+        async def chat(request):
+            raise AgentError("It broke", code="boom", status_code=400)
+
+        TestClient(app).post("/v1/chat", json=make_request("hi"))
+        span = exporter.get_finished_spans()[-1]
+        assert span.status.status_code.name == "ERROR"
+
+    def test_streaming_span_spans_the_whole_generator(self):
+        app, exporter = self._traced_app()
+
+        @app.stream
+        async def stream(request):
+            yield "one "
+            yield "two"
+
+        with TestClient(app).stream(
+            "POST", "/v1/chat/stream", json=make_request("hi")
+        ) as response:
+            frames = parse_sse("".join(response.iter_text()))
+
+        assert [e for e, _ in frames] == ["message.delta", "message.delta",
+                                          "message.completed"]
+        attrs = self._attrs(exporter)
+        assert attrs["output.value"] == "one two"
+
+    def test_untraced_app_still_serves(self):
+        # tracing off is the common case; the span must degrade to nothing
+        app = build_basic_app()
+        body = TestClient(app).post("/v1/chat", json=make_request("hi")).json()
+        assert body["message"]["content"][0]["text"] == "echo: hi"
+        assert "trace_id" not in body["metadata"]
+
+
+class TestEvalCapabilities:
+    """The manifest is how a runner learns what a deployment can do before it
+    fires a suite at it, rather than discovering it from broken results."""
+
+    def test_trace_correlation_reflects_tracing(self):
+        app = AgentApp(name="t", tracing=False)
+        manifest = TestClient(app).get("/.well-known/hopsworks-agent.json").json()
+        assert manifest["capabilities"]["trace_correlation"] is False
+
+        app.tracer_provider = object()
+        manifest = TestClient(app).get("/.well-known/hopsworks-agent.json").json()
+        assert manifest["capabilities"]["trace_correlation"] is True
+
+    def test_eval_mode_comes_from_the_platform(self, monkeypatch):
+        from hopsworks_agent_protocol import conventions
+
+        monkeypatch.setenv(conventions.EVAL_MODE_ENV, "true")
+        manifest = (
+            TestClient(AgentApp(name="t"))
+            .get("/.well-known/hopsworks-agent.json")
+            .json()
+        )
+        assert manifest["capabilities"]["eval_mode"] is True
+
+    def test_eval_mode_defaults_off(self, monkeypatch):
+        from hopsworks_agent_protocol import conventions
+
+        monkeypatch.delenv(conventions.EVAL_MODE_ENV, raising=False)
+        manifest = (
+            TestClient(AgentApp(name="t"))
+            .get("/.well-known/hopsworks-agent.json")
+            .json()
+        )
+        assert manifest["capabilities"]["eval_mode"] is False
