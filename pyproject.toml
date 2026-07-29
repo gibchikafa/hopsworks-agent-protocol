@@ -42,6 +42,12 @@ eval = [
     "pandas>=1.5",
     "requests>=2.28",
 ]
+# The LLM judge's provider. Separate from [eval] because most graders need no
+# model at all, and a run that uses none should not carry a provider SDK.
+eval-judge = [
+    "hopsworks-agent-protocol[eval]",
+    "anthropic>=0.40",
+]
 dev = [
     "pytest",
     "httpx",

@@ -30,6 +30,7 @@ from .graders import (
     ToolCallGrader,
     ToolOrderGrader,
 )
+from .judges import DEFAULT_MODEL, LlmJudgeGrader, anthropic_completer
 from .metrics import run_metrics
 from .models import ExecutionMode, Suite, SuiteType, Task
 from .runner import RunnerConfig, SuiteRefused, run_suite
@@ -45,7 +46,7 @@ def _api(host: str, project_id: int) -> str:
     return f"{host.rstrip('/')}/hopsworks-api/api/project/{project_id}/agent-evals"
 
 
-def _graders_for(task: Task) -> list[Grader]:
+def _graders_for(task: Task, judge: LlmJudgeGrader | None = None) -> list[Grader]:
     """Which graders a task gets, inferred from what it declares.
 
     A task that names no expectation and no tools would otherwise be graded by
@@ -53,6 +54,11 @@ def _graders_for(task: Task) -> list[Grader]:
     ungradable — which is the honest answer rather than a free pass.
     """
     graders: list[Grader] = []
+    if judge is not None and task.rubric:
+        # A rubric is a request for judgement that no string comparison can
+        # answer, so it is the one thing that earns the cost and the
+        # uncertainty of a model in the loop.
+        graders.append(judge)
     if task.expected_output:
         # `contains` rather than exact match: for free text an exact match
         # asserts the model's phrasing rather than its correctness
@@ -64,6 +70,26 @@ def _graders_for(task: Task) -> list[Grader]:
     if task.required_tools:
         graders.append(NoToolErrorGrader())
     return graders
+
+
+def _judge_for(project: Any) -> LlmJudgeGrader | None:
+    """An LLM judge, if the project has configured one.
+
+    The key comes from a project secret named ``EVAL_JUDGE_API_KEY``: the
+    provider is the project's choice, and a run should never carry credentials
+    of its own. Absent, tasks with rubrics simply go ungradable — better than a
+    run that quietly grades nothing while looking complete.
+    """
+    try:
+        secret = project.get_secrets_api().get_secret("EVAL_JUDGE_API_KEY")
+        api_key = secret.value
+    except Exception:  # noqa: BLE001 — no judge configured is a normal state
+        log.info("no EVAL_JUDGE_API_KEY secret; rubric tasks will be ungradable")
+        return None
+
+    model = os.environ.get("EVAL_JUDGE_MODEL", DEFAULT_MODEL)
+    log.info("LLM judge enabled (model=%s)", model)
+    return LlmJudgeGrader(anthropic_completer(api_key, model), model=model)
 
 
 def _to_suite(run: dict[str, Any], tasks: list[dict[str, Any]]) -> Suite:
@@ -139,7 +165,7 @@ def _write_results(feature_store: Any, result: Any, run: dict[str, Any]) -> None
             "ungradable": g.ungradable,
             "reason": g.reason,
             "assertions_json": json.dumps(g.assertions),
-            "judge_model": "",
+            "judge_model": str(g.assertions.get("judge_model", "")),
             "grader_version": "1",
             "created_at": now,
         }
@@ -207,6 +233,7 @@ def main() -> None:
 
         from .client import HopsworksAgentClient
 
+        judge = _judge_for(project)
         client = HopsworksAgentClient(
             session=session,
             api_base=host,
@@ -222,7 +249,7 @@ def main() -> None:
             deployment_id=run["deploymentId"],
             # per task, not one list for the suite: which graders apply depends
             # on what each task declares
-            graders=_graders_for,
+            graders=lambda t: _graders_for(t, judge),
             config=RunnerConfig(
                 n_trials=run.get("nTrials", 1),
                 readiness_timeout_s=args.readiness_timeout_s,

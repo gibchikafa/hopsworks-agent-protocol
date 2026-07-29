@@ -1,0 +1,142 @@
+"""The LLM judge, which is the least trustworthy grader in the set.
+
+Almost every test is about that: what happens when the judge misbehaves. A
+judge that fails must never produce a score, because a score is a claim about
+the agent and a broken judge has made no claim about anything.
+"""
+
+import pytest
+
+from hopsworks_agent_eval.judges import (
+    LlmJudgeGrader,
+    _json_from,
+    pairwise_verdict,
+)
+from hopsworks_agent_eval.models import Task, Trial
+
+
+def task(**kwargs):
+    defaults = {
+        "task_id": "t1",
+        "input_messages": '[{"role": "user", "content": "why is the sky blue?"}]',
+        "rubric": "Mentions scattering. Does not invent a source.",
+    }
+    defaults.update(kwargs)
+    return Task(**defaults)
+
+
+def trial(answer="Rayleigh scattering."):
+    return Trial(trial_id="x", run_id="r", task_id="t1", task_version=1,
+                 trial_index=0, deployment_id=7, final_output=answer)
+
+
+def judge(reply, **kwargs):
+    return LlmJudgeGrader(lambda _prompt: reply, **kwargs)
+
+
+GOOD = '{"score": 0.9, "passed": true, "reason": "Correct.", "criteria": {"accuracy": 0.9}}'
+
+
+class TestGrading:
+    def test_a_clean_verdict_is_used(self):
+        result = judge(GOOD).grade(task(), trial(), None)
+        assert result.passed is True
+        assert result.score == pytest.approx(0.9)
+        assert result.ungradable is False
+
+    def test_the_judge_model_is_recorded(self):
+        # a score that moved because the judge changed is not an agent
+        # regression, and without the model on the row the two look identical
+        result = judge(GOOD, model="claude-opus-5").grade(task(), trial(), None)
+        assert result.assertions["judge_model"] == "claude-opus-5"
+
+    def test_the_models_own_pass_decision_wins_over_the_threshold(self):
+        # a rubric can encode a bar a single number cannot
+        reply = '{"score": 0.5, "passed": true, "reason": "meets the bar"}'
+        assert judge(reply, pass_threshold=0.9).grade(task(), trial(), None).passed
+
+    def test_the_threshold_applies_when_the_model_gives_no_verdict(self):
+        reply = '{"score": 0.5, "reason": "partial"}'
+        assert judge(reply, pass_threshold=0.7).grade(task(), trial(), None).passed is False
+
+    def test_scores_are_clamped(self):
+        # a model returning 1.4 has not found extra quality
+        reply = '{"score": 1.4, "passed": true, "reason": "great"}'
+        assert judge(reply).grade(task(), trial(), None).score == 1.0
+
+
+class TestWhenTheJudgeMisbehaves:
+    """Every one of these must be ungradable, never a zero."""
+
+    def test_a_judge_that_raises_is_ungradable(self):
+        def explode(_prompt):
+            raise RuntimeError("rate limited")
+
+        result = LlmJudgeGrader(explode).grade(task(), trial(), None)
+        assert result.ungradable is True
+        assert result.score == 0.0
+        assert "rate limited" in result.reason
+
+    def test_unparseable_output_is_ungradable(self):
+        result = judge("I think it was pretty good actually").grade(task(), trial(), None)
+        assert result.ungradable is True
+
+    def test_a_non_numeric_score_is_ungradable(self):
+        reply = '{"score": "high", "passed": true, "reason": "good"}'
+        assert judge(reply).grade(task(), trial(), None).ungradable is True
+
+    def test_grading_against_nothing_is_refused(self):
+        # a judge given no rubric and no expected answer still returns a number,
+        # and that number is noise dressed as a measurement
+        bare = task(rubric="", expected_output="")
+        assert judge(GOOD).grade(bare, trial(), None).ungradable is True
+
+    def test_an_empty_answer_is_ungradable(self):
+        assert judge(GOOD).grade(task(), trial(answer=""), None).ungradable is True
+
+
+class TestJsonSalvage:
+    def test_plain_json(self):
+        assert _json_from('{"score": 1}') == {"score": 1}
+
+    def test_fenced_json(self):
+        # models fence output constantly; discarding a valid judgement over
+        # formatting would be its own kind of wrong
+        assert _json_from('```json\n{"score": 1}\n```') == {"score": 1}
+
+    def test_json_with_a_preamble(self):
+        assert _json_from('Here is my grade:\n{"score": 0.5}') == {"score": 0.5}
+
+    def test_prose_is_not_salvaged_into_something(self):
+        assert _json_from("looks fine to me") is None
+
+    def test_a_json_array_is_not_a_verdict(self):
+        assert _json_from("[1, 2, 3]") is None
+
+
+class TestPairwise:
+    def test_a_winner_is_reported(self):
+        result = pairwise_verdict(
+            lambda _p: '{"winner": "b", "reason": "more complete"}',
+            "q", "short", "thorough",
+        )
+        assert result["winner"] == "b"
+
+    def test_a_tie_is_kept_as_a_tie(self):
+        # forcing a winner would read downstream as a real difference between
+        # two versions that are equivalent — the common case when comparing
+        # close deployments
+        result = pairwise_verdict(
+            lambda _p: '{"winner": "tie", "reason": "equivalent"}', "q", "a", "b"
+        )
+        assert result["winner"] == "tie"
+
+    def test_an_unusable_verdict_is_unknown_not_a_winner(self):
+        result = pairwise_verdict(lambda _p: "the first one I guess", "q", "a", "b")
+        assert result["winner"] == "unknown"
+
+    def test_a_failed_call_is_unknown(self):
+        def explode(_p):
+            raise ConnectionError("no route")
+
+        assert pairwise_verdict(explode, "q", "a", "b")["winner"] == "unknown"

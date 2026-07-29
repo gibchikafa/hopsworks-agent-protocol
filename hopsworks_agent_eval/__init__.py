@@ -34,11 +34,15 @@ from .promotion import (
     tasks_from_trace,
 )
 from .client import HopsworksAgentClient
+from .judges import LlmJudgeGrader, anthropic_completer, pairwise_verdict
 from .runner import RunnerConfig, SuiteRefused, run_suite
 
 __all__ = [
     "ExecutionMode",
     "HopsworksAgentClient",
+    "LlmJudgeGrader",
+    "anthropic_completer",
+    "pairwise_verdict",
     "RunnerConfig",
     "Suite",
     "SuiteRefused",
