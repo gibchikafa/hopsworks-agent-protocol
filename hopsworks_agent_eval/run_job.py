@@ -215,13 +215,14 @@ def main() -> None:
             deployment_id=run["deploymentId"],
         )
 
-        graders = _graders_for(suite.tasks[0]) if suite.tasks else []
         result = run_suite(
             client,
             suite,
             run_id=args.run_id,
             deployment_id=run["deploymentId"],
-            graders=graders,
+            # per task, not one list for the suite: which graders apply depends
+            # on what each task declares
+            graders=_graders_for,
             config=RunnerConfig(
                 n_trials=run.get("nTrials", 1),
                 readiness_timeout_s=args.readiness_timeout_s,

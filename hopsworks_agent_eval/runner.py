@@ -18,7 +18,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
 from .graders import Grader, Trace, run_graders, verdict
 from .models import (
@@ -291,11 +291,18 @@ def run_suite(
     *,
     run_id: str,
     deployment_id: int,
-    graders: Sequence[Grader],
+    graders: Sequence[Grader] | Callable[[Task], Sequence[Grader]],
     config: RunnerConfig | None = None,
     sleep=time.sleep,
 ) -> RunResult:
-    """Execute every task, ``n_trials`` times each, and grade the results."""
+    """Execute every task, ``n_trials`` times each, and grade the results.
+
+    ``graders`` may be one list applied to every task, or a function of the
+    task. Per-task matters more than it looks: which graders apply depends on
+    what a task declares, so one fixed list either judges a task on tools it
+    never claimed to use, or judges nothing at all and reports a run that says
+    nothing while looking complete.
+    """
     config = config or RunnerConfig()
     check_deployment_supports(suite, client.manifest())
 
@@ -316,11 +323,13 @@ def run_suite(
 
     # Bounded: a full suite against a shared endpoint is otherwise a
     # self-inflicted load test on production capacity.
+    resolve = graders if callable(graders) else (lambda _task: graders)
+
     with ThreadPoolExecutor(max_workers=max(1, config.max_concurrency)) as pool:
         futures = [
             pool.submit(
                 _run_trial, client, suite, task, index, run_id, deployment_id,
-                graders, config, sleep,
+                resolve(task), config, sleep,
             )
             for task, index in work
         ]

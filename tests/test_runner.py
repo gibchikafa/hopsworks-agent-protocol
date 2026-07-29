@@ -395,3 +395,42 @@ class TestToolGraders:
             {"tool_names": '["refund", "lookup"]'},
         )
         assert result.passed is False
+
+
+class TestPerTaskGraders:
+    """Which graders apply depends on what each task declares.
+
+    One fixed list for a whole suite either judges a task on tools it never
+    claimed to use, or judges nothing at all — and a run that graded nothing
+    reports cleanly while saying nothing, which is the worst of both.
+    """
+
+    def test_each_task_gets_its_own_graders(self):
+        answered = suite(tasks=[
+            task(task_id="answer", expected_output="4"),
+            task(task_id="tools", expected_output="", required_tools=["search"]),
+        ])
+
+        def per_task(t):
+            return [ExactMatchGrader()] if t.expected_output else [ToolCallGrader()]
+
+        result = go(FakeClient(trace={"root_span_id": "a", "tool_names": '["search"]'}),
+                    answered, graders=per_task)
+
+        by_task = {t.task_id: [g.grader_type for g in t.grader_results]
+                   for t in result.trials}
+        assert by_task["answer"] == ["exact_match"]
+        assert by_task["tools"] == ["tool_call"]
+
+    def test_a_plain_list_still_applies_to_every_task(self):
+        # the simple case keeps working; per-task is an option, not a burden
+        result = go(FakeClient(), suite(tasks=[task(task_id="a"), task(task_id="b")]),
+                    graders=[ExactMatchGrader()])
+        assert all(len(t.grader_results) == 1 for t in result.trials)
+
+    def test_a_task_declaring_nothing_is_ungradable_not_passing(self):
+        # silence must not read as success
+        result = go(FakeClient(), suite(tasks=[task(task_id="empty")]),
+                    graders=lambda _t: [])
+        assert result.trials[0].status is TrialStatus.TRACE_MISSING
+        assert result.trials[0].grader_results == []
