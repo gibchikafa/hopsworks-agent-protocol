@@ -33,10 +33,12 @@ from .promotion import (
     promote_trace,
     tasks_from_trace,
 )
+from .client import HopsworksAgentClient
 from .runner import RunnerConfig, SuiteRefused, run_suite
 
 __all__ = [
     "ExecutionMode",
+    "HopsworksAgentClient",
     "RunnerConfig",
     "Suite",
     "SuiteRefused",
