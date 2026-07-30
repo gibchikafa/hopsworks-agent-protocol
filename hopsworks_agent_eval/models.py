@@ -159,6 +159,12 @@ class Trial:
     error_type: str = ""
     error_message: str = ""
     grader_results: list[GraderResult] = field(default_factory=list)
+    # Read off the trace for run-level tool metrics. In memory only: the trials
+    # feature group has no column for them, and adding one needs a version bump
+    # that would leave existing projects on the old schema. The rate they feed
+    # is written as an ordinary key/value metric row instead.
+    tool_error_count: int | None = None
+    tool_call_count: int | None = None
     started_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
     completed_at: datetime | None = None
 

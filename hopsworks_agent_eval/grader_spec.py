@@ -35,6 +35,10 @@ from .graders import (
     NoToolErrorGrader,
     RegexGrader,
     SqlStateGrader,
+    ToolArgumentGrader,
+    ToolLatencyGrader,
+    ToolRetryGrader,
+    UnnecessaryToolGrader,
     ToolCallGrader,
     ToolOrderGrader,
 )
@@ -52,6 +56,12 @@ SPEC_TYPES = (
     "tool_call",
     "tool_order",
     "no_tool_error",
+    "tool_arguments",
+    "no_unnecessary_tools",
+    "tool_retries",
+    "tool_latency",
+    "tool_arguments_judge",
+    "tool_result_used",
     "llm_judge",
     "pairwise",
     "sql_state",
@@ -98,6 +108,30 @@ def _one(
         return ToolOrderGrader(name=name)
     if kind == "no_tool_error":
         return NoToolErrorGrader(name=name)
+    if kind == "tool_arguments":
+        keys = entry.get("required_keys") or entry.get("requiredKeys") or []
+        return ToolArgumentGrader(
+            tool=str(entry.get("tool") or ""),
+            required_keys=[str(k) for k in keys],
+            must_parse=bool(entry.get("must_parse", True)),
+            name=name,
+        )
+    if kind == "no_unnecessary_tools":
+        allowed = entry.get("allowed") or []
+        return UnnecessaryToolGrader(allowed=[str(a) for a in allowed], name=name)
+    if kind == "tool_retries":
+        return ToolRetryGrader(
+            max_retries=int(entry.get("max_retries", 0)),
+            tool=str(entry.get("tool") or ""),
+            name=name,
+        )
+    if kind == "tool_latency":
+        budget = entry.get("max_ms")
+        if budget is None:
+            raise SpecError("a tool_latency grader needs max_ms")
+        return ToolLatencyGrader(
+            max_ms=float(budget), tool=str(entry.get("tool") or ""), name=name
+        )
     if kind == "human_review":
         return HumanReviewGrader(prompt=str(entry.get("prompt") or ""), name=name)
     if kind == "sql_state":
@@ -108,10 +142,15 @@ def _one(
             sql=str(sql), expect=entry.get("expect"), query=query, name=name
         )
 
-    if kind in ("llm_judge", "pairwise"):
+    if kind in ("llm_judge", "pairwise", "tool_arguments_judge", "tool_result_used"):
         # Imported here because judges pulls in the provider plumbing, and a
         # suite with no judge configured should not need it loaded.
-        from .judges import LlmJudgeGrader, PairwiseGrader
+        from .judges import (
+            LlmJudgeGrader,
+            PairwiseGrader,
+            ToolArgumentsJudge,
+            ToolResultUsedJudge,
+        )
 
         if judge_completer is None:
             # Not an error: a project without a judge key still runs its
@@ -125,6 +164,12 @@ def _one(
                 name=name,
                 pass_threshold=float(entry.get("pass_threshold", 0.7)),
             )
+        if kind == "tool_arguments_judge":
+            return ToolArgumentsJudge(
+                judge_completer, tool=str(entry.get("tool") or ""), name=name
+            )
+        if kind == "tool_result_used":
+            return ToolResultUsedJudge(judge_completer, name=name)
         return PairwiseGrader(
             judge_completer, reference=str(entry.get("reference") or ""), name=name
         )

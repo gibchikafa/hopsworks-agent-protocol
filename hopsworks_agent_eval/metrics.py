@@ -78,6 +78,17 @@ def _by_task(trials: Sequence[Trial]) -> dict[str, list[Trial]]:
     return dict(grouped)
 
 
+def _tool_error_rate(trials: Sequence[Trial]) -> float:
+    """Share of trials with a visible trajectory in which a tool call failed."""
+    seen = [
+        t for t in trials
+        if t.trace_status is not TraceStatus.MISSING and t.tool_error_count is not None
+    ]
+    if not seen:
+        return 0.0
+    return sum(1 for t in seen if t.tool_error_count) / len(seen)
+
+
 def run_metrics(run_id: str, suite_id: str, deployment_id: int,
                 trials: Sequence[Trial]) -> list[dict[str, Any]]:
     """One row per metric, scoped to the run."""
@@ -103,6 +114,11 @@ def run_metrics(run_id: str, suite_id: str, deployment_id: int,
             / len(trials) if trials else 0.0
         ),
         "flaky_task_count": float(len(flaky_tasks(trials))),
+        # Trials in which at least one tool call failed, over trials whose
+        # trajectory was actually visible. Scoped that way on purpose: dividing
+        # by every trial would report an observability gap as a healthy tool
+        # layer, since a trial with no trace contributes no errors.
+        "tool_error_rate": _tool_error_rate(trials),
     }
 
     task_count = len({t.task_id for t in trials})

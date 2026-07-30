@@ -59,6 +59,23 @@ GEN_AI_TOOL_CALL_ID = "gen_ai.tool.call.id"
 GEN_AI_TOOL_CALL_ARGUMENTS = "gen_ai.tool.call.arguments"
 GEN_AI_TOOL_CALL_RESULT = "gen_ai.tool.call.result"
 
+# Where a tool call's arguments and result actually turn up, most specific
+# first. The design doc names `gen_ai.tool.*` and OpenInference; in practice
+# LlamaIndex and LangChain instrumentation write `input.value` / `output.value`
+# on the TOOL span and nothing else, so reading one convention would see
+# arguments on almost no real trace. First non-empty wins.
+TOOL_ARGUMENT_KEYS = (
+    GEN_AI_TOOL_CALL_ARGUMENTS,
+    "tool.parameters",
+    "tool.arguments",
+    INPUT_VALUE,
+)
+TOOL_RESULT_KEYS = (
+    GEN_AI_TOOL_CALL_RESULT,
+    "tool.result",
+    OUTPUT_VALUE,
+)
+
 # ── model / provider ──────────────────────────────────────────────────────
 
 GEN_AI_REQUEST_MODEL = "gen_ai.request.model"

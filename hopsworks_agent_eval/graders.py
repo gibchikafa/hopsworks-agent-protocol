@@ -426,3 +426,252 @@ AWAITING_REVIEW = "awaiting_review"
 def awaits_review(results: Sequence[GraderResult]) -> bool:
     """Whether any grader deferred to a person."""
     return any(r.assertions.get(AWAITING_REVIEW) for r in results)
+
+
+# ── tool-use graders ──────────────────────────────────────────────────────
+#
+# All of these read `trace["tool_calls"]`: the ordered list of TOOL spans with
+# their arguments, results, status and duration. Two rules they share.
+#
+# **Missing instrumentation is ungradable, never a failure.** Whether a
+# framework writes tool arguments onto its spans is a property of the
+# framework, not of the agent. Scoring their absence as a failing trial would
+# report a tracing gap as a misbehaving agent — the same mistake as scoring a
+# missing trace zero.
+#
+# **A tool that ran is judged; a tool that did not is not.** A grader scoped to
+# one tool that never appears returns ungradable rather than passing vacuously,
+# because "it never called the tool" is a `tool_call` verdict and saying it
+# twice in two graders makes one of them noise.
+
+
+def _tool_calls(trace: Trace | None) -> list[dict[str, Any]] | None:
+    if trace is None:
+        return None
+    calls = trace.get("tool_calls")
+    return calls if isinstance(calls, list) else None
+
+
+def _scoped(calls: list[dict[str, Any]], tool: str) -> list[dict[str, Any]]:
+    return [c for c in calls if not tool or c.get("name") == tool]
+
+
+class ToolArgumentGrader:
+    """The arguments a tool was called with parse, and carry what they must.
+
+    Deterministic shape checking only: that the payload is JSON, and that the
+    keys someone said must be there are there. Whether the *values* make sense
+    for the question asked is a judgement, and lives in ToolArgumentsJudge.
+    """
+
+    type = "tool_arguments"
+    needs_trace = True
+
+    def __init__(
+        self,
+        tool: str = "",
+        required_keys: Sequence[str] = (),
+        *,
+        must_parse: bool = True,
+        name: str = "tool_arguments",
+    ):
+        self.tool = tool
+        self.required_keys = list(required_keys)
+        self.must_parse = must_parse
+        self.name = name
+
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+        calls = _tool_calls(trace)
+        if calls is None:
+            return _ungradable(self.name, self.type, "no trace: arguments unknown")
+        scoped = _scoped(calls, self.tool)
+        if not scoped:
+            return _ungradable(
+                self.name, self.type,
+                f"{self.tool or 'no tool'} was never called; that is a tool_call verdict",
+            )
+
+        checked = 0
+        problems: list[str] = []
+        for call in scoped:
+            raw = call.get("arguments") or ""
+            if not raw:
+                # instrumentation, not the agent
+                continue
+            checked += 1
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, TypeError):
+                if self.must_parse:
+                    problems.append(f"{call.get('name')}: arguments are not JSON")
+                continue
+            if not isinstance(parsed, dict):
+                if self.required_keys:
+                    problems.append(f"{call.get('name')}: arguments are not an object")
+                continue
+            missing = [k for k in self.required_keys if k not in parsed]
+            if missing:
+                problems.append(f"{call.get('name')}: missing {', '.join(missing)}")
+
+        if checked == 0:
+            return _ungradable(
+                self.name, self.type,
+                "no tool call recorded its arguments; the framework does not "
+                "appear to trace them",
+            )
+        passed = not problems
+        return GraderResult(
+            grader_name=self.name,
+            grader_type=self.type,
+            score=1.0 if passed else 0.0,
+            passed=passed,
+            reason="; ".join(problems[:5]),
+            assertions={"calls_checked": checked, "problems": problems},
+        )
+
+
+class UnnecessaryToolGrader:
+    """No tool ran that the task did not ask for.
+
+    ``allowed`` defaults to the task's required tools, which makes this the
+    complement of ToolCallGrader: that one asks whether everything needed
+    happened, this asks whether anything else did. A task with no required
+    tools and no explicit allowlist has nothing to say here and is ungradable —
+    the alternative would fail every agent that used a tool at all.
+    """
+
+    type = "no_unnecessary_tools"
+    needs_trace = True
+
+    def __init__(self, allowed: Sequence[str] = (), name: str = "no_unnecessary_tools"):
+        self.allowed = list(allowed)
+        self.name = name
+
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+        calls = _tool_calls(trace)
+        if calls is None:
+            return _ungradable(self.name, self.type, "no trace: tool calls unknown")
+        allowed = set(self.allowed or task.required_tools)
+        if not allowed:
+            return _ungradable(
+                self.name, self.type,
+                "the task names no tools, so there is nothing to call unnecessary",
+            )
+        extra = sorted({
+            c.get("name", "") for c in calls if c.get("name") and c.get("name") not in allowed
+        })
+        return GraderResult(
+            grader_name=self.name,
+            grader_type=self.type,
+            score=0.0 if extra else 1.0,
+            passed=not extra,
+            reason=f"called {', '.join(extra)}, which the task did not ask for" if extra else "",
+            assertions={"unexpected": extra, "allowed": sorted(allowed)},
+        )
+
+
+class ToolRetryGrader:
+    """The agent did not call the same tool the same way more than it should.
+
+    A retry is the *same tool with the same arguments*, not merely the same
+    tool twice: looking up two different orders is two calls, looking up the
+    same order twice is a retry. Where arguments are not traced the grader
+    falls back to counting repeats by name and says so, because a loose signal
+    labelled as such beats a confident wrong one.
+    """
+
+    type = "tool_retries"
+    needs_trace = True
+
+    def __init__(self, max_retries: int = 0, tool: str = "", name: str = "tool_retries"):
+        self.max_retries = max_retries
+        self.tool = tool
+        self.name = name
+
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+        calls = _tool_calls(trace)
+        if calls is None:
+            return _ungradable(self.name, self.type, "no trace: retries unknown")
+        scoped = _scoped(calls, self.tool)
+        if not scoped:
+            return _ungradable(self.name, self.type, "no tool calls to examine")
+
+        by_arguments = all(c.get("arguments") for c in scoped)
+        counts: dict[tuple[str, str], int] = {}
+        for call in scoped:
+            key = (call.get("name", ""), call.get("arguments", "") if by_arguments else "")
+            counts[key] = counts.get(key, 0) + 1
+
+        repeats = {name: count - 1 for (name, _), count in counts.items() if count > 1}
+        worst = max(repeats.values(), default=0)
+        passed = worst <= self.max_retries
+        basis = "identical arguments" if by_arguments else "name only, arguments not traced"
+        return GraderResult(
+            grader_name=self.name,
+            grader_type=self.type,
+            score=1.0 if passed else 0.0,
+            passed=passed,
+            reason="" if passed else (
+                f"{', '.join(f'{n} repeated {c}x' for n, c in sorted(repeats.items()))} "
+                f"(matched on {basis})"
+            ),
+            assertions={"retries": repeats, "matched_on": basis},
+        )
+
+
+class ToolLatencyGrader:
+    """No tool call took longer than its budget.
+
+    Judges the slowest single call rather than the total, because a budget is
+    usually about one call blocking a turn. A call whose span never closed has
+    no duration and is reported rather than treated as instant — an unclosed
+    span is the shape a hung tool leaves behind.
+    """
+
+    type = "tool_latency"
+    needs_trace = True
+
+    def __init__(self, max_ms: float, tool: str = "", name: str = "tool_latency"):
+        self.max_ms = float(max_ms)
+        self.tool = tool
+        self.name = name
+
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+        calls = _tool_calls(trace)
+        if calls is None:
+            return _ungradable(self.name, self.type, "no trace: durations unknown")
+        scoped = _scoped(calls, self.tool)
+        if not scoped:
+            return _ungradable(self.name, self.type, "no tool calls to time")
+
+        timed = [c for c in scoped if c.get("duration_ms") is not None]
+        unclosed = [c.get("name", "") for c in scoped if c.get("duration_ms") is None]
+        if not timed:
+            return _ungradable(
+                self.name, self.type,
+                "no tool span carried both a start and an end time",
+            )
+
+        slowest = max(timed, key=lambda c: c["duration_ms"])
+        over = slowest["duration_ms"] > self.max_ms
+        reasons = []
+        if over:
+            reasons.append(
+                f"{slowest.get('name')} took {slowest['duration_ms']:.0f}ms, "
+                f"budget {self.max_ms:.0f}ms"
+            )
+        if unclosed:
+            reasons.append(f"unfinished span for {', '.join(sorted(set(unclosed)))}")
+        return GraderResult(
+            grader_name=self.name,
+            grader_type=self.type,
+            score=0.0 if (over or unclosed) else 1.0,
+            passed=not over and not unclosed,
+            reason="; ".join(reasons),
+            assertions={
+                "slowest_ms": slowest["duration_ms"],
+                "slowest_tool": slowest.get("name"),
+                "budget_ms": self.max_ms,
+                "unclosed": sorted(set(unclosed)),
+            },
+        )

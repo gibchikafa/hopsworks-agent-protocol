@@ -262,6 +262,10 @@ def _run_trial(
     trace, trace_status = _await_trace(client, response.trace_id or trace_id, config, sleep)
     trial.trace_status = trace_status
 
+    if trace is not None:
+        trial.tool_error_count = int(trace.get("tool_error_count") or 0)
+        trial.tool_call_count = len(trace.get("tool_calls") or trace.get("tool_names") or [])
+
     trial.grader_results = run_graders(graders, task, trial, trace)
     outcome = verdict(trial.grader_results, suite.pass_policy, suite.pass_threshold)
 

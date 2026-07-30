@@ -300,3 +300,176 @@ class PairwiseGrader:
             reason=outcome.get("reason", ""),
             assertions={"winner": winner, "judge_model": self.model},
         )
+
+
+TOOL_ARGUMENTS_PROMPT = """You are checking whether an AI agent called a tool \
+with sensible arguments.
+
+The arguments are syntactically valid; that has already been checked. Judge only \
+whether they are the right arguments for what was asked — right entity, right \
+filters, nothing invented that the question did not contain.
+
+<question>
+{question}
+</question>
+
+<tool_calls>
+{calls}
+</tool_calls>
+{rubric_block}
+Reply with JSON only, no prose:
+{{"passed": <true|false>, "score": <0.0-1.0>, "reason": "<one sentence>"}}"""
+
+TOOL_RESULT_PROMPT = """You are checking whether an AI agent used what its tools \
+returned.
+
+The question is whether the final answer reflects the tool results: values taken \
+from them rather than invented, and a result that contradicts the answer treated \
+as a problem. An answer that ignores a tool result and happens to be right is \
+still a failure of this check.
+
+<question>
+{question}
+</question>
+
+<tool_results>
+{results}
+</tool_results>
+
+<final_answer>
+{answer}
+</final_answer>
+
+Reply with JSON only, no prose:
+{{"passed": <true|false>, "score": <0.0-1.0>, "reason": "<one sentence>"}}"""
+
+
+def _truncate(value: str, limit: int = 2000) -> str:
+    return value if len(value) <= limit else value[:limit] + "…[truncated]"
+
+
+def _tool_calls(trace) -> list:
+    if not trace:
+        return []
+    calls = trace.get("tool_calls")
+    return calls if isinstance(calls, list) else []
+
+
+def _judged(name: str, kind: str, model: str, raw: str) -> GraderResult:
+    """A judge reply turned into a result, or ungradable if it is not usable."""
+    parsed = _json_from(raw)
+    if parsed is None or "passed" not in parsed:
+        return _ungradable(
+            name, kind,
+            "judge did not return usable JSON; scoring zero here would blame the "
+            "agent for the judge",
+        )
+    try:
+        score = max(0.0, min(1.0, float(parsed.get("score", 1.0 if parsed["passed"] else 0.0))))
+    except (TypeError, ValueError):
+        score = 1.0 if parsed["passed"] else 0.0
+    return GraderResult(
+        grader_name=name,
+        grader_type=kind,
+        score=score,
+        passed=bool(parsed["passed"]),
+        reason=str(parsed.get("reason", ""))[:1000],
+        assertions={"judge_model": model},
+    )
+
+
+class ToolArgumentsJudge:
+    """Were the arguments *right*, not merely well-formed?
+
+    ToolArgumentGrader answers whether the payload parses and carries the keys
+    it must. This answers whether `{"order_id": "4471"}` was the right order to
+    look up given what the user asked — which no schema can express.
+    """
+
+    type = "tool_arguments_judge"
+    needs_trace = True
+
+    def __init__(
+        self,
+        complete: Callable[[str], str],
+        *,
+        tool: str = "",
+        name: str = "tool_arguments_judge",
+        model: str = DEFAULT_MODEL,
+    ):
+        self._complete = complete
+        self.tool = tool
+        self.name = name
+        self.model = model
+
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+        calls = [
+            c for c in _tool_calls(trace)
+            if (not self.tool or c.get("name") == self.tool) and c.get("arguments")
+        ]
+        if not calls:
+            return _ungradable(
+                self.name, self.type,
+                "no tool call recorded its arguments; nothing to judge",
+            )
+        rendered = "\n".join(
+            f"- {c.get('name')}({_truncate(c.get('arguments', ''), 600)})" for c in calls
+        )
+        prompt = TOOL_ARGUMENTS_PROMPT.format(
+            question=task.prompt,
+            calls=rendered,
+            rubric_block=f"\n<criteria>\n{task.rubric}\n</criteria>\n" if task.rubric else "",
+        )
+        try:
+            raw = self._complete(prompt)
+        except Exception as err:  # noqa: BLE001 — a broken judge is not a broken agent
+            log.warning("tool argument judge failed: %s", err)
+            return _ungradable(self.name, self.type, f"judge call failed: {err}")
+        return _judged(self.name, self.type, self.model, raw)
+
+
+class ToolResultUsedJudge:
+    """Did the answer actually use what the tools returned?
+
+    The failure this catches is an agent that calls the right tool, ignores what
+    comes back, and answers from the model's own prior — which every other
+    grader here scores as a pass when the prior happens to be right, and which
+    is exactly the behaviour that breaks when the underlying data changes.
+    """
+
+    type = "tool_result_used"
+    needs_trace = True
+
+    def __init__(
+        self,
+        complete: Callable[[str], str],
+        *,
+        name: str = "tool_result_used",
+        model: str = DEFAULT_MODEL,
+    ):
+        self._complete = complete
+        self.name = name
+        self.model = model
+
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+        results = [c for c in _tool_calls(trace) if c.get("result")]
+        if not results:
+            return _ungradable(
+                self.name, self.type,
+                "no tool call recorded a result; nothing to have used",
+            )
+        if not trial.final_output:
+            return _ungradable(self.name, self.type, "the agent produced no answer")
+
+        rendered = "\n".join(
+            f"- {c.get('name')} → {_truncate(c.get('result', ''), 800)}" for c in results
+        )
+        prompt = TOOL_RESULT_PROMPT.format(
+            question=task.prompt, results=rendered, answer=trial.final_output
+        )
+        try:
+            raw = self._complete(prompt)
+        except Exception as err:  # noqa: BLE001
+            log.warning("tool result judge failed: %s", err)
+            return _ungradable(self.name, self.type, f"judge call failed: {err}")
+        return _judged(self.name, self.type, self.model, raw)

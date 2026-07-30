@@ -12,7 +12,9 @@ written to measure rather than to grade.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Sequence
+
+from hopsworks_agent_protocol import conventions
 
 from .graders import Trace
 from .runner import AgentResponse
@@ -146,29 +148,61 @@ class HopsworksAgentClient:
             return None
         attributes = trace.get("spanAttributes") or []
 
-        kinds: dict[str, str] = {}
-        names: dict[str, str] = {}
+        by_span: dict[str, dict[str, str]] = {}
         for attribute in attributes:
-            key, span_id = attribute.get("attrKey"), attribute.get("spanId")
-            if key == "openinference.span.kind":
-                kinds[span_id] = (attribute.get("attrValue") or "").upper()
-            elif key in ("tool.name", "gen_ai.tool.name"):
-                names.setdefault(span_id, attribute.get("attrValue") or "")
+            span_id, key = attribute.get("spanId"), attribute.get("attrKey")
+            if span_id and key:
+                by_span.setdefault(span_id, {})[key] = attribute.get("attrValue") or ""
 
-        tool_spans = [s for s in spans if kinds.get(s.get("spanId")) == "TOOL"]
+        def first(attrs: dict[str, str], keys: Sequence[str]) -> str:
+            for key in keys:
+                if attrs.get(key):
+                    return attrs[key]
+            return ""
+
+        tool_spans = sorted(
+            (
+                s for s in spans
+                if (by_span.get(s.get("spanId"), {})
+                    .get(conventions.SPAN_KIND, "")
+                    .upper()) == conventions.SPAN_KIND_TOOL
+            ),
+            key=lambda s: s.get("startTimeNs") or 0,
+        )
+
+        tool_calls = []
+        for span in tool_spans:
+            attrs = by_span.get(span.get("spanId"), {})
+            start = span.get("startTimeNs") or 0
+            end = span.get("endTimeNs") or 0
+            tool_calls.append({
+                "span_id": span.get("spanId") or "",
+                "parent_span_id": span.get("parentSpanId") or "",
+                "name": first(attrs, (conventions.TOOL_NAME, conventions.GEN_AI_TOOL_NAME))
+                or span.get("name") or "",
+                "call_id": attrs.get(conventions.GEN_AI_TOOL_CALL_ID, ""),
+                "arguments": first(attrs, conventions.TOOL_ARGUMENT_KEYS),
+                "result": first(attrs, conventions.TOOL_RESULT_KEYS),
+                "status": str(span.get("statusCode") or ""),
+                # None rather than 0 when a span is missing an end time: a tool
+                # that "took 0ms" and one that was never closed are different
+                # facts, and a latency budget must not pass on the second.
+                "duration_ms": (end - start) / 1e6 if end and start else None,
+                "start_time_ns": start,
+            })
+
         return {
             "trace_id": trace_id,
             "root_span_id": next(
                 (s.get("spanId") for s in spans if not s.get("parentSpanId")), ""
             ),
-            # ordered by start time: a trajectory grader asks about sequence,
-            # so an arbitrary order would make its verdict arbitrary too
-            "tool_names": [
-                names.get(s.get("spanId")) or s.get("name") or ""
-                for s in sorted(tool_spans, key=lambda s: s.get("startTimeNs") or 0)
-            ],
+            # The full ordered sequence, repeats included. `agent_trace_features`
+            # stores distinct names instead, which is why retry and
+            # unnecessary-call analysis reads tool_calls and not that row.
+            "tool_names": [call["name"] for call in tool_calls],
+            "tool_calls": tool_calls,
             "tool_error_count": sum(
-                1 for s in tool_spans if str(s.get("statusCode", "")).endswith("ERROR")
+                1 for call in tool_calls if call["status"].endswith("ERROR")
             ),
             "span_count": len(spans),
         }
