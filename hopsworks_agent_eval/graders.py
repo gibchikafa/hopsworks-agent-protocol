@@ -289,13 +289,140 @@ def run_graders(
     return results
 
 
-def verdict(results: Sequence[GraderResult]) -> bool | None:
-    """Whether the trial passed: every gradable grader must pass.
+def verdict(
+    results: Sequence[GraderResult],
+    policy: "PassPolicy | str" = "all",
+    threshold: float = 0.7,
+) -> bool | None:
+    """Whether the trial passed, under the suite's policy.
 
     Returns ``None`` when nothing was gradable, which is not the same as
     failing — it means the trial says nothing about the agent either way.
+
+    ``all`` is the default and stays the default. The other two can turn a
+    failing trial into a passing one, so a suite has to ask for them:
+
+    - ``any`` — one grader passing is enough. For a task with several acceptable
+      answers expressed as separate checks.
+    - ``threshold`` — the mean score clears a bar. For rubric-led suites where
+      partial credit is the measure and a hard pass/fail per grader is not.
     """
     gradable = [r for r in results if not r.ungradable]
     if not gradable:
         return None
+
+    name = getattr(policy, "value", policy)
+    if name == "any":
+        return any(r.passed for r in gradable)
+    if name == "threshold":
+        return (sum(r.score for r in gradable) / len(gradable)) >= threshold
     return all(r.passed for r in gradable)
+
+
+class SqlStateGrader:
+    """Assert the world changed, not just that the agent said it did.
+
+    An agent that answers "I've cancelled order 4471" convincingly and calls
+    nothing is indistinguishable, on the text alone, from one that did the work.
+    This runs a read query and compares one value against what the task expects.
+
+    ``query`` is injected rather than opened here: the grader has no business
+    holding credentials, and the job that runs it already has a feature store
+    session. Without one the grader is ungradable — never passing, since "I
+    could not check" must not read as "the state was right".
+    """
+
+    type = "sql_state"
+    needs_trace = False
+
+    def __init__(
+        self,
+        sql: str,
+        expect: Any = None,
+        *,
+        query: Callable[[str], Any] | None = None,
+        name: str = "sql_state",
+    ):
+        self.sql = sql
+        self.expect = expect
+        self.query = query
+        self.name = name
+
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+        if self.query is None:
+            return _ungradable(
+                self.name, self.type,
+                "no query function configured: state could not be checked",
+            )
+        try:
+            actual = self.query(self.sql)
+        except Exception as err:  # noqa: BLE001 — a broken query is not a broken agent
+            return _ungradable(self.name, self.type, f"query failed: {err}")
+
+        got = _scalar(actual)
+        passed = str(got).strip() == str(self.expect).strip()
+        return GraderResult(
+            grader_name=self.name,
+            grader_type=self.type,
+            score=1.0 if passed else 0.0,
+            passed=passed,
+            reason="" if passed else f"expected {self.expect!r}, found {got!r}",
+            assertions={"sql": self.sql, "expected": self.expect, "actual": got},
+        )
+
+
+def _scalar(result: Any) -> Any:
+    """First cell of whatever the query returned.
+
+    Accepts a DataFrame, a list of rows, or a bare value, because the caller's
+    session decides the shape and the grader asserts one value either way.
+    """
+    if result is None:
+        return None
+    values = getattr(result, "values", None)
+    if values is not None and hasattr(result, "columns"):  # DataFrame
+        return values[0][0] if len(values) and len(values[0]) else None
+    if isinstance(result, (list, tuple)):
+        if not result:
+            return None
+        first = result[0]
+        if isinstance(first, (list, tuple)):
+            return first[0] if first else None
+        return first
+    return result
+
+
+class HumanReviewGrader:
+    """A verdict this run cannot produce, held open until a person gives one.
+
+    Returns ungradable with ``awaiting_review``, which the runner reads to mark
+    the trial ``AWAITING_REVIEW`` rather than letting the other graders decide
+    it. That distinction is the point: a task that asked for human judgement and
+    silently passed on a substring match has not been judged.
+
+    The verdict arrives later through the review endpoint, which writes a real
+    grader result alongside this one.
+    """
+
+    type = "human_review"
+    needs_trace = False
+
+    def __init__(self, prompt: str = "", name: str = "human_review"):
+        self.prompt = prompt
+        self.name = name
+
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+        result = _ungradable(
+            self.name, self.type,
+            self.prompt or "waiting for a reviewer to judge this answer",
+        )
+        result.assertions = {"awaiting_review": True, "prompt": self.prompt}
+        return result
+
+
+AWAITING_REVIEW = "awaiting_review"
+
+
+def awaits_review(results: Sequence[GraderResult]) -> bool:
+    """Whether any grader deferred to a person."""
+    return any(r.assertions.get(AWAITING_REVIEW) for r in results)

@@ -434,3 +434,58 @@ class TestPerTaskGraders:
                     graders=lambda _t: [])
         assert result.trials[0].status is TrialStatus.TRACE_MISSING
         assert result.trials[0].grader_results == []
+
+
+class TestPassPolicyAndReview:
+    """The suite's policy decides the trial, and a person can hold it open."""
+
+    def test_the_suite_policy_reaches_the_verdict(self):
+        # `all` would fail this trial: the exact match passes, the second does not
+        from hopsworks_agent_eval.graders import RegexGrader
+        from hopsworks_agent_eval.models import PassPolicy
+
+        graders = [ExactMatchGrader(), RegexGrader(r"never matches this")]
+
+        strict = go(FakeClient(answer="4"), graders=graders)
+        assert strict.trials[0].status is TrialStatus.FAILED
+
+        lenient = go(
+            FakeClient(answer="4"),
+            s=suite(pass_policy=PassPolicy.ANY),
+            graders=graders,
+        )
+        assert lenient.trials[0].status is TrialStatus.PASSED
+
+    def test_a_threshold_policy_reads_the_mean_score(self):
+        from hopsworks_agent_eval.models import PassPolicy
+
+        result = go(
+            FakeClient(answer="4"),
+            s=suite(pass_policy=PassPolicy.THRESHOLD, pass_threshold=0.4),
+            graders=[ExactMatchGrader(), ContainsGrader(expected="nowhere")],
+        )
+        assert result.trials[0].status is TrialStatus.PASSED
+
+    def test_a_task_awaiting_review_is_neither_passed_nor_failed(self):
+        # the other graders agreeing is not the judgement the task asked for
+        from hopsworks_agent_eval.graders import HumanReviewGrader
+
+        result = go(
+            FakeClient(answer="4"),
+            graders=[ExactMatchGrader(), HumanReviewGrader("is the tone right?")],
+        )
+        assert result.trials[0].status is TrialStatus.AWAITING_REVIEW
+
+    def test_the_deferred_result_is_kept_so_a_reviewer_can_see_the_prompt(self):
+        from hopsworks_agent_eval.graders import HumanReviewGrader
+
+        result = go(
+            FakeClient(answer="4"),
+            graders=[HumanReviewGrader("is the tone right?")],
+        )
+        pending = [
+            r for r in result.trials[0].grader_results
+            if r.assertions.get("awaiting_review")
+        ]
+        assert len(pending) == 1
+        assert "tone" in pending[0].reason

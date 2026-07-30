@@ -233,3 +233,70 @@ def anthropic_completer(api_key: str, model: str = DEFAULT_MODEL,
         )
 
     return complete
+
+
+class PairwiseGrader:
+    """Is this answer at least as good as a reference one?
+
+    A rubric judge scores an answer against a description. This compares it
+    against a concrete answer someone already accepted, which is the sharper
+    question when a suite exists to catch regressions: "no worse than what we
+    shipped" is easier to agree on than "scores 0.7".
+
+    Ties pass. A tie means the judge could not tell them apart, and failing a
+    trial on that would make the grader a coin toss on every equivalent answer.
+
+    Position bias is real and worth knowing about: judges favour whichever
+    response they see first. The reference is presented as A and the candidate
+    as B consistently, so the bias is a constant across trials rather than
+    noise, and a suite compares like with like.
+    """
+
+    type = "pairwise"
+    needs_trace = False
+
+    def __init__(
+        self,
+        complete: Callable[[str], str],
+        *,
+        reference: str = "",
+        name: str = "pairwise",
+        model: str = DEFAULT_MODEL,
+    ):
+        self._complete = complete
+        self.reference = reference
+        self.name = name
+        self.model = model
+
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+        reference = self.reference or task.expected_output
+        if not reference:
+            return _ungradable(
+                self.name, self.type,
+                "no reference answer to compare against",
+            )
+        if not trial.final_output:
+            return _ungradable(self.name, self.type, "the agent produced no answer")
+
+        outcome = pairwise_verdict(
+            self._complete,
+            question=task.prompt,
+            answer_a=reference,
+            answer_b=trial.final_output,
+            rubric=task.rubric,
+        )
+        winner = outcome.get("winner")
+        if winner not in ("a", "b", "tie"):
+            return _ungradable(self.name, self.type, outcome.get("reason", "no verdict"))
+
+        # b is the candidate; a tie passes, since the judge is saying it cannot
+        # separate them rather than that the candidate is worse.
+        passed = winner in ("b", "tie")
+        return GraderResult(
+            grader_name=self.name,
+            grader_type=self.type,
+            score=1.0 if winner == "b" else 0.5 if winner == "tie" else 0.0,
+            passed=passed,
+            reason=outcome.get("reason", ""),
+            assertions={"winner": winner, "judge_model": self.model},
+        )

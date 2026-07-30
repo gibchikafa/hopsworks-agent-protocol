@@ -18,6 +18,7 @@ from .features import (
 from .metrics import pass_all_k, pass_at_k, run_metrics
 from .models import (
     ExecutionMode,
+    PassPolicy,
     Suite,
     SuiteType,
     Task,
@@ -34,7 +35,13 @@ from .promotion import (
     tasks_from_trace,
 )
 from .client import HopsworksAgentClient
-from .judges import LlmJudgeGrader, anthropic_completer, pairwise_verdict
+from .grader_spec import SpecError, graders_for_task, graders_from_spec, validate_spec
+from .judges import (
+    LlmJudgeGrader,
+    PairwiseGrader,
+    anthropic_completer,
+    pairwise_verdict,
+)
 from .runner import RunnerConfig, SuiteRefused, run_suite
 
 __all__ = [
@@ -43,7 +50,13 @@ __all__ = [
     "LlmJudgeGrader",
     "anthropic_completer",
     "pairwise_verdict",
+    "PairwiseGrader",
+    "SpecError",
+    "graders_for_task",
+    "graders_from_spec",
+    "validate_spec",
     "RunnerConfig",
+    "PassPolicy",
     "Suite",
     "SuiteRefused",
     "SuiteType",

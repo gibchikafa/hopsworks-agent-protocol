@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Protocol, Sequence
 
-from .graders import Grader, Trace, run_graders, verdict
+from .graders import Grader, Trace, awaits_review, run_graders, verdict
 from .models import (
     ExecutionMode,
     Suite,
@@ -263,7 +263,15 @@ def _run_trial(
     trial.trace_status = trace_status
 
     trial.grader_results = run_graders(graders, task, trial, trace)
-    outcome = verdict(trial.grader_results)
+    outcome = verdict(trial.grader_results, suite.pass_policy, suite.pass_threshold)
+
+    if awaits_review(trial.grader_results):
+        # A task that asked for human judgement has not been judged by the other
+        # graders agreeing with each other. Held open rather than resolved, so a
+        # reviewer's verdict is the thing that settles it.
+        trial.status = TrialStatus.AWAITING_REVIEW
+        trial.completed_at = datetime.now(tz=timezone.utc)
+        return trial
 
     if trace_status is TraceStatus.MISSING:
         # Final-answer graders still ran on the captured response; only the

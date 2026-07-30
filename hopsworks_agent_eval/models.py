@@ -51,6 +51,10 @@ class TrialStatus(str, Enum):
     INFRA_ERROR = "INFRA_ERROR"
     INVALID_OUTPUT = "INVALID_OUTPUT"
     TRACE_MISSING = "TRACE_MISSING"
+    # A grader deferred to a person and no verdict has been recorded yet. Not a
+    # failure and not a pass: counting it either way answers a question nobody
+    # has answered.
+    AWAITING_REVIEW = "AWAITING_REVIEW"
     # An outcome, not inherently a failure: in a safety suite a block is the
     # desired result. Folding it into AGENT_ERROR would make guardrail
     # behaviour unattributable.
@@ -75,6 +79,11 @@ class Task:
     rubric: str = ""
     category: str = ""
     tags: list[str] = field(default_factory=list)
+    # JSON array naming the graders this task wants, e.g.
+    # [{"type": "regex", "pattern": "^ORD-\\d{4}$"}]. Empty means "infer from
+    # what the task declares", which is right for most tasks and wrong for any
+    # that needs a check no other field implies.
+    graders: str = ""
 
     @property
     def prompt(self) -> str:
@@ -93,6 +102,20 @@ class Task:
         return ""
 
 
+class PassPolicy(str, Enum):
+    """How a trial's graders combine into one verdict.
+
+    ALL is the default and the safe one. ANY and THRESHOLD exist because some
+    suites genuinely want them — a capability suite where three phrasings are
+    each acceptable, or a rubric suite where a mean score is the measure — but
+    both can turn a failing trial into a passing one, so neither is a default.
+    """
+
+    ALL = "all"
+    ANY = "any"
+    THRESHOLD = "threshold"
+
+
 @dataclass
 class Suite:
     suite_id: str
@@ -101,6 +124,9 @@ class Suite:
     type: SuiteType = SuiteType.REGRESSION
     execution_mode: ExecutionMode = ExecutionMode.READ_ONLY
     tasks: list[Task] = field(default_factory=list)
+    pass_policy: PassPolicy = PassPolicy.ALL
+    # Only read under THRESHOLD: the mean score every gradable grader must reach.
+    pass_threshold: float = 0.7
 
 
 @dataclass

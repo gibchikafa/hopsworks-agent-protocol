@@ -22,6 +22,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+from .grader_spec import SpecError, graders_for_task
 from .graders import (
     ContainsGrader,
     ExactMatchGrader,
@@ -32,7 +33,7 @@ from .graders import (
 )
 from .judges import DEFAULT_MODEL, LlmJudgeGrader, anthropic_completer
 from .metrics import run_metrics
-from .models import ExecutionMode, Suite, SuiteType, Task
+from .models import ExecutionMode, PassPolicy, Suite, SuiteType, Task
 from .runner import RunnerConfig, SuiteRefused, run_suite
 
 log = logging.getLogger(__name__)
@@ -46,30 +47,17 @@ def _api(host: str, project_id: int) -> str:
     return f"{host.rstrip('/')}/hopsworks-api/api/project/{project_id}/agent-evals"
 
 
-def _graders_for(task: Task, judge: LlmJudgeGrader | None = None) -> list[Grader]:
-    """Which graders a task gets, inferred from what it declares.
+def _query_for(project: Any) -> Any:
+    """A read-only query function for state graders, or None.
 
-    A task that names no expectation and no tools would otherwise be graded by
-    nothing and pass silently, so it gets nothing and its trials come back
-    ungradable — which is the honest answer rather than a free pass.
+    Bound to the feature store the job already authenticated to, so a state
+    assertion sees exactly what the project can see and nothing wider. Returned
+    lazily: a suite with no sql_state grader should not pay for a session.
     """
-    graders: list[Grader] = []
-    if judge is not None and task.rubric:
-        # A rubric is a request for judgement that no string comparison can
-        # answer, so it is the one thing that earns the cost and the
-        # uncertainty of a model in the loop.
-        graders.append(judge)
-    if task.expected_output:
-        # `contains` rather than exact match: for free text an exact match
-        # asserts the model's phrasing rather than its correctness
-        graders.append(ContainsGrader())
-    if task.required_tools or task.forbidden_tools:
-        graders.append(ToolCallGrader())
-    if len(task.required_tools) > 1:
-        graders.append(ToolOrderGrader())
-    if task.required_tools:
-        graders.append(NoToolErrorGrader())
-    return graders
+    def query(sql: str) -> Any:
+        return project.get_feature_store().sql(sql)
+
+    return query
 
 
 def _judge_for(project: Any) -> LlmJudgeGrader | None:
@@ -106,6 +94,8 @@ def _to_suite(run: dict[str, Any], tasks: list[dict[str, Any]]) -> Suite:
         suite_version=run.get("suiteVersion", 1),
         type=SuiteType(run.get("suiteType", "regression")),
         execution_mode=ExecutionMode(run.get("executionMode", "read_only")),
+        pass_policy=PassPolicy(run.get("passPolicy") or "all"),
+        pass_threshold=float(run.get("passThreshold") or 0.7),
         tasks=[
             Task(
                 task_id=t["taskId"],
@@ -115,6 +105,7 @@ def _to_suite(run: dict[str, Any], tasks: list[dict[str, Any]]) -> Suite:
                 expected_output=t.get("expectedOutput") or "",
                 required_tools=parse_tools(t.get("requiredTools")),
                 forbidden_tools=parse_tools(t.get("forbiddenTools")),
+                graders=t.get("graders") or "",
                 rubric=t.get("rubric") or "",
                 category=t.get("category") or "",
             )
@@ -234,6 +225,10 @@ def main() -> None:
         from .client import HopsworksAgentClient
 
         judge = _judge_for(project)
+        # The judge is a grader; the spec needs the bare completer behind it, so
+        # a task can ask for a rubric judge and a pairwise judge independently.
+        completer = judge._complete if judge is not None else None  # noqa: SLF001
+        query = _query_for(project)
         client = HopsworksAgentClient(
             session=session,
             api_base=host,
@@ -247,9 +242,11 @@ def main() -> None:
             suite,
             run_id=args.run_id,
             deployment_id=run["deploymentId"],
-            # per task, not one list for the suite: which graders apply depends
-            # on what each task declares
-            graders=lambda t: _graders_for(t, judge),
+            # per task, not one list for the suite: a task's own spec decides,
+            # and inference only covers the tasks that declare none
+            graders=lambda t: graders_for_task(
+                t, judge_completer=completer, query=query
+            ),
             config=RunnerConfig(
                 n_trials=run.get("nTrials", 1),
                 readiness_timeout_s=args.readiness_timeout_s,
@@ -259,6 +256,12 @@ def main() -> None:
         _write_results(project.get_feature_store(), result, run)
         report(result.status)
         log.info("run %s finished: %s", args.run_id, result.status)
+    except SpecError as err:
+        # Authoring validates the spec, so reaching here means a task was written
+        # before that check existed or around it. Named as a run failure rather
+        # than an agent one.
+        log.exception("a task has an unusable grader spec")
+        report("FAILED", f"grader spec: {err}")
     except SuiteRefused as err:
         # A refusal is a result, not a crash: the run would have produced
         # numbers that looked valid, and saying so is the point.
