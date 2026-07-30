@@ -15,6 +15,7 @@ import pytest
 from hopsworks_agent_eval.grader_spec import SpecError, graders_from_spec
 from hopsworks_agent_eval.judge_config import (
     FAILURE_CATEGORIES,
+    PROVIDERS,
     JudgeConfigError,
     default_templates,
     parse_judge_config,
@@ -305,3 +306,39 @@ def test_the_default_template_leaves_tool_checks_to_the_tool_graders():
     spec = json.loads(default_templates()[0]["spec"])
     names = set(spec[0]["criteria"])
     assert not names & {"tool_selection", "tool_execution", "efficiency"}
+
+
+class TestProviders:
+    def test_every_provider_maps_to_an_adapter_that_exists(self):
+        # the point of the registry: adding a provider is a row, not a client
+        for key, entry in PROVIDERS.items():
+            assert entry["adapter"] in ("openai", "anthropic"), key
+
+    def test_only_anthropic_needs_its_own_client(self):
+        anthropic = [k for k, v in PROVIDERS.items() if v["adapter"] == "anthropic"]
+        assert anthropic == ["anthropic"]
+
+    def test_every_openai_shaped_provider_knows_where_to_call(self):
+        # except openai itself, whose SDK default is correct, and custom, which
+        # is refused without one
+        for key, entry in PROVIDERS.items():
+            if entry["adapter"] == "openai" and key not in ("openai", "custom"):
+                assert entry["base_url"].startswith("https://"), key
+
+    def test_a_custom_provider_needs_a_base_url(self):
+        with pytest.raises(JudgeConfigError, match="needs a base_url"):
+            parse_judge_config({"type": "llm_judge", "provider": "custom"})
+
+    def test_a_custom_provider_with_a_base_url_is_fine(self):
+        config = parse_judge_config({
+            "type": "llm_judge", "provider": "custom",
+            "base_url": "https://my-vllm.internal/v1",
+        })
+        assert config.base_url == "https://my-vllm.internal/v1"
+
+    def test_every_provider_parses(self):
+        for key in PROVIDERS:
+            entry = {"type": "llm_judge", "provider": key}
+            if key == "custom":
+                entry["base_url"] = "https://x/v1"
+            assert parse_judge_config(entry).provider == key

@@ -31,7 +31,74 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
-PROVIDERS = ("anthropic", "openai")
+# Providers, and which of the two adapters each one actually needs.
+#
+# Almost everything speaks the OpenAI chat-completions shape and differs only by
+# base URL, so "add a provider" is a row here rather than another SDK. That is
+# the whole reason the list can be this long without the code growing: only
+# Anthropic needs its own client.
+#
+# `default_model` is a starting point, not a recommendation that survives
+# contact with time — model names change faster than this file will.
+PROVIDERS: dict[str, dict[str, str]] = {
+    "openai": {
+        "label": "OpenAI",
+        "adapter": "openai",
+        "base_url": "",
+        "default_model": "gpt-4o",
+    },
+    "anthropic": {
+        "label": "Anthropic",
+        "adapter": "anthropic",
+        "base_url": "",
+        "default_model": "claude-sonnet-5",
+    },
+    "google": {
+        "label": "Google Gemini",
+        "adapter": "openai",
+        # Gemini's OpenAI-compatible surface, so it needs no separate client
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "default_model": "gemini-2.5-pro",
+    },
+    "mistral": {
+        "label": "Mistral AI",
+        "adapter": "openai",
+        "base_url": "https://api.mistral.ai/v1",
+        "default_model": "mistral-large-latest",
+    },
+    "fireworks": {
+        "label": "Fireworks",
+        "adapter": "openai",
+        "base_url": "https://api.fireworks.ai/inference/v1",
+        "default_model": "",
+    },
+    "groq": {
+        "label": "Groq",
+        "adapter": "openai",
+        "base_url": "https://api.groq.com/openai/v1",
+        "default_model": "",
+    },
+    "deepseek": {
+        "label": "DeepSeek",
+        "adapter": "openai",
+        "base_url": "https://api.deepseek.com",
+        "default_model": "deepseek-chat",
+    },
+    "xai": {
+        "label": "xAI",
+        "adapter": "openai",
+        "base_url": "https://api.x.ai/v1",
+        "default_model": "",
+    },
+    # Anything else that speaks the same shape: vLLM, a gateway, an internal
+    # deployment. Requires base_url, since there is nothing to guess.
+    "custom": {
+        "label": "OpenAI-compatible",
+        "adapter": "openai",
+        "base_url": "",
+        "default_model": "",
+    },
+}
 
 # Enumerated rather than free text. An open-ended "what went wrong" field gives
 # a different phrasing every trial, which cannot be counted or compared — the
@@ -156,6 +223,11 @@ def parse_judge_config(entry: dict[str, Any]) -> JudgeConfig:
     config.provider = provider
     config.model = str(entry.get("model") or "")
     config.base_url = str(entry.get("base_url") or entry.get("baseUrl") or "")
+    if provider == "custom" and not config.base_url:
+        raise JudgeConfigError(
+            "an OpenAI-compatible provider needs a base_url; there is nothing "
+            "to guess from"
+        )
     config.api_key_secret = str(
         entry.get("api_key_secret") or entry.get("apiKeySecret") or config.api_key_secret
     )
@@ -385,15 +457,21 @@ def completer_for(
     Both SDKs are imported lazily: a project judging with one provider should
     not need the other installed.
     """
-    if config.provider == "openai":
+    registry = PROVIDERS.get(config.provider, PROVIDERS["openai"])
+    # An explicit base_url overrides the registry's, which is how someone points
+    # a known provider at a proxy without inventing a new provider name.
+    base_url = config.base_url or registry["base_url"]
+    model = config.model or registry["default_model"]
+
+    if registry["adapter"] == "openai":
         def complete_openai(prompt: str) -> str:
             import openai
 
             client = openai.OpenAI(
-                api_key=api_key, **({"base_url": config.base_url} if config.base_url else {})
+                api_key=api_key, **({"base_url": base_url} if base_url else {})
             )
             response = client.chat.completions.create(
-                model=config.model or "gpt-4o",
+                model=model or "gpt-4o",
                 temperature=config.temperature,
                 max_tokens=config.max_tokens,
                 messages=[{"role": "user", "content": prompt}],
@@ -405,9 +483,11 @@ def completer_for(
     def complete_anthropic(prompt: str) -> str:
         import anthropic
 
-        client = anthropic.Anthropic(api_key=api_key)
+        client = anthropic.Anthropic(
+            api_key=api_key, **({"base_url": base_url} if base_url else {})
+        )
         response = client.messages.create(
-            model=config.model or "claude-sonnet-4-5",
+            model=model or "claude-sonnet-5",
             max_tokens=config.max_tokens,
             temperature=config.temperature,
             messages=[{"role": "user", "content": prompt}],

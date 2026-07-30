@@ -37,7 +37,7 @@ from .models import GraderResult, Task, Trial
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "claude-sonnet-4-5"
+DEFAULT_MODEL = "claude-sonnet-5"
 
 PAIRWISE_PROMPT = """You are comparing two AI agent responses to the same question.
 
