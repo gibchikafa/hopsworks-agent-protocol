@@ -27,6 +27,12 @@ import re
 from typing import Any, Callable
 
 from .graders import Trace, _ungradable
+from .judge_config import (
+    FAILURE_CATEGORIES,
+    JudgeConfig,
+    render_prompt,
+    tool_calls_text,
+)
 from .models import GraderResult, Task, Trial
 
 log = logging.getLogger(__name__)
@@ -473,3 +479,148 @@ class ToolResultUsedJudge:
             log.warning("tool result judge failed: %s", err)
             return _ungradable(self.name, self.type, f"judge call failed: {err}")
         return _judged(self.name, self.type, self.model, raw)
+
+
+class MultiCriteriaJudge:
+    """One model call, several named criteria, one verdict.
+
+    Separate judges per criterion would fit the existing machinery more neatly,
+    but cost a model call each — seven criteria over fifty tasks and three
+    trials is a thousand calls rather than a hundred and fifty. One call keeps
+    that affordable and is the only way to express weights and per-criterion
+    floors, neither of which the suite's pass policy can say.
+
+    The per-criterion scores go into ``assertions`` rather than becoming
+    separate results, so the trial has one verdict while the breakdown stays
+    readable.
+    """
+
+    type = "llm_judge"
+
+    def __init__(
+        self,
+        complete: Callable[[str], str],
+        config: JudgeConfig,
+        *,
+        name: str = "llm_judge",
+    ):
+        self._complete = complete
+        self.config = config
+        self.name = name
+        self.model = config.model or DEFAULT_MODEL
+        # Only when the configuration asks to see the trajectory: a judge that
+        # is not shown tool calls must not be marked ungradable for want of a
+        # trace it would never have read.
+        self.needs_trace = bool(
+            {"tool_calls", "tool_results"} & set(config.inputs)
+        )
+
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+        if not trial.final_output:
+            return _ungradable(self.name, self.type, "the agent produced no answer")
+        if self.needs_trace and trace is None:
+            return _ungradable(
+                self.name, self.type,
+                "no trace: this judge is configured to read the tool calls",
+            )
+
+        calls, results = tool_calls_text(trace)
+        prompt = render_prompt(
+            self.config,
+            question=task.prompt,
+            answer=trial.final_output,
+            expected=task.expected_output,
+            rubric=task.rubric,
+            tool_calls=calls,
+            tool_results=results,
+        )
+
+        try:
+            raw = self._complete(prompt)
+        except Exception as err:  # noqa: BLE001 — a broken judge is not a broken agent
+            log.warning("judge call failed: %s", err)
+            return _ungradable(self.name, self.type, f"judge call failed: {err}")
+
+        parsed = _json_from(raw)
+        scores = (parsed or {}).get("scores")
+        if not isinstance(scores, dict):
+            return _ungradable(
+                self.name, self.type,
+                "judge did not return per-criterion scores; scoring zero here "
+                "would blame the agent for the judge",
+            )
+
+        graded: dict[str, float] = {}
+        missing: list[str] = []
+        for criterion in self.config.criteria:
+            value = scores.get(criterion.name)
+            try:
+                graded[criterion.name] = float(value)
+            except (TypeError, ValueError):
+                missing.append(criterion.name)
+
+        if not graded:
+            return _ungradable(
+                self.name, self.type, "judge scored none of the criteria"
+            )
+        if missing:
+            # Partial results are worse than none: a weighted total over the
+            # criteria that happened to come back is a different measurement
+            # each time, and comparing it across runs is meaningless.
+            return _ungradable(
+                self.name, self.type,
+                f"judge did not score {', '.join(missing)}",
+            )
+
+        weights = {c.name: c.weight for c in self.config.criteria}
+        total_weight = sum(weights.values())
+        weighted = sum(graded[n] * weights[n] for n in graded) / total_weight
+
+        # A floor breached fails the trial whatever the weighted total says.
+        # Seven good scores hiding one catastrophic safety result is exactly
+        # what anyone configuring a critical dimension is guarding against.
+        breached = [
+            c.name for c in self.config.criteria
+            if c.critical_min is not None and graded[c.name] < c.critical_min
+        ]
+        passed = not breached and weighted >= self.config.pass_score
+
+        reasons = (parsed or {}).get("reasoning") or {}
+        category = str((parsed or {}).get("failure_category") or "")
+        if category and category not in FAILURE_CATEGORIES:
+            category = "other"
+
+        if breached:
+            reason = "below the floor on " + ", ".join(breached)
+        elif passed:
+            reason = ""
+        else:
+            reason = (
+                f"scored {weighted:.2f} of {self.config.score_max:g}, "
+                f"needs {self.config.pass_score:g}"
+            )
+        detail = "; ".join(
+            f"{name}: {text}" for name, text in reasons.items() if text
+        ) if isinstance(reasons, dict) else ""
+
+        return GraderResult(
+            grader_name=self.name,
+            grader_type=self.type,
+            score=self.config.normalise(weighted),
+            passed=passed,
+            reason=(reason + (f" ({detail})" if detail and not passed else ""))[:1000],
+            assertions={
+                # Raw, in the scale the judge was asked for, so a person reading
+                # this sees the numbers the prompt talked about.
+                "criteria": graded,
+                "criteria_normalised": {
+                    n: self.config.normalise(v) for n, v in graded.items()
+                },
+                "weighted_score": weighted,
+                "pass_score": self.config.pass_score,
+                "critical_breached": breached,
+                "failure_category": category,
+                "reasoning": reasons if isinstance(reasons, dict) else {},
+                "judge_model": self.model,
+            },
+        )

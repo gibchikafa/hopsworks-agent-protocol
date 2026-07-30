@@ -239,6 +239,19 @@ def main() -> None:
         # a task can ask for a rubric judge and a pairwise judge independently.
         completer = judge._complete if judge is not None else None  # noqa: SLF001
         query = _query_for(project)
+
+        def secret_reader(name: str) -> str | None:
+            """A project secret, for a judge that names its own key.
+
+            Looked up per name rather than passed in, so a suite can mix a
+            cheap judge for canaries with an expensive one for release gating
+            without either key leaving the project's secret store.
+            """
+            try:
+                return project.get_secrets_api().get_secret(name).value
+            except Exception:  # noqa: BLE001 — a missing secret is a normal state
+                log.info("no secret %r; judges naming it will be skipped", name)
+                return None
         client = HopsworksAgentClient(
             session=session,
             api_base=host,
@@ -255,7 +268,8 @@ def main() -> None:
             # per task, not one list for the suite: a task's own spec decides,
             # and inference only covers the tasks that declare none
             graders=lambda t: graders_for_task(
-                t, judge_completer=completer, query=query
+                t, judge_completer=completer, query=query,
+                secret_reader=secret_reader,
             ),
             config=RunnerConfig(
                 n_trials=run.get("nTrials", 1),

@@ -42,6 +42,7 @@ from .graders import (
     ToolCallGrader,
     ToolOrderGrader,
 )
+from .judge_config import JudgeConfigError, completer_for, parse_judge_config
 from .models import Task
 
 log = logging.getLogger(__name__)
@@ -78,6 +79,7 @@ def _one(
     *,
     judge_completer: Callable[[str], str] | None,
     query: Callable[[str], Any] | None,
+    secret_reader: Callable[[str], str | None] | None = None,
 ) -> Grader | None:
     kind = str(entry.get("type") or "").strip()
     name = str(entry.get("name") or kind or "grader")
@@ -152,26 +154,51 @@ def _one(
             ToolResultUsedJudge,
         )
 
-        if judge_completer is None:
+        # A judge may bring its own provider, model and key. Falling back to the
+        # project default keeps every spec written before that was possible
+        # working unchanged.
+        completer = judge_completer
+        config = None
+        if kind == "llm_judge":
+            try:
+                config = parse_judge_config(entry)
+            except JudgeConfigError as err:
+                raise SpecError(str(err)) from err
+        if config is not None and (config.model or entry.get("provider")):
+            api_key = secret_reader(config.api_key_secret) if secret_reader else None
+            if api_key:
+                completer = completer_for(config, api_key)
+            elif secret_reader is not None:
+                log.info(
+                    "no secret %r for judge %r; skipping it",
+                    config.api_key_secret, name,
+                )
+                return None
+
+        if completer is None:
             # Not an error: a project without a judge key still runs its
             # deterministic graders, and the trial reports what was skipped
             # rather than pretending the judgement happened.
             log.info("no judge configured; skipping %s grader %r", kind, name)
             return None
         if kind == "llm_judge":
+            if config is not None and config.multi:
+                from .judges import MultiCriteriaJudge
+
+                return MultiCriteriaJudge(completer, config, name=name)
             return LlmJudgeGrader(
-                judge_completer,
+                completer,
                 name=name,
                 pass_threshold=float(entry.get("pass_threshold", 0.7)),
             )
         if kind == "tool_arguments_judge":
             return ToolArgumentsJudge(
-                judge_completer, tool=str(entry.get("tool") or ""), name=name
+                completer, tool=str(entry.get("tool") or ""), name=name
             )
         if kind == "tool_result_used":
-            return ToolResultUsedJudge(judge_completer, name=name)
+            return ToolResultUsedJudge(completer, name=name)
         return PairwiseGrader(
-            judge_completer, reference=str(entry.get("reference") or ""), name=name
+            completer, reference=str(entry.get("reference") or ""), name=name
         )
 
     raise SpecError(
@@ -184,6 +211,7 @@ def graders_from_spec(
     *,
     judge_completer: Callable[[str], str] | None = None,
     query: Callable[[str], Any] | None = None,
+    secret_reader: Callable[[str], str | None] | None = None,
 ) -> list[Grader]:
     """Every grader a spec asks for.
 
@@ -207,7 +235,8 @@ def graders_from_spec(
         if not isinstance(entry, dict):
             raise SpecError(f"entry {index + 1} is not an object")
         try:
-            grader = _one(entry, judge_completer=judge_completer, query=query)
+            grader = _one(entry, judge_completer=judge_completer, query=query,
+                          secret_reader=secret_reader)
         except SpecError as err:
             raise SpecError(f"entry {index + 1}: {err}") from err
         if grader is not None:
@@ -230,6 +259,7 @@ def graders_for_task(
     *,
     judge_completer: Callable[[str], str] | None = None,
     query: Callable[[str], Any] | None = None,
+    secret_reader: Callable[[str], str | None] | None = None,
 ) -> list[Grader]:
     """What this task gets: its spec if it has one, inference otherwise.
 
@@ -239,7 +269,8 @@ def graders_for_task(
     """
     if task.graders:
         return graders_from_spec(
-            task.graders, judge_completer=judge_completer, query=query
+            task.graders, judge_completer=judge_completer, query=query,
+            secret_reader=secret_reader,
         )
 
     graders: list[Grader] = []
