@@ -30,18 +30,24 @@ def trial(answer="Rayleigh scattering."):
                  trial_index=0, deployment_id=7, final_output=answer)
 
 
-def judge(reply, **kwargs):
-    return LlmJudgeGrader(lambda _prompt: reply, **kwargs)
+def judge(reply, **config_overrides):
+    """A judge with no criteria named — one `overall` score, scored 1-5."""
+    from hopsworks_agent_eval.judge_config import parse_judge_config
+
+    config = parse_judge_config({"type": "llm_judge", **config_overrides})
+    return LlmJudgeGrader(lambda _prompt: reply, config)
 
 
-GOOD = '{"score": 0.9, "passed": true, "reason": "Correct.", "criteria": {"accuracy": 0.9}}'
+# The unified judge asks for per-criterion scores even when there is one
+# criterion, so a single-score reply names it.
+GOOD = '{"scores": {"overall": 5}, "reasoning": {"overall": "Correct."}}'
 
 
 class TestGrading:
     def test_a_clean_verdict_is_used(self):
         result = judge(GOOD).grade(task(), trial(), None)
         assert result.passed is True
-        assert result.score == pytest.approx(0.9)
+        assert result.score == pytest.approx(1.0)
         assert result.ungradable is False
 
     def test_the_judge_model_is_recorded(self):
@@ -50,18 +56,25 @@ class TestGrading:
         result = judge(GOOD, model="claude-opus-5").grade(task(), trial(), None)
         assert result.assertions["judge_model"] == "claude-opus-5"
 
-    def test_the_models_own_pass_decision_wins_over_the_threshold(self):
-        # a rubric can encode a bar a single number cannot
-        reply = '{"score": 0.5, "passed": true, "reason": "meets the bar"}'
-        assert judge(reply, pass_threshold=0.9).grade(task(), trial(), None).passed
+    def test_one_unnamed_criterion_behaves_like_any_other(self):
+        # there is no separate single-score judge: a configuration naming no
+        # criteria gets one called `overall` and the same code path
+        result = judge(GOOD).grade(task(), trial(), None)
+        assert set(result.assertions["criteria"]) == {"overall"}
 
-    def test_the_threshold_applies_when_the_model_gives_no_verdict(self):
-        reply = '{"score": 0.5, "reason": "partial"}'
-        assert judge(reply, pass_threshold=0.7).grade(task(), trial(), None).passed is False
+    def test_the_threshold_decides_the_verdict(self):
+        # the model no longer gets to return its own pass/fail: one trial
+        # passing at 0.6 while another fails at 0.7 because the judge felt
+        # differently makes results incomparable
+        reply = '{"scores": {"overall": 3}}'
+        assert judge(reply).grade(task(), trial(), None).passed is False
+        assert judge(reply, thresholds={"pass_score": 3}).grade(
+            task(), trial(), None
+        ).passed is True
 
     def test_scores_are_clamped(self):
-        # a model returning 1.4 has not found extra quality
-        reply = '{"score": 1.4, "passed": true, "reason": "great"}'
+        # a model told to answer 1-5 and returning 7 has not found extra quality
+        reply = '{"scores": {"overall": 7}}'
         assert judge(reply).grade(task(), trial(), None).score == 1.0
 
 

@@ -60,6 +60,11 @@ INPUTS = (
 
 DEFAULT_INPUTS = ("user_request", "expected_result", "agent_response", "rubric")
 
+# A judge with no criteria configured is not a different kind of judge, it is
+# one with a single unnamed criterion. Naming it here means one code path, one
+# prompt and one way of computing a verdict, rather than two that drift.
+OVERALL = "overall"
+
 
 class JudgeConfigError(ValueError):
     """A judge configuration that cannot be used, with the reason."""
@@ -96,7 +101,28 @@ class JudgeConfig:
 
     @property
     def multi(self) -> bool:
+        """Whether the configuration named its own criteria."""
         return bool(self.criteria)
+
+    def effective_criteria(self) -> list[Criterion]:
+        """What to score, always at least one thing.
+
+        Everything downstream — the prompt, the weighting, the floors, the
+        breakdown in `assertions` — works the same whether someone named three
+        criteria or none.
+        """
+        if self.criteria:
+            return self.criteria
+        return [
+            Criterion(
+                name=OVERALL,
+                description=(
+                    "how well the answer satisfies the question and any "
+                    "expectations given above"
+                ),
+                weight=1.0,
+            )
+        ]
 
     def normalise(self, raw: float) -> float:
         """A judge's score in storage units.
@@ -330,14 +356,14 @@ def _number(value: float) -> str:
 def _criteria_block(config: JudgeConfig) -> str:
     return "\n".join(
         f"- {c.name}: {c.description or 'no description given'}"
-        for c in config.criteria
+        for c in config.effective_criteria()
     )
 
 
 def _output_shape(config: JudgeConfig) -> str:
     scores = ", ".join(
         f'"{c.name}": <{_number(config.score_min)}-{_number(config.score_max)}>'
-        for c in config.criteria
+        for c in config.effective_criteria()
     )
     parts = [f'"scores": {{{scores}}}']
     if config.include_reasoning:

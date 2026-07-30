@@ -39,7 +39,6 @@ from .judge_config import JudgeConfig, JudgeConfigError, default_templates
 from .grader_spec import SpecError, graders_for_task, graders_from_spec, validate_spec
 from .judges import (
     LlmJudgeGrader,
-    MultiCriteriaJudge,
     PairwiseGrader,
     anthropic_completer,
     pairwise_verdict,
@@ -52,7 +51,6 @@ __all__ = [
     "LlmJudgeGrader",
     "anthropic_completer",
     "pairwise_verdict",
-    "MultiCriteriaJudge",
     "PairwiseGrader",
     "SpecError",
     "JudgeConfig",

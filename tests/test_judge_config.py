@@ -20,7 +20,7 @@ from hopsworks_agent_eval.judge_config import (
     parse_judge_config,
     render_prompt,
 )
-from hopsworks_agent_eval.judges import MultiCriteriaJudge
+from hopsworks_agent_eval.judges import LlmJudgeGrader
 from hopsworks_agent_eval.models import Task, Trial
 
 CRITERIA = {
@@ -56,9 +56,9 @@ def trial(output: str = "Done — order 4471 is cancelled.") -> Trial:
     )
 
 
-def judge(reply: dict | str, **overrides) -> MultiCriteriaJudge:
+def judge(reply: dict | str, **overrides) -> LlmJudgeGrader:
     text = reply if isinstance(reply, str) else json.dumps(reply)
-    return MultiCriteriaJudge(lambda _p: text, parse_judge_config(entry(**overrides)))
+    return LlmJudgeGrader(lambda _p: text, parse_judge_config(entry(**overrides)))
 
 
 class TestParsing:
@@ -207,7 +207,7 @@ class TestGrading:
         assert result.ungradable and result.passed is False
 
     def test_a_judge_that_raises_is_ungradable(self):
-        grader = MultiCriteriaJudge(
+        grader = LlmJudgeGrader(
             lambda _p: (_ for _ in ()).throw(RuntimeError("rate limited")),
             parse_judge_config(entry()),
         )
@@ -246,15 +246,30 @@ class TestGrading:
 
 
 class TestSpecIntegration:
-    def test_criteria_turn_an_llm_judge_into_a_multi_criteria_one(self):
+    def test_criteria_are_carried_onto_the_grader(self):
         graders = graders_from_spec([entry()], judge_completer=lambda _p: "{}")
-        assert isinstance(graders[0], MultiCriteriaJudge)
+        assert [c.name for c in graders[0].config.criteria] == [
+            "task_completion", "correctness", "safety",
+        ]
 
-    def test_without_criteria_it_stays_the_single_score_judge(self):
+    def test_a_judge_with_no_criteria_gets_one_called_overall(self):
+        # not a different class, not a different code path — the same judge
+        # scoring a single unnamed thing
         graders = graders_from_spec(
             [{"type": "llm_judge"}], judge_completer=lambda _p: "{}"
         )
-        assert not isinstance(graders[0], MultiCriteriaJudge)
+        assert [c.name for c in graders[0].config.effective_criteria()] == ["overall"]
+
+    def test_every_judged_type_can_bring_its_own_model(self):
+        # a pairwise comparison has no reason to be stuck with the project
+        # default when a rubric judge is not
+        for kind in ("pairwise", "tool_arguments_judge", "tool_result_used"):
+            graders = graders_from_spec(
+                [{"type": kind, "provider": "openai", "model": "gpt-4o",
+                  "api_key_secret": "K"}],
+                secret_reader=lambda name: "sk-test",
+            )
+            assert graders[0].model == "gpt-4o", kind
 
     def test_a_bad_judge_config_is_a_spec_error(self):
         # so it is refused at authoring time like every other malformed entry

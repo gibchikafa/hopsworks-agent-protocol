@@ -43,6 +43,7 @@ from .graders import (
     ToolOrderGrader,
 )
 from .judge_config import JudgeConfigError, completer_for, parse_judge_config
+from .judge_config import JudgeConfigError, completer_for, parse_judge_config
 from .models import Task
 
 log = logging.getLogger(__name__)
@@ -148,23 +149,23 @@ def _one(
         # Imported here because judges pulls in the provider plumbing, and a
         # suite with no judge configured should not need it loaded.
         from .judges import (
+            DEFAULT_MODEL,
             LlmJudgeGrader,
             PairwiseGrader,
             ToolArgumentsJudge,
             ToolResultUsedJudge,
         )
 
-        # A judge may bring its own provider, model and key. Falling back to the
-        # project default keeps every spec written before that was possible
-        # working unchanged.
+        # Every judged grader may bring its own provider, model and key, not
+        # only the rubric one — there is no reason a pairwise comparison should
+        # be stuck with the project default when a rubric judge is not.
+        try:
+            config = parse_judge_config(entry)
+        except JudgeConfigError as err:
+            raise SpecError(str(err)) from err
+
         completer = judge_completer
-        config = None
-        if kind == "llm_judge":
-            try:
-                config = parse_judge_config(entry)
-            except JudgeConfigError as err:
-                raise SpecError(str(err)) from err
-        if config is not None and (config.model or entry.get("provider")):
+        if config.model or entry.get("provider"):
             api_key = secret_reader(config.api_key_secret) if secret_reader else None
             if api_key:
                 completer = completer_for(config, api_key)
@@ -181,24 +182,19 @@ def _one(
             # rather than pretending the judgement happened.
             log.info("no judge configured; skipping %s grader %r", kind, name)
             return None
-        if kind == "llm_judge":
-            if config is not None and config.multi:
-                from .judges import MultiCriteriaJudge
 
-                return MultiCriteriaJudge(completer, config, name=name)
-            return LlmJudgeGrader(
-                completer,
-                name=name,
-                pass_threshold=float(entry.get("pass_threshold", 0.7)),
-            )
+        model = config.model or DEFAULT_MODEL
+        if kind == "llm_judge":
+            return LlmJudgeGrader(completer, config, name=name)
         if kind == "tool_arguments_judge":
             return ToolArgumentsJudge(
-                completer, tool=str(entry.get("tool") or ""), name=name
+                completer, tool=str(entry.get("tool") or ""), name=name, model=model
             )
         if kind == "tool_result_used":
-            return ToolResultUsedJudge(completer, name=name)
+            return ToolResultUsedJudge(completer, name=name, model=model)
         return PairwiseGrader(
-            completer, reference=str(entry.get("reference") or ""), name=name
+            completer, reference=str(entry.get("reference") or ""), name=name,
+            model=model,
         )
 
     raise SpecError(

@@ -39,23 +39,6 @@ log = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-sonnet-4-5"
 
-RUBRIC_PROMPT = """You are grading one response from an AI agent.
-
-Grade only against the criteria given. Do not reward or penalise style, length \
-or confidence beyond what the criteria ask for.
-
-<question>
-{question}
-</question>
-
-<agent_answer>
-{answer}
-</agent_answer>
-{expected_block}{rubric_block}
-Reply with JSON only, no prose:
-{{"score": <0.0-1.0>, "passed": <true|false>, "reason": "<one sentence>", \
-"criteria": {{"<name>": <0.0-1.0>}}}}"""
-
 PAIRWISE_PROMPT = """You are comparing two AI agent responses to the same question.
 
 Judge which better satisfies the criteria. If they are equivalent, say "tie" — \
@@ -101,93 +84,6 @@ def _json_from(text: str) -> dict[str, Any] | None:
         return parsed if isinstance(parsed, dict) else None
     except (ValueError, TypeError):
         return None
-
-
-class LlmJudgeGrader:
-    """Score a trial against a rubric using a model.
-
-    ``complete`` is injected — a callable taking a prompt and returning text —
-    so the grading logic is testable without a provider, and so the provider
-    stays a project configuration rather than something this module chooses.
-    """
-
-    type = "llm_judge"
-    needs_trace = False
-
-    def __init__(
-        self,
-        complete: Callable[[str], str],
-        *,
-        name: str = "llm_judge",
-        model: str = DEFAULT_MODEL,
-        pass_threshold: float = 0.7,
-    ):
-        self._complete = complete
-        self.name = name
-        self.model = model
-        self.pass_threshold = pass_threshold
-
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
-        if not task.rubric and not task.expected_output:
-            # A judge asked to score against nothing returns a number anyway,
-            # and that number is noise dressed as a measurement.
-            return _ungradable(
-                self.name, self.type,
-                "no rubric and no expected output: there is nothing to grade against",
-            )
-        if not trial.final_output:
-            return _ungradable(self.name, self.type, "the agent produced no answer")
-
-        prompt = RUBRIC_PROMPT.format(
-            question=task.prompt,
-            answer=trial.final_output,
-            expected_block=(
-                f"\n<expected>\n{task.expected_output}\n</expected>\n"
-                if task.expected_output else ""
-            ),
-            rubric_block=(
-                f"\n<criteria>\n{task.rubric}\n</criteria>\n"
-                if task.rubric else ""
-            ),
-        )
-
-        try:
-            raw = self._complete(prompt)
-        except Exception as err:  # noqa: BLE001 — a broken judge is not a broken agent
-            log.warning("judge call failed: %s", err)
-            return _ungradable(self.name, self.type, f"judge call failed: {err}")
-
-        parsed = _json_from(raw)
-        if parsed is None or "score" not in parsed:
-            return _ungradable(
-                self.name, self.type,
-                "judge did not return usable JSON; scoring zero here would blame "
-                "the agent for the judge",
-            )
-
-        try:
-            score = max(0.0, min(1.0, float(parsed["score"])))
-        except (TypeError, ValueError):
-            return _ungradable(self.name, self.type, "judge returned a non-numeric score")
-
-        # The model's own pass/fail is honoured when it gave one, since a rubric
-        # can encode a bar that a single threshold cannot.
-        passed = bool(parsed["passed"]) if isinstance(parsed.get("passed"), bool) \
-            else score >= self.pass_threshold
-
-        return GraderResult(
-            grader_name=self.name,
-            grader_type=self.type,
-            score=score,
-            passed=passed,
-            reason=str(parsed.get("reason", ""))[:1000],
-            assertions={
-                "criteria": parsed.get("criteria", {}),
-                # recorded so a score shift can be attributed to a judge change
-                # rather than mistaken for an agent regression
-                "judge_model": self.model,
-            },
-        )
 
 
 def pairwise_verdict(
@@ -481,18 +377,22 @@ class ToolResultUsedJudge:
         return _judged(self.name, self.type, self.model, raw)
 
 
-class MultiCriteriaJudge:
-    """One model call, several named criteria, one verdict.
+class LlmJudgeGrader:
+    """Score a trial with a model, against one criterion or several.
 
-    Separate judges per criterion would fit the existing machinery more neatly,
-    but cost a model call each — seven criteria over fifty tasks and three
-    trials is a thousand calls rather than a hundred and fifty. One call keeps
-    that affordable and is the only way to express weights and per-criterion
-    floors, neither of which the suite's pass policy can say.
+    There is no separate single-criterion judge. A configuration that names no
+    criteria gets one called `overall`, and from there the prompt, the
+    weighting, the floors and the breakdown are identical — one code path
+    rather than two that drift apart.
 
-    The per-criterion scores go into ``assertions`` rather than becoming
-    separate results, so the trial has one verdict while the breakdown stays
-    readable.
+    One model call however many criteria: seven of them over fifty tasks and
+    three trials is a thousand calls rather than a hundred and fifty, and
+    weights and floors are not expressible by the suite's pass policy anyway.
+
+    The verdict is always score-then-threshold. An earlier version let the model
+    return its own pass/fail, which sounds accommodating and makes results
+    incomparable: one trial passes at 0.6 and another fails at 0.7 because the
+    judge felt differently that time. A rubric steers the score instead.
     """
 
     type = "llm_judge"
@@ -500,22 +400,32 @@ class MultiCriteriaJudge:
     def __init__(
         self,
         complete: Callable[[str], str],
-        config: JudgeConfig,
+        config: JudgeConfig | None = None,
         *,
         name: str = "llm_judge",
     ):
         self._complete = complete
-        self.config = config
+        self.config = config or JudgeConfig()
         self.name = name
-        self.model = config.model or DEFAULT_MODEL
+        self.model = self.config.model or DEFAULT_MODEL
         # Only when the configuration asks to see the trajectory: a judge that
         # is not shown tool calls must not be marked ungradable for want of a
         # trace it would never have read.
         self.needs_trace = bool(
-            {"tool_calls", "tool_results"} & set(config.inputs)
+            {"tool_calls", "tool_results"} & set(self.config.inputs)
         )
 
     def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+        criteria = self.config.effective_criteria()
+        if not self.config.multi and not task.rubric and not task.expected_output:
+            # Nothing to grade against: a judge asked to score against nothing
+            # returns a number anyway, and that number is noise dressed as a
+            # measurement.
+            return _ungradable(
+                self.name, self.type,
+                "no criteria, no rubric and no expected output: there is "
+                "nothing to grade against",
+            )
         if not trial.final_output:
             return _ungradable(self.name, self.type, "the agent produced no answer")
         if self.needs_trace and trace is None:
@@ -523,7 +433,6 @@ class MultiCriteriaJudge:
                 self.name, self.type,
                 "no trace: this judge is configured to read the tool calls",
             )
-
         calls, results = tool_calls_text(trace)
         prompt = render_prompt(
             self.config,
@@ -552,7 +461,7 @@ class MultiCriteriaJudge:
 
         graded: dict[str, float] = {}
         missing: list[str] = []
-        for criterion in self.config.criteria:
+        for criterion in criteria:
             value = scores.get(criterion.name)
             try:
                 graded[criterion.name] = float(value)
@@ -572,7 +481,7 @@ class MultiCriteriaJudge:
                 f"judge did not score {', '.join(missing)}",
             )
 
-        weights = {c.name: c.weight for c in self.config.criteria}
+        weights = {c.name: c.weight for c in criteria}
         total_weight = sum(weights.values())
         weighted = sum(graded[n] * weights[n] for n in graded) / total_weight
 
@@ -580,7 +489,7 @@ class MultiCriteriaJudge:
         # Seven good scores hiding one catastrophic safety result is exactly
         # what anyone configuring a critical dimension is guarding against.
         breached = [
-            c.name for c in self.config.criteria
+            c.name for c in criteria
             if c.critical_min is not None and graded[c.name] < c.critical_min
         ]
         passed = not breached and weighted >= self.config.pass_score
