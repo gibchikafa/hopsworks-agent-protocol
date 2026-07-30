@@ -316,8 +316,11 @@ class TestMetrics:
 
     def test_run_metrics_are_hand_checkable(self):
         trials = self._trials({"a": [True, True], "b": [True, False]})
+        # filtered by scope: `pass_rate` is emitted per task as well as per run,
+        # and flattening on the name alone silently reads the last task's value
         metrics = {m["metric_name"]: m["metric_value"]
-                   for m in run_metrics("r", "s", 7, trials)}
+                   for m in run_metrics("r", "s", 7, trials)
+                   if m["metric_scope"] == "run"}
         assert metrics["pass_rate"] == 0.75      # 3 of 4 trials
         assert metrics["pass_at_k"] == 1.0       # both tasks passed once
         assert metrics["pass_all_k"] == 0.5      # only a passed every time
@@ -325,8 +328,13 @@ class TestMetrics:
 
     def test_metric_rows_carry_the_scope_key(self):
         rows = run_metrics("r", "s", 7, self._trials({"a": [True]}))
-        assert all(row["metric_scope"] == "run" for row in rows)
-        assert all(row["metric_scope_value"] == "" for row in rows)
+        # run-scope rows carry no value; every other scope must, or two
+        # categories reporting the same metric collide into one row
+        for row in rows:
+            if row["metric_scope"] == "run":
+                assert row["metric_scope_value"] == ""
+            else:
+                assert row["metric_scope_value"]
 
 
 class TestGraderRobustness:

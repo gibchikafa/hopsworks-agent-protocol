@@ -114,7 +114,8 @@ def _to_suite(run: dict[str, Any], tasks: list[dict[str, Any]]) -> Suite:
     )
 
 
-def _write_results(feature_store: Any, result: Any, run: dict[str, Any]) -> None:
+def _write_results(feature_store: Any, result: Any, run: dict[str, Any],
+                   tasks: list[dict[str, Any]] | None = None) -> None:
     import pandas as pd
 
     now = datetime.now(tz=timezone.utc)
@@ -133,9 +134,9 @@ def _write_results(feature_store: Any, result: Any, run: dict[str, Any]) -> None
             "started_at": t.started_at,
             "completed_at": t.completed_at or now,
             "latency_ms": t.latency_ms,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "estimated_cost": None,
+            "input_tokens": t.input_tokens or 0,
+            "output_tokens": t.output_tokens or 0,
+            "estimated_cost": t.estimated_cost,
             "final_output": t.final_output,
             "error_type": t.error_type,
             "error_message": t.error_message,
@@ -166,7 +167,16 @@ def _write_results(feature_store: Any, result: Any, run: dict[str, Any]) -> None
     metric_rows = [
         {**m, "suite_version": run.get("suiteVersion", 1), "created_at": now}
         for m in run_metrics(
-            result.run_id, run["suiteId"], run["deploymentId"], result.trials
+            result.run_id,
+            run["suiteId"],
+            run["deploymentId"],
+            result.trials,
+            suite_type=run.get("suiteType", "regression"),
+            # so score-by-category has categories to group on; the tasks are
+            # already in hand from building the suite
+            categories={
+                t["taskId"]: t.get("category") or "" for t in (tasks or [])
+            },
         )
     ]
 
@@ -251,9 +261,11 @@ def main() -> None:
                 n_trials=run.get("nTrials", 1),
                 readiness_timeout_s=args.readiness_timeout_s,
                 max_concurrency=args.max_concurrency,
+                input_token_price_per_million=run.get("inputTokenPricePerMillion"),
+                output_token_price_per_million=run.get("outputTokenPricePerMillion"),
             ),
         )
-        _write_results(project.get_feature_store(), result, run)
+        _write_results(project.get_feature_store(), result, run, tasks)
         report(result.status)
         log.info("run %s finished: %s", args.run_id, result.status)
     except SpecError as err:

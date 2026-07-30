@@ -165,6 +165,12 @@ class Trial:
     # is written as an ordinary key/value metric row instead.
     tool_error_count: int | None = None
     tool_call_count: int | None = None
+    # Read off the trace's LLM spans. Previously written as a hard-coded zero,
+    # which made token and cost dashboards report a confident, wrong number
+    # rather than an obviously absent one.
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    estimated_cost: float | None = None
     started_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
     completed_at: datetime | None = None
 

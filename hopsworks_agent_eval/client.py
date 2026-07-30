@@ -170,6 +170,23 @@ class HopsworksAgentClient:
             key=lambda s: s.get("startTimeNs") or 0,
         )
 
+        llm_spans = [
+            s for s in spans
+            if (by_span.get(s.get("spanId"), {})
+                .get(conventions.SPAN_KIND, "")
+                .upper()) == conventions.SPAN_KIND_LLM
+        ]
+
+        def tokens(keys: Sequence[str]) -> int:
+            total = 0
+            for span in llm_spans:
+                raw = first(by_span.get(span.get("spanId"), {}), keys)
+                try:
+                    total += int(float(raw)) if raw else 0
+                except (TypeError, ValueError):
+                    continue
+            return total
+
         tool_calls = []
         for span in tool_spans:
             attrs = by_span.get(span.get("spanId"), {})
@@ -205,4 +222,10 @@ class HopsworksAgentClient:
                 1 for call in tool_calls if call["status"].endswith("ERROR")
             ),
             "span_count": len(spans),
+            "input_tokens": tokens(
+                (conventions.GEN_AI_USAGE_INPUT_TOKENS, conventions.LLM_TOKEN_COUNT_PROMPT)
+            ),
+            "output_tokens": tokens(
+                (conventions.GEN_AI_USAGE_OUTPUT_TOKENS, conventions.LLM_TOKEN_COUNT_COMPLETION)
+            ),
         }

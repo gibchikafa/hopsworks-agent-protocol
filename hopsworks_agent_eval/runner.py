@@ -75,6 +75,11 @@ class RunnerConfig:
     # self-inflicted load test on production capacity.
     readiness_timeout_s: float = 120.0
     readiness_poll_s: float = 2.0
+    # Taken from the deployment's tracing config so an eval run is costed the
+    # same way production traffic is. Absent means unpriced, which is reported
+    # as such rather than as free.
+    input_token_price_per_million: float | None = None
+    output_token_price_per_million: float | None = None
 
 
 @dataclass
@@ -265,6 +270,9 @@ def _run_trial(
     if trace is not None:
         trial.tool_error_count = int(trace.get("tool_error_count") or 0)
         trial.tool_call_count = len(trace.get("tool_calls") or trace.get("tool_names") or [])
+        trial.input_tokens = trace.get("input_tokens")
+        trial.output_tokens = trace.get("output_tokens")
+        trial.estimated_cost = _cost(trial, config)
 
     trial.grader_results = run_graders(graders, task, trial, trace)
     outcome = verdict(trial.grader_results, suite.pass_policy, suite.pass_threshold)
@@ -295,6 +303,22 @@ def _run_trial(
 
     trial.completed_at = datetime.now(tz=timezone.utc)
     return trial
+
+
+def _cost(trial: Trial, config: RunnerConfig) -> float | None:
+    """What this trial cost, or None when nobody configured a price.
+
+    None rather than 0.0 on purpose: a run with no pricing set up and a run that
+    genuinely cost nothing are different facts, and a dashboard summing zeros
+    reports the second when it means the first.
+    """
+    if config.input_token_price_per_million is None \
+            and config.output_token_price_per_million is None:
+        return None
+    return (
+        (trial.input_tokens or 0) * (config.input_token_price_per_million or 0.0)
+        + (trial.output_tokens or 0) * (config.output_token_price_per_million or 0.0)
+    ) / 1_000_000
 
 
 def run_suite(
