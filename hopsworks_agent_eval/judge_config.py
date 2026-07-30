@@ -39,13 +39,16 @@ from typing import Any, Callable, Sequence
 # Anthropic needs its own client.
 #
 # `default_model` is a starting point, not a recommendation that survives
-# contact with time — model names change faster than this file will.
+# contact with time — model names change faster than this file will. The UI asks
+# each provider what it currently offers rather than trusting these; they are
+# what the runner falls back to when a spec names no model at all.
+# Verified against provider documentation on 31 July 2026.
 PROVIDERS: dict[str, dict[str, str]] = {
     "openai": {
         "label": "OpenAI",
         "adapter": "openai",
         "base_url": "",
-        "default_model": "gpt-4o",
+        "default_model": "gpt-5.6-terra",
     },
     "anthropic": {
         "label": "Anthropic",
@@ -58,13 +61,13 @@ PROVIDERS: dict[str, dict[str, str]] = {
         "adapter": "openai",
         # Gemini's OpenAI-compatible surface, so it needs no separate client
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "default_model": "gemini-2.5-pro",
+        "default_model": "gemini-3.6-flash",
     },
     "mistral": {
         "label": "Mistral AI",
         "adapter": "openai",
         "base_url": "https://api.mistral.ai/v1",
-        "default_model": "mistral-large-latest",
+        "default_model": "mistral-medium-latest",
     },
     "fireworks": {
         "label": "Fireworks",
@@ -82,13 +85,13 @@ PROVIDERS: dict[str, dict[str, str]] = {
         "label": "DeepSeek",
         "adapter": "openai",
         "base_url": "https://api.deepseek.com",
-        "default_model": "deepseek-chat",
+        "default_model": "deepseek-v4-pro",
     },
     "xai": {
         "label": "xAI",
         "adapter": "openai",
         "base_url": "https://api.x.ai/v1",
-        "default_model": "",
+        "default_model": "grok-4.5",
     },
     # Anything else that speaks the same shape: vLLM, a gateway, an internal
     # deployment. Requires base_url, since there is nothing to guess.
@@ -471,7 +474,7 @@ def completer_for(
                 api_key=api_key, **({"base_url": base_url} if base_url else {})
             )
             response = client.chat.completions.create(
-                model=model or "gpt-4o",
+                model=model or "gpt-5.6-terra",
                 temperature=config.temperature,
                 max_tokens=config.max_tokens,
                 messages=[{"role": "user", "content": prompt}],
