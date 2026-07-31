@@ -22,7 +22,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from .grader_spec import SpecError, graders_for_task
+from .grader_spec import SpecError, graders_for_suite
 from .graders import (
     ContainsGrader,
     ExactMatchGrader,
@@ -94,6 +94,7 @@ def _to_suite(run: dict[str, Any], tasks: list[dict[str, Any]]) -> Suite:
         suite_version=run.get("suiteVersion", 1),
         type=SuiteType(run.get("suiteType", "regression")),
         execution_mode=ExecutionMode(run.get("executionMode", "read_only")),
+        graders=run.get("graders") or "",
         pass_policy=PassPolicy(run.get("passPolicy") or "all"),
         pass_threshold=float(run.get("passThreshold") or 0.7),
         tasks=[
@@ -105,7 +106,6 @@ def _to_suite(run: dict[str, Any], tasks: list[dict[str, Any]]) -> Suite:
                 expected_output=t.get("expectedOutput") or "",
                 required_tools=parse_tools(t.get("requiredTools")),
                 forbidden_tools=parse_tools(t.get("forbiddenTools")),
-                graders=t.get("graders") or "",
                 rubric=t.get("rubric") or "",
                 category=t.get("category") or "",
             )
@@ -265,10 +265,11 @@ def main() -> None:
             suite,
             run_id=args.run_id,
             deployment_id=run["deploymentId"],
-            # per task, not one list for the suite: a task's own spec decides,
-            # and inference only covers the tasks that declare none
-            graders=lambda t: graders_for_task(
-                t, judge_completer=completer, query=query,
+            # One list for the whole suite: every task is measured the same
+            # way, which is what makes the run's pass rate comparable to the
+            # next one's.
+            graders=graders_for_suite(
+                suite, judge_completer=completer, query=query,
                 secret_reader=secret_reader,
             ),
             config=RunnerConfig(

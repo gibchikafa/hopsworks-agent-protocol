@@ -1,7 +1,9 @@
-"""Graders a task asks for by name, rather than ones inferred for it.
+"""The checks a suite names, and what it refuses to accept as one.
 
-Inference covers the ordinary cases and reaches none of the others: before a
-spec existed, four implemented graders could never be selected by anything.
+The spec lives on the suite: a pass rate only means something if every task in
+it was measured the same way. Inference was removed with the move — checks
+derived from whatever each task happened to declare are exactly what makes two
+tasks in one suite incomparable.
 """
 
 from __future__ import annotations
@@ -12,11 +14,11 @@ import pytest
 
 from hopsworks_agent_eval.grader_spec import (
     SpecError,
-    graders_for_task,
+    graders_for_suite,
     graders_from_spec,
     validate_spec,
 )
-from hopsworks_agent_eval.models import Task
+from hopsworks_agent_eval.models import Suite, Task
 
 
 def task(**kwargs) -> Task:
@@ -51,7 +53,7 @@ class TestBuildingFromSpec:
         ]
 
     def test_a_named_grader_keeps_its_name(self):
-        # two regex graders on one task are only distinguishable by name
+        # two regex checks in one suite are only distinguishable by name
         graders = graders_from_spec(
             [{"type": "regex", "pattern": "a", "name": "has_order_id"}]
         )
@@ -62,8 +64,8 @@ class TestBuildingFromSpec:
         assert [g.type for g in graders] == ["llm_judge"]
 
     def test_judge_graders_are_skipped_when_no_judge_is_configured(self):
-        # not an error: the deterministic graders on the same task still run, and
-        # pretending a judgement happened would be worse than skipping it
+        # not an error: the deterministic checks in the same suite still run,
+        # and pretending a judgement happened would be worse than skipping it
         graders = graders_from_spec(
             [{"type": "llm_judge"}, {"type": "regex", "pattern": "a"}]
         )
@@ -106,7 +108,7 @@ class TestRefusals:
             graders_from_spec('[{"type": "tool_call"}, "regex"]')
 
     def test_an_unknown_type_lists_what_is_allowed(self):
-        # a typo should not silently produce a task graded by nothing
+        # a typo should not silently produce a suite graded by nothing
         with pytest.raises(SpecError, match="unknown grader type"):
             graders_from_spec('[{"type": "vibes"}]')
 
@@ -131,37 +133,31 @@ class TestRefusals:
             validate_spec('[{"type": "regex"}]')
 
 
-class TestSpecVersusInference:
-    def test_a_task_with_no_spec_is_inferred_as_before(self):
-        graders = graders_for_task(
-            task(expected_output="yes", required_tools=["a", "b"])
+class TestTheSuiteOwnsTheChecks:
+    def test_a_suite_names_what_every_task_is_graded_by(self):
+        suite = Suite(
+            suite_id="s1",
+            graders='[{"type": "regex", "pattern": "^ORD"}]',
         )
-        assert [g.type for g in graders] == [
-            "contains", "tool_call", "tool_order", "no_tool_error",
+        assert [g.type for g in graders_for_suite(suite)] == ["regex"]
+
+    def test_a_suite_with_no_checks_grades_by_nothing(self):
+        # there is no inference: checks derived from whatever each task happened
+        # to declare would make two tasks in one suite incomparable, which is
+        # the thing a suite exists to prevent
+        assert graders_for_suite(Suite(suite_id="s1")) == []
+
+    def test_the_checks_do_not_depend_on_the_tasks(self):
+        # the same suite grades every task the same way; what varies is what
+        # each task supplies to those checks
+        suite = Suite(
+            suite_id="s1",
+            graders='[{"type": "contains"}, {"type": "tool_call"}]',
+            tasks=[task(expected_output="a"), task(required_tools=["x"])],
+        )
+        assert [g.type for g in graders_for_suite(suite)] == [
+            "contains", "tool_call",
         ]
-
-    def test_a_spec_replaces_inference_rather_than_adding_to_it(self):
-        # a task asking for one regex must not also fail a substring check it
-        # never asked for
-        graders = graders_for_task(
-            task(
-                expected_output="yes",
-                required_tools=["a"],
-                graders='[{"type": "regex", "pattern": "^ORD"}]',
-            )
-        )
-        assert [g.type for g in graders] == ["regex"]
-
-    def test_inference_still_adds_a_judge_when_a_rubric_is_present(self):
-        graders = graders_for_task(
-            task(rubric="cites the policy"), judge_completer=completer
-        )
-        assert [g.type for g in graders] == ["llm_judge"]
-
-    def test_a_task_declaring_nothing_gets_nothing(self):
-        # its trials come back ungradable, which is honest; inventing a grader
-        # here would be a silent free pass
-        assert graders_for_task(task()) == []
 
 
 def _trial():

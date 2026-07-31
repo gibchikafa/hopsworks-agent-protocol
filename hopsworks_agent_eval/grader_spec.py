@@ -5,13 +5,15 @@ got a substring check, tools got the tool graders. That covers the common cases
 and reaches none of the others — a task had no way to ask for a regex, a JSON
 shape, or a state check, so four implemented graders could never run.
 
-A spec is a JSON array stored on the task:
+A spec is a JSON array stored on the suite:
 
     [{"type": "regex", "pattern": "^ORD-\\\\d{4}$"},
      {"type": "json_schema", "required_keys": ["order_id", "status"]}]
 
-Inference stays as the default for a task that declares nothing, because most
-tasks should not have to.
+The spec lives on the suite rather than on each task, so every task in a suite
+is measured the same way. There is no inference: checks derived from whatever a
+task happened to declare would make two tasks in one suite incomparable, which
+is the thing a suite exists to prevent.
 
 **Nothing here executes caller-supplied code.** ``FunctionGrader`` is
 deliberately absent: it wraps a Python callable, and resolving one from a
@@ -44,7 +46,7 @@ from .graders import (
 )
 from .judge_config import JudgeConfigError, completer_for, parse_judge_config
 from .judge_config import JudgeConfigError, completer_for, parse_judge_config
-from .models import Task
+from .models import Suite
 
 log = logging.getLogger(__name__)
 
@@ -250,38 +252,28 @@ def validate_spec(spec: str | None) -> None:
     graders_from_spec(spec, judge_completer=lambda _prompt: "", query=lambda _sql: None)
 
 
-def graders_for_task(
-    task: Task,
+def graders_for_suite(
+    suite: "Suite",
     *,
     judge_completer: Callable[[str], str] | None = None,
     query: Callable[[str], Any] | None = None,
     secret_reader: Callable[[str], str | None] | None = None,
 ) -> list[Grader]:
-    """What this task gets: its spec if it has one, inference otherwise.
+    """The checks every task in this suite is graded by.
 
-    A task that declares a spec gets exactly that and no additions. Quietly
-    appending inferred graders would mean a task asking for one regex could
-    still fail on a substring check it never asked for.
+    There is no per-task variation and no inference. Both were removed together,
+    because they are the same idea: if the checks are derived from what each
+    task happens to declare, two tasks in one suite are measured differently and
+    the suite's pass rate stops meaning anything. A suite names its checks, and
+    every task is held to them.
+
+    The checks are still parameterised by each task — a shared "contains" reads
+    each task's own expected output — so tasks differ in substance while the
+    measurement stays identical.
     """
-    if task.graders:
-        return graders_from_spec(
-            task.graders, judge_completer=judge_completer, query=query,
-            secret_reader=secret_reader,
-        )
-
-    graders: list[Grader] = []
-    if judge_completer is not None and task.rubric:
-        from .judges import LlmJudgeGrader
-
-        graders.append(LlmJudgeGrader(judge_completer))
-    if task.expected_output:
-        # `contains` rather than exact match: for free text an exact match
-        # asserts the model's phrasing rather than its correctness
-        graders.append(ContainsGrader())
-    if task.required_tools or task.forbidden_tools:
-        graders.append(ToolCallGrader())
-    if len(task.required_tools) > 1:
-        graders.append(ToolOrderGrader())
-    if task.required_tools:
-        graders.append(NoToolErrorGrader())
-    return graders
+    return graders_from_spec(
+        suite.graders,
+        judge_completer=judge_completer,
+        query=query,
+        secret_reader=secret_reader,
+    )

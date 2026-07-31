@@ -36,7 +36,7 @@ from .promotion import (
 )
 from .client import HopsworksAgentClient
 from .judge_config import JudgeConfig, JudgeConfigError, default_templates
-from .grader_spec import SpecError, graders_for_task, graders_from_spec, validate_spec
+from .grader_spec import SpecError, graders_for_suite, graders_from_spec, validate_spec
 from .judges import (
     LlmJudgeGrader,
     PairwiseGrader,
@@ -56,7 +56,7 @@ __all__ = [
     "JudgeConfig",
     "JudgeConfigError",
     "default_templates",
-    "graders_for_task",
+    "graders_for_suite",
     "graders_from_spec",
     "validate_spec",
     "RunnerConfig",

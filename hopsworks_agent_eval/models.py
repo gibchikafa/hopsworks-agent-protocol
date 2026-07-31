@@ -79,11 +79,6 @@ class Task:
     rubric: str = ""
     category: str = ""
     tags: list[str] = field(default_factory=list)
-    # JSON array naming the graders this task wants, e.g.
-    # [{"type": "regex", "pattern": "^ORD-\\d{4}$"}]. Empty means "infer from
-    # what the task declares", which is right for most tasks and wrong for any
-    # that needs a check no other field implies.
-    graders: str = ""
 
     @property
     def prompt(self) -> str:
@@ -124,6 +119,14 @@ class Suite:
     type: SuiteType = SuiteType.REGRESSION
     execution_mode: ExecutionMode = ExecutionMode.READ_ONLY
     tasks: list[Task] = field(default_factory=list)
+    # The checks every task in this suite is graded by, as a JSON array.
+    #
+    # On the suite rather than on each task: a suite is a measurement, and a
+    # pass rate only means something if the measurement is constant. Per task,
+    # "60% passed" would aggregate incomparable things — and pass_policy below
+    # could not be a suite-level rule at all, since the things it combines have
+    # to be the same for every task.
+    graders: str = ""
     pass_policy: PassPolicy = PassPolicy.ALL
     # Only read under THRESHOLD: the mean score every gradable grader must reach.
     pass_threshold: float = 0.7
