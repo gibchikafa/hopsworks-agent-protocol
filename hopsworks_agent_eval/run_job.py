@@ -33,7 +33,7 @@ from .evaluators import (
 )
 from .judges import DEFAULT_MODEL, LlmJudgeEvaluator, anthropic_completer
 from .metrics import run_metrics
-from .models import ExecutionMode, PassPolicy, Suite, SuiteType, Task
+from .models import ExecutionMode, PassPolicy, Suite, Task
 from .runner import RunnerConfig, SuiteRefused, run_suite
 
 log = logging.getLogger(__name__)
@@ -92,7 +92,8 @@ def _to_suite(run: dict[str, Any], tasks: list[dict[str, Any]]) -> Suite:
     return Suite(
         suite_id=run["suiteId"],
         suite_version=run.get("suiteVersion", 1),
-        type=SuiteType(run.get("suiteType", "regression")),
+        tags=run.get("tags") or [],
+        blocks_are_success=bool(run.get("blocksAreSuccess")),
         execution_mode=ExecutionMode(run.get("executionMode", "read_only")),
         evaluators=run.get("evaluators") or "",
         pass_policy=PassPolicy(run.get("passPolicy") or "all"),
@@ -171,7 +172,7 @@ def _write_results(feature_store: Any, result: Any, run: dict[str, Any],
             run["suiteId"],
             run["deploymentId"],
             result.trials,
-            suite_type=run.get("suiteType", "regression"),
+            blocks_are_success=bool(run.get("blocksAreSuccess")),
             # so score-by-category has categories to group on; the tasks are
             # already in hand from building the suite
             categories={

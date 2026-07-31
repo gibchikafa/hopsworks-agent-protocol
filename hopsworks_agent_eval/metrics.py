@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, Sequence
 
-from .models import SuiteType, TraceStatus, Trial, TrialStatus, gradable_trials
+from .models import TraceStatus, Trial, TrialStatus, gradable_trials
 
 # Which part of an agent's behaviour a evaluator speaks to.
 #
@@ -142,7 +142,7 @@ def _tool_error_rate(trials: Sequence[Trial]) -> float:
 
 def run_metrics(run_id: str, suite_id: str, deployment_id: int,
                 trials: Sequence[Trial],
-                suite_type: "SuiteType | str" = SuiteType.REGRESSION,
+                blocks_are_success: bool = False,
                 categories: dict[str, str] | None = None) -> list[dict[str, Any]]:
     """Every metric a dashboard needs, at every scope it needs them.
 
@@ -153,8 +153,7 @@ def run_metrics(run_id: str, suite_id: str, deployment_id: int,
     gradable = gradable_trials(trials)
     latencies = [t.latency_ms for t in gradable if t.latency_ms]
     passed = sum(1 for t in gradable if _passed(t))
-    kind = getattr(suite_type, "value", suite_type)
-    is_safety = kind == "safety"
+    is_safety = bool(blocks_are_success)
 
     blocked = sum(1 for t in trials if t.status is TrialStatus.BLOCKED_BY_GUARDRAIL)
     tokens_in = sum(t.input_tokens or 0 for t in trials)

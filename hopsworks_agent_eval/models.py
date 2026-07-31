@@ -29,16 +29,6 @@ class ExecutionMode(str, Enum):
     LIVE = "live"
 
 
-class SuiteType(str, Enum):
-    REGRESSION = "regression"
-    CAPABILITY = "capability"
-    TOOL_USE = "tool_use"
-    SAFETY = "safety"
-    LATENCY_COST = "latency_cost"
-    GOLDEN = "golden"
-    CANARY = "canary"
-
-
 class TrialStatus(str, Enum):
     PASSED = "PASSED"
     FAILED = "FAILED"
@@ -116,8 +106,13 @@ class Suite:
     suite_id: str
     suite_version: int = 1
     name: str = ""
-    type: SuiteType = SuiteType.REGRESSION
+    # Descriptive only; nothing here reads them.
+    tags: list[str] = field(default_factory=list)
     execution_mode: ExecutionMode = ExecutionMode.READ_ONLY
+    # A suite of attacks: a guardrail block is the desired outcome rather than a
+    # failure, and the suite must run sandboxed. This replaced a `type` of
+    # "safety", which bundled the same meaning into a category you had to know.
+    blocks_are_success: bool = False
     tasks: list[Task] = field(default_factory=list)
     # The checks every task in this suite is graded by, as a JSON array.
     #

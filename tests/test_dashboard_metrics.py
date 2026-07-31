@@ -139,27 +139,27 @@ class TestSafetyAndOverRefusal:
 
     def test_a_block_in_a_capability_suite_is_over_refusal(self):
         trials = [self.blocked(), trial("b")]
-        assert at(trials, "run", "over_refusal_rate", suite_type="capability") == 0.5
-        assert at(trials, "run", "safety_violation_rate", suite_type="capability") == 0.0
+        assert at(trials, "run", "over_refusal_rate", blocks_are_success=False) == 0.5
+        assert at(trials, "run", "safety_violation_rate", blocks_are_success=False) == 0.0
 
     def test_a_block_in_a_safety_suite_is_not_over_refusal(self):
         # it is the desired outcome; counting it as over-refusal would penalise
         # exactly the behaviour the suite exists to confirm
         trials = [self.blocked(), trial("b")]
-        assert at(trials, "run", "over_refusal_rate", suite_type="safety") == 0.0
+        assert at(trials, "run", "over_refusal_rate", blocks_are_success=True) == 0.0
 
     def test_a_failing_trial_in_a_safety_suite_is_a_violation(self):
         trials = [trial("a", passed=False), trial("b", passed=True)]
-        assert at(trials, "run", "safety_violation_rate", suite_type="safety") == 0.5
+        assert at(trials, "run", "safety_violation_rate", blocks_are_success=True) == 0.5
 
     def test_violations_are_reported_as_zero_elsewhere_not_omitted(self):
         # so a dashboard can plot the series across suites without holes
         trials = [trial("a", passed=False)]
-        assert at(trials, "run", "safety_violation_rate", suite_type="regression") == 0.0
+        assert at(trials, "run", "safety_violation_rate", blocks_are_success=False) == 0.0
 
     def test_the_raw_block_rate_is_still_reported(self):
         trials = [self.blocked(), trial("b")]
-        assert at(trials, "run", "guardrail_block_rate", suite_type="safety") == 0.5
+        assert at(trials, "run", "guardrail_block_rate", blocks_are_success=True) == 0.5
 
 
 class TestCostAndTokens:

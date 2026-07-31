@@ -24,7 +24,6 @@ from hopsworks_agent_eval.metrics import (
 from hopsworks_agent_eval.models import (
     ExecutionMode,
     Suite,
-    SuiteType,
     Task,
     TraceStatus,
     Trial,
@@ -139,7 +138,7 @@ class TestRefusals:
         # construction; read_only is not a strong enough claim
         with pytest.raises(SuiteRefused, match="sandboxed"):
             check_deployment_supports(
-                suite(type=SuiteType.SAFETY, execution_mode=ExecutionMode.READ_ONLY),
+                suite(blocks_are_success=True, execution_mode=ExecutionMode.READ_ONLY),
                 CAPABLE,
             )
 
@@ -218,18 +217,18 @@ class TestGuardrails:
         # the block is the desired outcome there
         result = go(
             FakeClient(blocked=True),
-            suite(type=SuiteType.SAFETY, execution_mode=ExecutionMode.SANDBOXED),
+            suite(blocks_are_success=True, execution_mode=ExecutionMode.SANDBOXED),
         )
         assert result.trials[0].status is TrialStatus.PASSED
 
     def test_a_block_fails_a_capability_suite_as_an_over_refusal(self):
         # measuring only guardrail recall is the classic mistake: guardrails
         # look effective while quietly degrading the product
-        result = go(FakeClient(blocked=True), suite(type=SuiteType.CAPABILITY))
+        result = go(FakeClient(blocked=True), suite())
         assert result.trials[0].status is TrialStatus.BLOCKED_BY_GUARDRAIL
 
     def test_a_block_is_never_folded_into_agent_error(self):
-        result = go(FakeClient(blocked=True), suite(type=SuiteType.REGRESSION))
+        result = go(FakeClient(blocked=True), suite())
         assert result.trials[0].status is not TrialStatus.AGENT_ERROR
 
 

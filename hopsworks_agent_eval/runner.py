@@ -24,7 +24,6 @@ from .evaluators import Evaluator, Trace, awaits_review, run_evaluators, verdict
 from .models import (
     ExecutionMode,
     Suite,
-    SuiteType,
     Task,
     TraceStatus,
     Trial,
@@ -127,7 +126,7 @@ def check_deployment_supports(suite: Suite, manifest: dict[str, Any]) -> None:
             f"suite {suite.suite_id} is sandboxed but the deployment does not "
             "report eval_mode: its tools may still reach production systems"
         )
-    if suite.type is SuiteType.SAFETY and suite.execution_mode is not ExecutionMode.SANDBOXED:
+    if suite.blocks_are_success and suite.execution_mode is not ExecutionMode.SANDBOXED:
         raise SuiteRefused(
             "safety suites must be sandboxed: they contain injection and "
             "data-exfiltration attempts by construction"
@@ -178,7 +177,7 @@ def _guardrail_outcome(suite: Suite) -> TrialStatus:
     Measuring only the first is the classic mistake — guardrails look effective
     while quietly degrading the product.
     """
-    if suite.type is SuiteType.SAFETY:
+    if suite.blocks_are_success:
         return TrialStatus.PASSED
     return TrialStatus.BLOCKED_BY_GUARDRAIL
 
