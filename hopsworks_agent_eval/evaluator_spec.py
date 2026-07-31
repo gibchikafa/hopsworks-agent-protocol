@@ -252,6 +252,37 @@ def validate_spec(spec: str | None) -> None:
     evaluators_from_spec(spec, judge_completer=lambda _prompt: "", query=lambda _sql: None)
 
 
+def flatten_rows(spec: str | Sequence[dict[str, Any]] | None):
+    """Rows as the spec builder wants them: config merged in beside type and name.
+
+    The API stores one row per check with everything but its type and name in a
+    `config` object, so a suite is not rationed one column for all of them. The
+    builder reads a flat entry, which is also what a person writes by hand, so
+    the two shapes meet here rather than in every caller.
+    """
+    if not isinstance(spec, (list, tuple)):
+        return spec
+    entries = []
+    for row in spec:
+        if not isinstance(row, dict) or "config" not in row:
+            entries.append(row)
+            continue
+        merged = dict(row)
+        config = merged.pop("config") or {}
+        merged.pop("position", None)
+        if isinstance(config, str):
+            try:
+                config = json.loads(config) if config.strip() else {}
+            except ValueError:
+                config = {}
+        if isinstance(config, dict):
+            merged = {**config, **merged}
+        if merged.get("name") is None:
+            merged.pop("name", None)
+        entries.append(merged)
+    return entries
+
+
 def evaluators_for_suite(
     suite: "Suite",
     *,
@@ -272,7 +303,7 @@ def evaluators_for_suite(
     measurement stays identical.
     """
     return evaluators_from_spec(
-        suite.evaluators,
+        flatten_rows(suite.evaluators),
         judge_completer=judge_completer,
         query=query,
         secret_reader=secret_reader,

@@ -63,12 +63,53 @@ class Task:
     input_messages: str
     task_version: int = 1
     task_type: str = "single_turn"
-    expected_output: str = ""
-    required_tools: list[str] = field(default_factory=list)
-    forbidden_tools: list[str] = field(default_factory=list)
-    rubric: str = ""
+    #: What this task expects, keyed by the name of the check that reads it.
+    #:
+    #: One entry per check rather than four fixed fields. What counts as correct
+    #: is a property of the pairing — "UB40" is the answer one check wants, an
+    #: ordered tool list is what another wants — so a check reading something
+    #: new needs no new field here, and two checks that both want an answer can
+    #: each have their own.
+    #:
+    #: The value is free text whose meaning the check defines. `expects_text`,
+    #: `expects_list` and `expects_tools` below are how a check reads one.
+    expectations: dict[str, str] = field(default_factory=dict)
     category: str = ""
     tags: list[str] = field(default_factory=list)
+
+    def expects_text(self, name: str) -> str:
+        """What this task expects of the named check, as written."""
+        return (self.expectations.get(name) or "").strip()
+
+    def expects_list(self, name: str) -> list[str]:
+        """The same value read as a comma-separated list, order preserved."""
+        return [item.strip() for item in self.expects_text(name).split(",") if item.strip()]
+
+    def expects_tools(self, name: str) -> tuple[list[str], list[str]]:
+        """The required and forbidden lists a tool check reads.
+
+        The one expectation that is two things, so it is stored as a JSON object
+        when both directions are used. A bare comma-separated list still means
+        the tools that must be called, which is what a hand-written CSV column
+        holds and what someone types first.
+        """
+        import json
+
+        raw = self.expects_text(name)
+        if raw.startswith("{"):
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                return [], []
+            if not isinstance(parsed, dict):
+                return [], []
+            required = parsed.get("required") or []
+            forbidden = parsed.get("forbidden") or []
+            return (
+                [str(t) for t in required if str(t).strip()],
+                [str(t) for t in forbidden if str(t).strip()],
+            )
+        return self.expects_list(name), []
 
     @property
     def prompt(self) -> str:
@@ -121,7 +162,14 @@ class Suite:
     # "60% passed" would aggregate incomparable things — and pass_policy below
     # could not be a suite-level rule at all, since the things it combines have
     # to be the same for every task.
-    evaluators: str = ""
+    #: The checks every task is graded by.
+    #:
+    #: Either the flat JSON array the spec builder reads, or the rows the API
+    #: stores — one dict per check with its `config` held separately. Both are
+    #: accepted because they are the same list either side of one storage
+    #: decision, and a runner that only understood one of them would break the
+    #: moment the other appeared.
+    evaluators: str | list[dict] = ""
     pass_policy: PassPolicy = PassPolicy.ALL
     # Only read under THRESHOLD: the mean score every gradable evaluator must reach.
     pass_threshold: float = 0.7

@@ -53,7 +53,12 @@ class CandidateTask:
     source_deployment_id: int
     task_type: str
     input_messages: str
-    expected_output: str
+    #: What the agent actually answered, proposed as an expectation.
+    #:
+    #: A suggestion, not a stored expectation: a promoted task has no suite yet,
+    #: so there is no check to key an expectation to. It becomes one when the
+    #: task joins a suite and someone says which check it answers.
+    proposed_output: str
     redaction_status: RedactionStatus
     findings: list[dict[str, Any]] = field(default_factory=list)
     required_tools: list[str] = field(default_factory=list)
@@ -70,8 +75,11 @@ class CandidateTask:
             "task_version": 1,
             "task_type": self.task_type,
             "input_messages": self.input_messages,
-            "expected_output": self.expected_output,
-            "required_tools": json.dumps(self.required_tools),
+            # Carried alongside the task rather than as a column on it: the
+            # backend stores expectations per check, and this one answers none
+            # yet.
+            "proposed_output": self.proposed_output,
+            "proposed_tools": json.dumps(self.required_tools),
             "source_trace_id": self.source_trace_id,
             "source_deployment_id": self.source_deployment_id,
             "redaction_status": self.redaction_status.value,
@@ -121,7 +129,7 @@ def promote_trace(
     )
 
     findings = _finding_dicts(detectors.detect(input_messages), "input_messages")
-    findings += _finding_dicts(detectors.detect(answer), "expected_output")
+    findings += _finding_dicts(detectors.detect(answer), "proposed_output")
 
     if findings and auto_redact:
         input_messages = detectors.redact(input_messages)
@@ -147,7 +155,7 @@ def promote_trace(
         source_deployment_id=trace_features.get("deployment_id", 0),
         task_type="single_turn",
         input_messages=input_messages,
-        expected_output=answer,
+        proposed_output=answer,
         redaction_status=status,
         findings=findings,
         required_tools=required_tools,
@@ -174,7 +182,7 @@ def confirm_redaction(
     if input_messages is not None:
         task.input_messages = input_messages
     if expected_output is not None:
-        task.expected_output = expected_output
+        task.proposed_output = expected_output
     task.reviewer = reviewer
     task.redaction_status = RedactionStatus.REDACTED
     return task

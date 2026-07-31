@@ -171,7 +171,7 @@ class PairwiseEvaluator:
         self.model = model
 
     def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
-        reference = self.reference or task.expected_output
+        reference = self.reference or task.expects_text(self.name)
         if not reference:
             return _ungradable(
                 self.name, self.type,
@@ -185,7 +185,7 @@ class PairwiseEvaluator:
             question=task.prompt,
             answer_a=reference,
             answer_b=trial.final_output,
-            rubric=task.rubric,
+            rubric=task.expects_text(self.name),
         )
         winner = outcome.get("winner")
         if winner not in ("a", "b", "tie"):
@@ -320,7 +320,9 @@ class ToolArgumentsJudge:
         prompt = TOOL_ARGUMENTS_PROMPT.format(
             question=task.prompt,
             calls=rendered,
-            rubric_block=f"\n<criteria>\n{task.rubric}\n</criteria>\n" if task.rubric else "",
+            rubric_block=(
+                f"\n<criteria>\n{rubric}\n</criteria>\n" if (rubric := task.expects_text(self.name)) else ""
+            ),
         )
         try:
             raw = self._complete(prompt)
@@ -417,7 +419,7 @@ class LlmJudgeEvaluator:
 
     def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         criteria = self.config.effective_criteria()
-        if not self.config.multi and not task.rubric and not task.expected_output:
+        if not self.config.multi and not task.expects_text(self.name):
             # Nothing to grade against: a judge asked to score against nothing
             # returns a number anyway, and that number is noise dressed as a
             # measurement.
@@ -438,8 +440,8 @@ class LlmJudgeEvaluator:
             self.config,
             question=task.prompt,
             answer=trial.final_output,
-            expected=task.expected_output,
-            rubric=task.rubric,
+            expected=task.expects_text(self.name),
+            rubric=task.expects_text(self.name),
             tool_calls=calls,
             tool_results=results,
         )

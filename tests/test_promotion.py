@@ -88,13 +88,13 @@ class TestRedactionOnPromotion:
         assert "a@b.com" not in task.input_messages
         assert "[EMAIL]" in task.input_messages
 
-    def test_secrets_in_the_expected_output_are_flagged(self):
+    def test_secrets_in_the_proposed_output_are_flagged(self):
         task = promote_trace(
             trace(final_output="your key is AKIAIOSFODNN7EXAMPLE"),
             task_id="task-1",
         )
         assert any(f["kind"] == "AWS_ACCESS_KEY" for f in task.findings)
-        assert "AKIAIOSFODNN7EXAMPLE" not in task.expected_output
+        assert "AKIAIOSFODNN7EXAMPLE" not in task.proposed_output
 
     def test_findings_record_the_field_they_came_from(self):
         task = promote_trace(
@@ -105,7 +105,7 @@ class TestRedactionOnPromotion:
             task_id="task-1",
         )
         by_field = {f["field"]: f["kind"] for f in task.findings}
-        assert by_field == {"input_messages": "EMAIL", "expected_output": "IP_ADDRESS"}
+        assert by_field == {"input_messages": "EMAIL", "proposed_output": "IP_ADDRESS"}
 
     def test_findings_never_carry_the_secret_itself(self):
         task = promote_trace(
@@ -120,29 +120,29 @@ class TestRedactionOnPromotion:
             auto_redact=False,
         )
         assert task.findings, "detection must still run"
-        assert "AKIAIOSFODNN7EXAMPLE" in task.expected_output
+        assert "AKIAIOSFODNN7EXAMPLE" in task.proposed_output
 
     def test_a_reviewer_can_edit_the_content_while_confirming(self):
         task = promote_trace(trace(), task_id="task-1")
         confirm_redaction(
             task, reviewer="gibson@logicalclocks.com", expected_output="corrected"
         )
-        assert task.expected_output == "corrected"
+        assert task.proposed_output == "corrected"
         assert task.redaction_status is RedactionStatus.REDACTED
 
 
 class TestTaskContent:
-    def test_the_correction_is_used_as_the_expected_output(self):
+    def test_the_correction_is_used_as_the_proposal(self):
         # promotion usually comes from negative feedback: the corrected answer
         # is the point, not what the agent actually said
         task = promote_trace(
             trace(), task_id="task-1", expected_output="Led Zeppelin III only"
         )
-        assert task.expected_output == "Led Zeppelin III only"
+        assert task.proposed_output == "Led Zeppelin III only"
 
     def test_without_a_correction_it_falls_back_to_the_agents_answer(self):
         task = promote_trace(trace(), task_id="task-1")
-        assert task.expected_output.startswith("In Through The Out Door")
+        assert task.proposed_output.startswith("In Through The Out Door")
 
     def test_tools_the_trace_used_become_required_tools(self):
         task = promote_trace(trace(), task_id="task-1")

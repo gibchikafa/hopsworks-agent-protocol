@@ -60,13 +60,13 @@ class ExactMatchEvaluator:
         self.case_sensitive = case_sensitive
 
     def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
-        expected, actual = task.expected_output.strip(), trial.final_output.strip()
+        expected, actual = task.expects_text(self.name), trial.final_output.strip()
         if not self.case_sensitive:
             expected, actual = expected.lower(), actual.lower()
         passed = expected == actual
         return EvaluatorResult(
             self.name, self.type, 1.0 if passed else 0.0, passed,
-            "exact match" if passed else f"expected {task.expected_output!r}",
+            "exact match" if passed else f"expected {expected!r}",
         )
 
 
@@ -85,7 +85,9 @@ class ContainsEvaluator:
         self.expected = expected
 
     def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
-        needle = (self.expected if self.expected is not None else task.expected_output).strip()
+        needle = (
+            self.expected.strip() if self.expected is not None else task.expects_text(self.name)
+        )
         passed = needle.lower() in trial.final_output.lower()
         return EvaluatorResult(
             self.name, self.type, 1.0 if passed else 0.0, passed,
@@ -167,8 +169,9 @@ class ToolCallEvaluator:
                 "no trace: tool use cannot be judged from the answer alone",
             )
         called = _tool_names(trace)
-        missing = [t for t in task.required_tools if t not in called]
-        forbidden = [t for t in task.forbidden_tools if t in called]
+        required, not_allowed = task.expects_tools(self.name)
+        missing = [t for t in required if t not in called]
+        forbidden = [t for t in not_allowed if t in called]
         passed = not missing and not forbidden
         reasons = []
         if missing:
@@ -205,7 +208,7 @@ class ToolOrderEvaluator:
         if trace is None:
             return _ungradable(self.name, self.type, "no trace: order cannot be judged")
         called = _tool_names(trace)
-        remaining = list(task.required_tools)
+        remaining = task.expects_list(self.name)
         for name in called:
             if remaining and name == remaining[0]:
                 remaining.pop(0)
@@ -551,7 +554,7 @@ class UnnecessaryToolEvaluator:
         calls = _tool_calls(trace)
         if calls is None:
             return _ungradable(self.name, self.type, "no trace: tool calls unknown")
-        allowed = set(self.allowed or task.required_tools)
+        allowed = set(self.allowed or task.expects_list(self.name))
         if not allowed:
             return _ungradable(
                 self.name, self.type,

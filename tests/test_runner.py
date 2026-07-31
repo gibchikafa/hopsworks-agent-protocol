@@ -76,6 +76,38 @@ class FakeClient:
         return self._trace
 
 
+
+def _expects(kwargs: dict) -> dict:
+    """Legacy per-field kwargs, written as the expectations they now are.
+
+    Expectations are keyed by the check that reads them, and a check's name
+    defaults to its type — so `required_tools=["x"]` is what the `tool_call` and
+    `tool_order` checks expect, and an expected answer is what every check that
+    reads one expects. Written once here so a test can still say the thing it
+    means.
+    """
+    import json as _json
+
+    expectations = dict(kwargs.pop("expectations", {}) or {})
+    answer = kwargs.pop("expected_output", None)
+    if answer is not None:
+        for name in ("exact_match", "contains", "pairwise", "llm_judge"):
+            expectations.setdefault(name, answer)
+    rubric = kwargs.pop("rubric", None)
+    if rubric is not None:
+        expectations["llm_judge"] = rubric
+    required = kwargs.pop("required_tools", None)
+    forbidden = kwargs.pop("forbidden_tools", None)
+    if required is not None or forbidden is not None:
+        expectations["tool_call"] = _json.dumps(
+            {"required": required or [], "forbidden": forbidden or []}
+        )
+        expectations["tool_order"] = ", ".join(required or [])
+        expectations["no_unnecessary_tools"] = ", ".join(required or [])
+    if expectations:
+        kwargs["expectations"] = expectations
+    return kwargs
+
 def task(**kwargs):
     defaults = {
         "task_id": "t1",
@@ -83,7 +115,7 @@ def task(**kwargs):
         "expected_output": "4",
     }
     defaults.update(kwargs)
-    return Task(**defaults)
+    return Task(**_expects(defaults))
 
 
 def suite(**kwargs):
@@ -415,11 +447,19 @@ class TestPerTaskEvaluators:
     def test_each_task_gets_its_own_evaluators(self):
         answered = suite(tasks=[
             task(task_id="answer", expected_output="4"),
-            task(task_id="tools", expected_output="", required_tools=["search"]),
+            task(
+                task_id="tools",
+                expected_output="",
+                expectations={"tool_call": "search"},
+            ),
         ])
 
         def per_task(t):
-            return [ExactMatchEvaluator()] if t.expected_output else [ToolCallEvaluator()]
+            return (
+                [ExactMatchEvaluator()]
+                if t.expects_text("exact_match")
+                else [ToolCallEvaluator()]
+            )
 
         result = go(FakeClient(trace={"root_span_id": "a", "tool_names": '["search"]'}),
                     answered, evaluators=per_task)
