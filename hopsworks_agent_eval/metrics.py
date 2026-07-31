@@ -17,7 +17,7 @@ from typing import Any, Sequence
 
 from .models import SuiteType, TraceStatus, Trial, TrialStatus, gradable_trials
 
-# Which part of an agent's behaviour a grader speaks to.
+# Which part of an agent's behaviour a evaluator speaks to.
 #
 # The split is a judgement call and worth stating rather than leaving implied:
 # **final answer** is what the agent said, **tool use** is which tools it
@@ -28,9 +28,9 @@ from .models import SuiteType, TraceStatus, Trial, TrialStatus, gradable_trials
 # `sql_state` sits in trajectory because it asserts what the run *did* rather
 # than what it *said*. `human_review` sits in final answer because that is what
 # a reviewer is nearly always asked about. Neither placement is forced, and a
-# grader whose type is unknown here is counted in no family rather than
+# evaluator whose type is unknown here is counted in no family rather than
 # guessed into one.
-GRADER_FAMILIES: dict[str, str] = {
+EVALUATOR_FAMILIES: dict[str, str] = {
     "exact_match": "final_answer",
     "contains": "final_answer",
     "regex": "final_answer",
@@ -147,7 +147,7 @@ def run_metrics(run_id: str, suite_id: str, deployment_id: int,
     """Every metric a dashboard needs, at every scope it needs them.
 
     Rows carry ``metric_scope`` and ``metric_scope_value`` so one table answers
-    "how did the run do", "how did this task do" and "how did this grader
+    "how did the run do", "how did this task do" and "how did this evaluator
     behave" without a second aggregation somewhere else that could disagree.
     """
     gradable = gradable_trials(trials)
@@ -213,7 +213,7 @@ def run_metrics(run_id: str, suite_id: str, deployment_id: int,
     ]
     rows.extend(_task_rows(run_id, suite_id, deployment_id, trials))
     rows.extend(_category_rows(run_id, suite_id, deployment_id, trials, categories or {}))
-    rows.extend(_grader_rows(run_id, suite_id, deployment_id, trials))
+    rows.extend(_evaluator_rows(run_id, suite_id, deployment_id, trials))
     rows.extend(_family_rows(run_id, suite_id, deployment_id, trials))
     rows.extend(_bucket_rows(run_id, suite_id, deployment_id, trials))
     return rows
@@ -279,33 +279,33 @@ def _category_rows(run_id: str, suite_id: str, deployment_id: int, trials: Seque
     return rows
 
 
-def _grader_results(trials: Sequence[Trial]):
+def _evaluator_results(trials: Sequence[Trial]):
     for trial in trials:
-        for result in trial.grader_results:
+        for result in trial.evaluator_results:
             yield result
 
 
-def _grader_rows(run_id: str, suite_id: str, deployment_id: int,
+def _evaluator_rows(run_id: str, suite_id: str, deployment_id: int,
                  trials: Sequence[Trial]) -> list[dict[str, Any]]:
-    """Per grader, including how often it could not judge.
+    """Per evaluator, including how often it could not judge.
 
-    `ungradable_rate` is the one to watch: a grader that never manages a verdict
+    `ungradable_rate` is the one to watch: a evaluator that never manages a verdict
     is contributing nothing while looking like coverage.
     """
     grouped: dict[str, list[Any]] = defaultdict(list)
-    for result in _grader_results(trials):
-        grouped[result.grader_name].append(result)
+    for result in _evaluator_results(trials):
+        grouped[result.evaluator_name].append(result)
 
     rows = []
     for name, results in grouped.items():
         gradable = [r for r in results if not r.ungradable]
-        rows.append(_row(run_id, suite_id, deployment_id, "grader", name, "pass_rate",
+        rows.append(_row(run_id, suite_id, deployment_id, "evaluator", name, "pass_rate",
                          sum(1 for r in gradable if r.passed) / len(gradable)
                          if gradable else 0.0, 0, len(results)))
-        rows.append(_row(run_id, suite_id, deployment_id, "grader", name, "mean_score",
+        rows.append(_row(run_id, suite_id, deployment_id, "evaluator", name, "mean_score",
                          sum(r.score for r in gradable) / len(gradable)
                          if gradable else 0.0, 0, len(results)))
-        rows.append(_row(run_id, suite_id, deployment_id, "grader", name, "ungradable_rate",
+        rows.append(_row(run_id, suite_id, deployment_id, "evaluator", name, "ungradable_rate",
                          (len(results) - len(gradable)) / len(results)
                          if results else 0.0, 0, len(results)))
     return rows
@@ -320,15 +320,15 @@ def _family_rows(run_id: str, suite_id: str, deployment_id: int,
     data changes underneath it.
     """
     grouped: dict[str, list[Any]] = defaultdict(list)
-    for result in _grader_results(trials):
-        family = GRADER_FAMILIES.get(result.grader_type)
+    for result in _evaluator_results(trials):
+        family = EVALUATOR_FAMILIES.get(result.evaluator_type)
         if family:
             grouped[family].append(result)
 
     rows = []
     for family, results in grouped.items():
         gradable = [r for r in results if not r.ungradable]
-        rows.append(_row(run_id, suite_id, deployment_id, "grader_family", family, "pass_rate",
+        rows.append(_row(run_id, suite_id, deployment_id, "evaluator_family", family, "pass_rate",
                          sum(1 for r in gradable if r.passed) / len(gradable)
                          if gradable else 0.0, 0, len(results)))
     return rows
@@ -336,13 +336,13 @@ def _family_rows(run_id: str, suite_id: str, deployment_id: int,
 
 def _bucket_rows(run_id: str, suite_id: str, deployment_id: int,
                  trials: Sequence[Trial]) -> list[dict[str, Any]]:
-    """The distribution of grader scores, as a share per bucket.
+    """The distribution of evaluator scores, as a share per bucket.
 
     Worth plotting because the shape is the tell: scores piling up at one value
     usually means a rubric everything satisfies, which reads as a healthy pass
     rate and measures nothing.
     """
-    gradable = [r for r in _grader_results(trials) if not r.ungradable]
+    gradable = [r for r in _evaluator_results(trials) if not r.ungradable]
     if not gradable:
         return []
     counts = {bucket: 0 for bucket in SCORE_BUCKETS}

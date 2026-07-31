@@ -7,7 +7,7 @@ deployment and how many trials all live on the row it names, so the job and the
 record cannot disagree about what was executed.
 
 What it does, in order: read the run, load the suite's tasks, execute them
-against the deployment, write trials, grader results and metrics to the feature
+against the deployment, write trials, evaluator results and metrics to the feature
 store, and report the outcome back. Reporting back matters as much as the work
 — a run stuck in RUNNING because the job died is indistinguishable from one
 still going, and the UI has no way to tell you which.
@@ -22,16 +22,16 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from .grader_spec import SpecError, graders_for_suite
-from .graders import (
-    ContainsGrader,
-    ExactMatchGrader,
-    Grader,
-    NoToolErrorGrader,
-    ToolCallGrader,
-    ToolOrderGrader,
+from .evaluator_spec import SpecError, evaluators_for_suite
+from .evaluators import (
+    ContainsEvaluator,
+    ExactMatchEvaluator,
+    Evaluator,
+    NoToolErrorEvaluator,
+    ToolCallEvaluator,
+    ToolOrderEvaluator,
 )
-from .judges import DEFAULT_MODEL, LlmJudgeGrader, anthropic_completer
+from .judges import DEFAULT_MODEL, LlmJudgeEvaluator, anthropic_completer
 from .metrics import run_metrics
 from .models import ExecutionMode, PassPolicy, Suite, SuiteType, Task
 from .runner import RunnerConfig, SuiteRefused, run_suite
@@ -39,7 +39,7 @@ from .runner import RunnerConfig, SuiteRefused, run_suite
 log = logging.getLogger(__name__)
 
 TRIALS_FG = "agent_eval_trials"
-GRADER_RESULTS_FG = "agent_eval_grader_results"
+EVALUATOR_RESULTS_FG = "agent_eval_evaluator_results"
 RUN_METRICS_FG = "agent_eval_run_metrics"
 
 
@@ -48,11 +48,11 @@ def _api(host: str, project_id: int) -> str:
 
 
 def _query_for(project: Any) -> Any:
-    """A read-only query function for state graders, or None.
+    """A read-only query function for state evaluators, or None.
 
     Bound to the feature store the job already authenticated to, so a state
     assertion sees exactly what the project can see and nothing wider. Returned
-    lazily: a suite with no sql_state grader should not pay for a session.
+    lazily: a suite with no sql_state evaluator should not pay for a session.
     """
     def query(sql: str) -> Any:
         return project.get_feature_store().sql(sql)
@@ -60,7 +60,7 @@ def _query_for(project: Any) -> Any:
     return query
 
 
-def _judge_for(project: Any) -> LlmJudgeGrader | None:
+def _judge_for(project: Any) -> LlmJudgeEvaluator | None:
     """An LLM judge, if the project has configured one.
 
     The key comes from a project secret named ``EVAL_JUDGE_API_KEY``: the
@@ -77,7 +77,7 @@ def _judge_for(project: Any) -> LlmJudgeGrader | None:
 
     model = os.environ.get("EVAL_JUDGE_MODEL", DEFAULT_MODEL)
     log.info("LLM judge enabled (model=%s)", model)
-    return LlmJudgeGrader(anthropic_completer(api_key, model), model=model)
+    return LlmJudgeEvaluator(anthropic_completer(api_key, model), model=model)
 
 
 def _to_suite(run: dict[str, Any], tasks: list[dict[str, Any]]) -> Suite:
@@ -94,7 +94,7 @@ def _to_suite(run: dict[str, Any], tasks: list[dict[str, Any]]) -> Suite:
         suite_version=run.get("suiteVersion", 1),
         type=SuiteType(run.get("suiteType", "regression")),
         execution_mode=ExecutionMode(run.get("executionMode", "read_only")),
-        graders=run.get("graders") or "",
+        evaluators=run.get("evaluators") or "",
         pass_policy=PassPolicy(run.get("passPolicy") or "all"),
         pass_threshold=float(run.get("passThreshold") or 0.7),
         tasks=[
@@ -144,25 +144,25 @@ def _write_results(feature_store: Any, result: Any, run: dict[str, Any],
         }
         for t in result.trials
     ]
-    grader_rows = [
+    evaluator_rows = [
         {
             "run_id": t.run_id,
-            "result_id": f"{t.trial_id}/{g.grader_name}",
+            "result_id": f"{t.trial_id}/{g.evaluator_name}",
             "trial_id": t.trial_id,
             "task_id": t.task_id,
-            "grader_name": g.grader_name,
-            "grader_type": g.grader_type,
+            "evaluator_name": g.evaluator_name,
+            "evaluator_type": g.evaluator_type,
             "score": g.score,
             "passed": g.passed,
             "ungradable": g.ungradable,
             "reason": g.reason,
             "assertions_json": json.dumps(g.assertions),
             "judge_model": str(g.assertions.get("judge_model", "")),
-            "grader_version": "1",
+            "evaluator_version": "1",
             "created_at": now,
         }
         for t in result.trials
-        for g in t.grader_results
+        for g in t.evaluator_results
     ]
     metric_rows = [
         {**m, "suite_version": run.get("suiteVersion", 1), "created_at": now}
@@ -182,7 +182,7 @@ def _write_results(feature_store: Any, result: Any, run: dict[str, Any],
 
     for name, rows in (
         (TRIALS_FG, trials),
-        (GRADER_RESULTS_FG, grader_rows),
+        (EVALUATOR_RESULTS_FG, evaluator_rows),
         (RUN_METRICS_FG, metric_rows),
     ):
         if not rows:
@@ -235,7 +235,7 @@ def main() -> None:
         from .client import HopsworksAgentClient
 
         judge = _judge_for(project)
-        # The judge is a grader; the spec needs the bare completer behind it, so
+        # The judge is a evaluator; the spec needs the bare completer behind it, so
         # a task can ask for a rubric judge and a pairwise judge independently.
         completer = judge._complete if judge is not None else None  # noqa: SLF001
         query = _query_for(project)
@@ -268,7 +268,7 @@ def main() -> None:
             # One list for the whole suite: every task is measured the same
             # way, which is what makes the run's pass rate comparable to the
             # next one's.
-            graders=graders_for_suite(
+            evaluators=evaluators_for_suite(
                 suite, judge_completer=completer, query=query,
                 secret_reader=secret_reader,
             ),
@@ -287,8 +287,8 @@ def main() -> None:
         # Authoring validates the spec, so reaching here means a task was written
         # before that check existed or around it. Named as a run failure rather
         # than an agent one.
-        log.exception("a task has an unusable grader spec")
-        report("FAILED", f"grader spec: {err}")
+        log.exception("a task has an unusable evaluator spec")
+        report("FAILED", f"evaluator spec: {err}")
     except SuiteRefused as err:
         # A refusal is a result, not a crash: the run would have produced
         # numbers that looked valid, and saying so is the point.

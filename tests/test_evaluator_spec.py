@@ -12,10 +12,10 @@ import json
 
 import pytest
 
-from hopsworks_agent_eval.grader_spec import (
+from hopsworks_agent_eval.evaluator_spec import (
     SpecError,
-    graders_for_suite,
-    graders_from_spec,
+    evaluators_for_suite,
+    evaluators_from_spec,
     validate_spec,
 )
 from hopsworks_agent_eval.models import Suite, Task
@@ -46,85 +46,85 @@ class TestBuildingFromSpec:
             {"type": "human_review"},
             {"type": "sql_state", "sql": "SELECT 1", "expect": 1},
         ]
-        graders = graders_from_spec(json.dumps(spec))
-        assert [g.type for g in graders] == [
+        evaluators = evaluators_from_spec(json.dumps(spec))
+        assert [g.type for g in evaluators] == [
             "exact_match", "contains", "regex", "json_schema", "tool_call",
             "tool_order", "no_tool_error", "human_review", "sql_state",
         ]
 
-    def test_a_named_grader_keeps_its_name(self):
+    def test_a_named_evaluator_keeps_its_name(self):
         # two regex checks in one suite are only distinguishable by name
-        graders = graders_from_spec(
+        evaluators = evaluators_from_spec(
             [{"type": "regex", "pattern": "a", "name": "has_order_id"}]
         )
-        assert graders[0].name == "has_order_id"
+        assert evaluators[0].name == "has_order_id"
 
-    def test_judge_graders_need_a_completer(self):
-        graders = graders_from_spec([{"type": "llm_judge"}], judge_completer=completer)
-        assert [g.type for g in graders] == ["llm_judge"]
+    def test_judge_evaluators_need_a_completer(self):
+        evaluators = evaluators_from_spec([{"type": "llm_judge"}], judge_completer=completer)
+        assert [g.type for g in evaluators] == ["llm_judge"]
 
-    def test_judge_graders_are_skipped_when_no_judge_is_configured(self):
+    def test_judge_evaluators_are_skipped_when_no_judge_is_configured(self):
         # not an error: the deterministic checks in the same suite still run,
         # and pretending a judgement happened would be worse than skipping it
-        graders = graders_from_spec(
+        evaluators = evaluators_from_spec(
             [{"type": "llm_judge"}, {"type": "regex", "pattern": "a"}]
         )
-        assert [g.type for g in graders] == ["regex"]
+        assert [g.type for g in evaluators] == ["regex"]
 
     def test_pairwise_can_be_named(self):
-        graders = graders_from_spec(
+        evaluators = evaluators_from_spec(
             [{"type": "pairwise", "reference": "the good answer"}],
             judge_completer=completer,
         )
-        assert graders[0].type == "pairwise"
-        assert graders[0].reference == "the good answer"
+        assert evaluators[0].type == "pairwise"
+        assert evaluators[0].reference == "the good answer"
 
-    def test_a_sql_grader_is_handed_the_query_function(self):
+    def test_a_sql_evaluator_is_handed_the_query_function(self):
         called = []
-        graders = graders_from_spec(
+        evaluators = evaluators_from_spec(
             [{"type": "sql_state", "sql": "SELECT status FROM o", "expect": "x"}],
             query=lambda sql: called.append(sql) or "x",
         )
-        assert graders[0].grade(task(), _trial(), None).passed
+        assert evaluators[0].grade(task(), _trial(), None).passed
         assert called == ["SELECT status FROM o"]
 
-    def test_an_empty_spec_is_no_graders_not_an_error(self):
-        assert graders_from_spec("") == []
-        assert graders_from_spec(None) == []
-        assert graders_from_spec([]) == []
+    def test_an_empty_spec_is_no_evaluators_not_an_error(self):
+        assert evaluators_from_spec("") == []
+        assert evaluators_from_spec(None) == []
+        assert evaluators_from_spec([]) == []
 
 
 class TestRefusals:
     def test_unparseable_json(self):
         with pytest.raises(SpecError, match="not valid JSON"):
-            graders_from_spec("{not json")
+            evaluators_from_spec("{not json")
 
     def test_an_object_where_an_array_belongs(self):
         with pytest.raises(SpecError, match="array of objects"):
-            graders_from_spec('{"type": "regex"}')
+            evaluators_from_spec('{"type": "regex"}')
 
     def test_an_entry_that_is_not_an_object(self):
         with pytest.raises(SpecError, match="entry 2"):
-            graders_from_spec('[{"type": "tool_call"}, "regex"]')
+            evaluators_from_spec('[{"type": "tool_call"}, "regex"]')
 
     def test_an_unknown_type_lists_what_is_allowed(self):
         # a typo should not silently produce a suite graded by nothing
-        with pytest.raises(SpecError, match="unknown grader type"):
-            graders_from_spec('[{"type": "vibes"}]')
+        with pytest.raises(SpecError, match="unknown evaluator type"):
+            evaluators_from_spec('[{"type": "vibes"}]')
 
-    def test_a_regex_grader_without_a_pattern(self):
-        with pytest.raises(SpecError, match="entry 1: a regex grader needs a pattern"):
-            graders_from_spec('[{"type": "regex"}]')
+    def test_a_regex_evaluator_without_a_pattern(self):
+        with pytest.raises(SpecError, match="entry 1: a regex evaluator needs a pattern"):
+            evaluators_from_spec('[{"type": "regex"}]')
 
-    def test_a_schema_grader_without_keys(self):
+    def test_a_schema_evaluator_without_keys(self):
         with pytest.raises(SpecError, match="required_keys"):
-            graders_from_spec('[{"type": "json_schema"}]')
+            evaluators_from_spec('[{"type": "json_schema"}]')
 
-    def test_a_sql_grader_without_a_query(self):
+    def test_a_sql_evaluator_without_a_query(self):
         with pytest.raises(SpecError, match="needs a sql query"):
-            graders_from_spec('[{"type": "sql_state", "expect": 1}]')
+            evaluators_from_spec('[{"type": "sql_state", "expect": 1}]')
 
-    def test_validate_accepts_judge_and_sql_graders_without_runtime_config(self):
+    def test_validate_accepts_judge_and_sql_evaluators_without_runtime_config(self):
         # authoring must not depend on a provider key or a database session
         validate_spec('[{"type": "llm_judge"}, {"type": "sql_state", "sql": "SELECT 1"}]')
 
@@ -137,25 +137,25 @@ class TestTheSuiteOwnsTheChecks:
     def test_a_suite_names_what_every_task_is_graded_by(self):
         suite = Suite(
             suite_id="s1",
-            graders='[{"type": "regex", "pattern": "^ORD"}]',
+            evaluators='[{"type": "regex", "pattern": "^ORD"}]',
         )
-        assert [g.type for g in graders_for_suite(suite)] == ["regex"]
+        assert [g.type for g in evaluators_for_suite(suite)] == ["regex"]
 
     def test_a_suite_with_no_checks_grades_by_nothing(self):
         # there is no inference: checks derived from whatever each task happened
         # to declare would make two tasks in one suite incomparable, which is
         # the thing a suite exists to prevent
-        assert graders_for_suite(Suite(suite_id="s1")) == []
+        assert evaluators_for_suite(Suite(suite_id="s1")) == []
 
     def test_the_checks_do_not_depend_on_the_tasks(self):
         # the same suite grades every task the same way; what varies is what
         # each task supplies to those checks
         suite = Suite(
             suite_id="s1",
-            graders='[{"type": "contains"}, {"type": "tool_call"}]',
+            evaluators='[{"type": "contains"}, {"type": "tool_call"}]',
             tasks=[task(expected_output="a"), task(required_tools=["x"])],
         )
-        assert [g.type for g in graders_for_suite(suite)] == [
+        assert [g.type for g in evaluators_for_suite(suite)] == [
             "contains", "tool_call",
         ]
 

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Protocol, Sequence
 
-from .graders import Grader, Trace, awaits_review, run_graders, verdict
+from .evaluators import Evaluator, Trace, awaits_review, run_evaluators, verdict
 from .models import (
     ExecutionMode,
     Suite,
@@ -217,7 +217,7 @@ def _run_trial(
     trial_index: int,
     run_id: str,
     deployment_id: int,
-    graders: Sequence[Grader],
+    evaluators: Sequence[Evaluator],
     config: RunnerConfig,
     sleep=time.sleep,
 ) -> Trial:
@@ -274,19 +274,19 @@ def _run_trial(
         trial.output_tokens = trace.get("output_tokens")
         trial.estimated_cost = _cost(trial, config)
 
-    trial.grader_results = run_graders(graders, task, trial, trace)
-    outcome = verdict(trial.grader_results, suite.pass_policy, suite.pass_threshold)
+    trial.evaluator_results = run_evaluators(evaluators, task, trial, trace)
+    outcome = verdict(trial.evaluator_results, suite.pass_policy, suite.pass_threshold)
 
-    if awaits_review(trial.grader_results):
+    if awaits_review(trial.evaluator_results):
         # A task that asked for human judgement has not been judged by the other
-        # graders agreeing with each other. Held open rather than resolved, so a
+        # evaluators agreeing with each other. Held open rather than resolved, so a
         # reviewer's verdict is the thing that settles it.
         trial.status = TrialStatus.AWAITING_REVIEW
         trial.completed_at = datetime.now(tz=timezone.utc)
         return trial
 
     if trace_status is TraceStatus.MISSING:
-        # Final-answer graders still ran on the captured response; only the
+        # Final-answer evaluators still ran on the captured response; only the
         # trajectory ones went ungradable. The trial keeps its answer verdict
         # but is marked so trajectory metrics can exclude it, and so a high
         # rate of these fails the run rather than the agent.
@@ -327,14 +327,14 @@ def run_suite(
     *,
     run_id: str,
     deployment_id: int,
-    graders: Sequence[Grader] | Callable[[Task], Sequence[Grader]],
+    evaluators: Sequence[Evaluator] | Callable[[Task], Sequence[Evaluator]],
     config: RunnerConfig | None = None,
     sleep=time.sleep,
 ) -> RunResult:
     """Execute every task, ``n_trials`` times each, and grade the results.
 
-    ``graders`` may be one list applied to every task, or a function of the
-    task. Per-task matters more than it looks: which graders apply depends on
+    ``evaluators`` may be one list applied to every task, or a function of the
+    task. Per-task matters more than it looks: which evaluators apply depends on
     what a task declares, so one fixed list either judges a task on tools it
     never claimed to use, or judges nothing at all and reports a run that says
     nothing while looking complete.
@@ -359,7 +359,7 @@ def run_suite(
 
     # Bounded: a full suite against a shared endpoint is otherwise a
     # self-inflicted load test on production capacity.
-    resolve = graders if callable(graders) else (lambda _task: graders)
+    resolve = evaluators if callable(evaluators) else (lambda _task: evaluators)
 
     with ThreadPoolExecutor(max_workers=max(1, config.max_concurrency)) as pool:
         futures = [

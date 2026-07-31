@@ -1,15 +1,15 @@
-"""Graders: given a task, a trial and (maybe) a trace, produce a score.
+"""Evaluators: given a task, a trial and (maybe) a trace, produce a score.
 
 Two rules run through all of them.
 
-**A grader never raises into the runner.** One badly written custom grader must
-not fail a whole run, so :func:`run_graders` catches and converts to a
-``GRADER_ERROR`` result. That failure is the harness's, not the agent's, and is
+**A evaluator never raises into the runner.** One badly written custom evaluator must
+not fail a whole run, so :func:`run_evaluators` catches and converts to a
+``EVALUATOR_ERROR`` result. That failure is the harness's, not the agent's, and is
 excluded from pass rates.
 
 **No trace is not a failing score.** Spans reach the feature store
 asynchronously and sometimes never arrive at all — the sidecar logs and drops
-on insert failure. A trajectory grader handed ``trace=None`` must return
+on insert failure. A trajectory evaluator handed ``trace=None`` must return
 ``ungradable``, because scoring it zero would report a broken observability
 pipeline as a broken agent, and that is the kind of wrong answer that gets a
 good deployment blocked.
@@ -21,27 +21,27 @@ import json
 import re
 from typing import Any, Callable, Protocol, Sequence
 
-from .models import GraderResult, Task, Trial
+from .models import EvaluatorResult, Task, Trial
 
 # A trace as the runner assembles it: the `agent_trace_features` row plus the
-# raw spans, so trajectory graders can inspect tool order.
+# raw spans, so trajectory evaluators can inspect tool order.
 Trace = dict[str, Any]
 
 
-class Grader(Protocol):
+class Evaluator(Protocol):
     name: str
     type: str
-    # True when this grader reads the trajectory rather than only the answer,
-    # so the runner knows which graders to mark ungradable without a trace.
+    # True when this evaluator reads the trajectory rather than only the answer,
+    # so the runner knows which evaluators to mark ungradable without a trace.
     needs_trace: bool
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult: ...
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult: ...
 
 
-def _ungradable(name: str, kind: str, reason: str) -> GraderResult:
-    return GraderResult(
-        grader_name=name,
-        grader_type=kind,
+def _ungradable(name: str, kind: str, reason: str) -> EvaluatorResult:
+    return EvaluatorResult(
+        evaluator_name=name,
+        evaluator_type=kind,
         score=0.0,
         passed=False,
         reason=reason,
@@ -49,7 +49,7 @@ def _ungradable(name: str, kind: str, reason: str) -> GraderResult:
     )
 
 
-class ExactMatchGrader:
+class ExactMatchEvaluator:
     """Final answer equals the expected output, ignoring surrounding space."""
 
     type = "exact_match"
@@ -59,18 +59,18 @@ class ExactMatchGrader:
         self.name = name
         self.case_sensitive = case_sensitive
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         expected, actual = task.expected_output.strip(), trial.final_output.strip()
         if not self.case_sensitive:
             expected, actual = expected.lower(), actual.lower()
         passed = expected == actual
-        return GraderResult(
+        return EvaluatorResult(
             self.name, self.type, 1.0 if passed else 0.0, passed,
             "exact match" if passed else f"expected {task.expected_output!r}",
         )
 
 
-class ContainsGrader:
+class ContainsEvaluator:
     """The answer mentions the expected string.
 
     Weaker than exact match and much more useful for free-text answers, where
@@ -84,16 +84,16 @@ class ContainsGrader:
         self.name = name
         self.expected = expected
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         needle = (self.expected if self.expected is not None else task.expected_output).strip()
         passed = needle.lower() in trial.final_output.lower()
-        return GraderResult(
+        return EvaluatorResult(
             self.name, self.type, 1.0 if passed else 0.0, passed,
             "found" if passed else f"{needle!r} not in the answer",
         )
 
 
-class RegexGrader:
+class RegexEvaluator:
     type = "regex"
     needs_trace = False
 
@@ -102,17 +102,17 @@ class RegexGrader:
         self.pattern = re.compile(pattern)
         self.should_match = should_match
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         matched = bool(self.pattern.search(trial.final_output))
         passed = matched is self.should_match
-        return GraderResult(
+        return EvaluatorResult(
             self.name, self.type, 1.0 if passed else 0.0, passed,
             f"pattern {'matched' if matched else 'did not match'}",
             {"matched": matched},
         )
 
 
-class JsonSchemaGrader:
+class JsonSchemaEvaluator:
     """The answer parses as JSON and carries the required keys.
 
     Deliberately shallow: full JSON Schema would be a dependency, and the
@@ -127,28 +127,28 @@ class JsonSchemaGrader:
         self.name = name
         self.required_keys = list(required_keys)
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         try:
             parsed = json.loads(trial.final_output)
         except (ValueError, TypeError):
-            return GraderResult(
+            return EvaluatorResult(
                 self.name, self.type, 0.0, False, "answer is not valid JSON",
                 {"parsed": False},
             )
         if not isinstance(parsed, dict):
-            return GraderResult(
+            return EvaluatorResult(
                 self.name, self.type, 0.0, False, "answer is not a JSON object",
                 {"parsed": True},
             )
         missing = [k for k in self.required_keys if k not in parsed]
-        return GraderResult(
+        return EvaluatorResult(
             self.name, self.type, 0.0 if missing else 1.0, not missing,
             f"missing keys: {missing}" if missing else "all required keys present",
             {"missing": missing},
         )
 
 
-class ToolCallGrader:
+class ToolCallEvaluator:
     """Required tools were called and forbidden ones were not.
 
     Reads the trajectory, so it is ungradable without a trace.
@@ -160,7 +160,7 @@ class ToolCallGrader:
     def __init__(self, name: str = "tool_call"):
         self.name = name
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         if trace is None:
             return _ungradable(
                 self.name, self.type,
@@ -175,7 +175,7 @@ class ToolCallGrader:
             reasons.append(f"never called {missing}")
         if forbidden:
             reasons.append(f"called forbidden {forbidden}")
-        return GraderResult(
+        return EvaluatorResult(
             self.name, self.type, 1.0 if passed else 0.0, passed,
             "; ".join(reasons) or "tool use as expected",
             {
@@ -186,7 +186,7 @@ class ToolCallGrader:
         )
 
 
-class ToolOrderGrader:
+class ToolOrderEvaluator:
     """Required tools were called in the order the task lists them.
 
     Order matters for agents whose steps depend on each other — looking up a
@@ -201,7 +201,7 @@ class ToolOrderGrader:
     def __init__(self, name: str = "tool_order"):
         self.name = name
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         if trace is None:
             return _ungradable(self.name, self.type, "no trace: order cannot be judged")
         called = _tool_names(trace)
@@ -210,32 +210,32 @@ class ToolOrderGrader:
             if remaining and name == remaining[0]:
                 remaining.pop(0)
         passed = not remaining
-        return GraderResult(
+        return EvaluatorResult(
             self.name, self.type, 1.0 if passed else 0.0, passed,
             "order as expected" if passed else f"never reached {remaining}",
             {"called": called, "unmatched": remaining},
         )
 
 
-class NoToolErrorGrader:
+class NoToolErrorEvaluator:
     type = "no_tool_error"
     needs_trace = True
 
     def __init__(self, name: str = "no_tool_error"):
         self.name = name
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         if trace is None:
             return _ungradable(self.name, self.type, "no trace: tool errors unknown")
         errors = int(trace.get("tool_error_count") or 0)
-        return GraderResult(
+        return EvaluatorResult(
             self.name, self.type, 1.0 if errors == 0 else 0.0, errors == 0,
             "no tool errors" if errors == 0 else f"{errors} tool call(s) failed",
             {"tool_error_count": errors},
         )
 
 
-class FunctionGrader:
+class FunctionEvaluator:
     """Wraps a plain function, the interface the design documents::
 
         def grade(task, trial, trace) -> dict
@@ -250,9 +250,9 @@ class FunctionGrader:
         self.name = name or getattr(fn, "__name__", "function")
         self.needs_trace = needs_trace
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         raw = self.fn(task, trial, trace)
-        return GraderResult(
+        return EvaluatorResult(
             self.name, self.type,
             float(raw.get("score", 0.0)), bool(raw.get("passed", False)),
             str(raw.get("reason", "")), dict(raw.get("assertions", {})),
@@ -270,27 +270,27 @@ def _tool_names(trace: Trace) -> list[str]:
     return [str(t) for t in parsed] if isinstance(parsed, list) else []
 
 
-def run_graders(
-    graders: Sequence[Grader], task: Task, trial: Trial, trace: Trace | None
-) -> list[GraderResult]:
-    """Every grader, in order, none of which may break the run."""
-    results: list[GraderResult] = []
-    for grader in graders:
+def run_evaluators(
+    evaluators: Sequence[Evaluator], task: Task, trial: Trial, trace: Trace | None
+) -> list[EvaluatorResult]:
+    """Every evaluator, in order, none of which may break the run."""
+    results: list[EvaluatorResult] = []
+    for evaluator in evaluators:
         try:
-            results.append(grader.grade(task, trial, trace))
-        except Exception as err:  # noqa: BLE001 — a bad grader is not a bad agent
+            results.append(evaluator.grade(task, trial, trace))
+        except Exception as err:  # noqa: BLE001 — a bad evaluator is not a bad agent
             results.append(
-                GraderResult(
-                    getattr(grader, "name", "unknown"),
-                    getattr(grader, "type", "unknown"),
-                    0.0, False, f"grader raised: {err}", ungradable=True,
+                EvaluatorResult(
+                    getattr(evaluator, "name", "unknown"),
+                    getattr(evaluator, "type", "unknown"),
+                    0.0, False, f"evaluator raised: {err}", ungradable=True,
                 )
             )
     return results
 
 
 def verdict(
-    results: Sequence[GraderResult],
+    results: Sequence[EvaluatorResult],
     policy: "PassPolicy | str" = "all",
     threshold: float = 0.7,
 ) -> bool | None:
@@ -302,10 +302,10 @@ def verdict(
     ``all`` is the default and stays the default. The other two can turn a
     failing trial into a passing one, so a suite has to ask for them:
 
-    - ``any`` — one grader passing is enough. For a task with several acceptable
+    - ``any`` — one evaluator passing is enough. For a task with several acceptable
       answers expressed as separate checks.
     - ``threshold`` — the mean score clears a bar. For rubric-led suites where
-      partial credit is the measure and a hard pass/fail per grader is not.
+      partial credit is the measure and a hard pass/fail per evaluator is not.
     """
     gradable = [r for r in results if not r.ungradable]
     if not gradable:
@@ -319,16 +319,16 @@ def verdict(
     return all(r.passed for r in gradable)
 
 
-class SqlStateGrader:
+class SqlStateEvaluator:
     """Assert the world changed, not just that the agent said it did.
 
     An agent that answers "I've cancelled order 4471" convincingly and calls
     nothing is indistinguishable, on the text alone, from one that did the work.
     This runs a read query and compares one value against what the task expects.
 
-    ``query`` is injected rather than opened here: the grader has no business
+    ``query`` is injected rather than opened here: the evaluator has no business
     holding credentials, and the job that runs it already has a feature store
-    session. Without one the grader is ungradable — never passing, since "I
+    session. Without one the evaluator is ungradable — never passing, since "I
     could not check" must not read as "the state was right".
     """
 
@@ -348,7 +348,7 @@ class SqlStateGrader:
         self.query = query
         self.name = name
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         if self.query is None:
             return _ungradable(
                 self.name, self.type,
@@ -361,9 +361,9 @@ class SqlStateGrader:
 
         got = _scalar(actual)
         passed = str(got).strip() == str(self.expect).strip()
-        return GraderResult(
-            grader_name=self.name,
-            grader_type=self.type,
+        return EvaluatorResult(
+            evaluator_name=self.name,
+            evaluator_type=self.type,
             score=1.0 if passed else 0.0,
             passed=passed,
             reason="" if passed else f"expected {self.expect!r}, found {got!r}",
@@ -375,7 +375,7 @@ def _scalar(result: Any) -> Any:
     """First cell of whatever the query returned.
 
     Accepts a DataFrame, a list of rows, or a bare value, because the caller's
-    session decides the shape and the grader asserts one value either way.
+    session decides the shape and the evaluator asserts one value either way.
     """
     if result is None:
         return None
@@ -392,16 +392,16 @@ def _scalar(result: Any) -> Any:
     return result
 
 
-class HumanReviewGrader:
+class HumanReviewEvaluator:
     """A verdict this run cannot produce, held open until a person gives one.
 
     Returns ungradable with ``awaiting_review``, which the runner reads to mark
-    the trial ``AWAITING_REVIEW`` rather than letting the other graders decide
+    the trial ``AWAITING_REVIEW`` rather than letting the other evaluators decide
     it. That distinction is the point: a task that asked for human judgement and
     silently passed on a substring match has not been judged.
 
     The verdict arrives later through the review endpoint, which writes a real
-    grader result alongside this one.
+    evaluator result alongside this one.
     """
 
     type = "human_review"
@@ -411,7 +411,7 @@ class HumanReviewGrader:
         self.prompt = prompt
         self.name = name
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         result = _ungradable(
             self.name, self.type,
             self.prompt or "waiting for a reviewer to judge this answer",
@@ -423,12 +423,12 @@ class HumanReviewGrader:
 AWAITING_REVIEW = "awaiting_review"
 
 
-def awaits_review(results: Sequence[GraderResult]) -> bool:
-    """Whether any grader deferred to a person."""
+def awaits_review(results: Sequence[EvaluatorResult]) -> bool:
+    """Whether any evaluator deferred to a person."""
     return any(r.assertions.get(AWAITING_REVIEW) for r in results)
 
 
-# ── tool-use graders ──────────────────────────────────────────────────────
+# ── tool-use evaluators ──────────────────────────────────────────────────────
 #
 # All of these read `trace["tool_calls"]`: the ordered list of TOOL spans with
 # their arguments, results, status and duration. Two rules they share.
@@ -439,10 +439,10 @@ def awaits_review(results: Sequence[GraderResult]) -> bool:
 # report a tracing gap as a misbehaving agent — the same mistake as scoring a
 # missing trace zero.
 #
-# **A tool that ran is judged; a tool that did not is not.** A grader scoped to
+# **A tool that ran is judged; a tool that did not is not.** A evaluator scoped to
 # one tool that never appears returns ungradable rather than passing vacuously,
 # because "it never called the tool" is a `tool_call` verdict and saying it
-# twice in two graders makes one of them noise.
+# twice in two evaluators makes one of them noise.
 
 
 def _tool_calls(trace: Trace | None) -> list[dict[str, Any]] | None:
@@ -456,7 +456,7 @@ def _scoped(calls: list[dict[str, Any]], tool: str) -> list[dict[str, Any]]:
     return [c for c in calls if not tool or c.get("name") == tool]
 
 
-class ToolArgumentGrader:
+class ToolArgumentEvaluator:
     """The arguments a tool was called with parse, and carry what they must.
 
     Deterministic shape checking only: that the payload is JSON, and that the
@@ -480,7 +480,7 @@ class ToolArgumentGrader:
         self.must_parse = must_parse
         self.name = name
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         calls = _tool_calls(trace)
         if calls is None:
             return _ungradable(self.name, self.type, "no trace: arguments unknown")
@@ -520,9 +520,9 @@ class ToolArgumentGrader:
                 "appear to trace them",
             )
         passed = not problems
-        return GraderResult(
-            grader_name=self.name,
-            grader_type=self.type,
+        return EvaluatorResult(
+            evaluator_name=self.name,
+            evaluator_type=self.type,
             score=1.0 if passed else 0.0,
             passed=passed,
             reason="; ".join(problems[:5]),
@@ -530,11 +530,11 @@ class ToolArgumentGrader:
         )
 
 
-class UnnecessaryToolGrader:
+class UnnecessaryToolEvaluator:
     """No tool ran that the task did not ask for.
 
     ``allowed`` defaults to the task's required tools, which makes this the
-    complement of ToolCallGrader: that one asks whether everything needed
+    complement of ToolCallEvaluator: that one asks whether everything needed
     happened, this asks whether anything else did. A task with no required
     tools and no explicit allowlist has nothing to say here and is ungradable —
     the alternative would fail every agent that used a tool at all.
@@ -547,7 +547,7 @@ class UnnecessaryToolGrader:
         self.allowed = list(allowed)
         self.name = name
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         calls = _tool_calls(trace)
         if calls is None:
             return _ungradable(self.name, self.type, "no trace: tool calls unknown")
@@ -560,9 +560,9 @@ class UnnecessaryToolGrader:
         extra = sorted({
             c.get("name", "") for c in calls if c.get("name") and c.get("name") not in allowed
         })
-        return GraderResult(
-            grader_name=self.name,
-            grader_type=self.type,
+        return EvaluatorResult(
+            evaluator_name=self.name,
+            evaluator_type=self.type,
             score=0.0 if extra else 1.0,
             passed=not extra,
             reason=f"called {', '.join(extra)}, which the task did not ask for" if extra else "",
@@ -570,12 +570,12 @@ class UnnecessaryToolGrader:
         )
 
 
-class ToolRetryGrader:
+class ToolRetryEvaluator:
     """The agent did not call the same tool the same way more than it should.
 
     A retry is the *same tool with the same arguments*, not merely the same
     tool twice: looking up two different orders is two calls, looking up the
-    same order twice is a retry. Where arguments are not traced the grader
+    same order twice is a retry. Where arguments are not traced the evaluator
     falls back to counting repeats by name and says so, because a loose signal
     labelled as such beats a confident wrong one.
     """
@@ -588,7 +588,7 @@ class ToolRetryGrader:
         self.tool = tool
         self.name = name
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         calls = _tool_calls(trace)
         if calls is None:
             return _ungradable(self.name, self.type, "no trace: retries unknown")
@@ -606,9 +606,9 @@ class ToolRetryGrader:
         worst = max(repeats.values(), default=0)
         passed = worst <= self.max_retries
         basis = "identical arguments" if by_arguments else "name only, arguments not traced"
-        return GraderResult(
-            grader_name=self.name,
-            grader_type=self.type,
+        return EvaluatorResult(
+            evaluator_name=self.name,
+            evaluator_type=self.type,
             score=1.0 if passed else 0.0,
             passed=passed,
             reason="" if passed else (
@@ -619,7 +619,7 @@ class ToolRetryGrader:
         )
 
 
-class ToolLatencyGrader:
+class ToolLatencyEvaluator:
     """No tool call took longer than its budget.
 
     Judges the slowest single call rather than the total, because a budget is
@@ -636,7 +636,7 @@ class ToolLatencyGrader:
         self.tool = tool
         self.name = name
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         calls = _tool_calls(trace)
         if calls is None:
             return _ungradable(self.name, self.type, "no trace: durations unknown")
@@ -662,9 +662,9 @@ class ToolLatencyGrader:
             )
         if unclosed:
             reasons.append(f"unfinished span for {', '.join(sorted(set(unclosed)))}")
-        return GraderResult(
-            grader_name=self.name,
-            grader_type=self.type,
+        return EvaluatorResult(
+            evaluator_name=self.name,
+            evaluator_type=self.type,
             score=0.0 if (over or unclosed) else 1.0,
             passed=not over and not unclosed,
             reason="; ".join(reasons),

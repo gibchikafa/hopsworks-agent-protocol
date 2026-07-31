@@ -1,4 +1,4 @@
-"""The client: calling an agent, and turning a trace into what a grader needs.
+"""The client: calling an agent, and turning a trace into what a evaluator needs.
 
 Ported from the Stage 1 probe, so the parsing is the same shape that was
 measured against a real deployment — but the failure paths are new, and they
@@ -114,7 +114,7 @@ class TestTrace:
         assert client(FakeSession()).fetch_trace("nope") is None
 
     def test_tool_names_come_back_in_call_order(self):
-        # a trajectory grader asks about sequence, so an arbitrary order would
+        # a trajectory evaluator asks about sequence, so an arbitrary order would
         # make its verdict arbitrary too
         spans = [
             {"spanId": "root", "parentSpanId": "", "startTimeNs": 0},

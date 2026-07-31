@@ -16,7 +16,7 @@ from typing import Any, Sequence
 
 from hopsworks_agent_protocol import conventions
 
-from .graders import Trace
+from .evaluators import Trace
 from .runner import AgentResponse
 
 log = logging.getLogger(__name__)
@@ -128,7 +128,7 @@ class HopsworksAgentClient:
     # ── the trace ───────────────────────────────────────────────────────────
 
     def fetch_trace(self, trace_id: str) -> Trace | None:
-        """The trace as a grader needs it: the aggregate plus what tools ran.
+        """The trace as a evaluator needs it: the aggregate plus what tools ran.
 
         Read through the backend rather than the feature store directly, so the
         runner needs no feature store credentials for grading and sees exactly

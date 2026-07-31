@@ -11,13 +11,13 @@ from __future__ import annotations
 import pytest
 
 from hopsworks_agent_eval.metrics import (
-    GRADER_FAMILIES,
+    EVALUATOR_FAMILIES,
     SCORE_BUCKETS,
     run_metrics,
     variance,
 )
 from hopsworks_agent_eval.models import (
-    GraderResult,
+    EvaluatorResult,
     TraceStatus,
     Trial,
     TrialStatus,
@@ -31,14 +31,14 @@ def trial(task_id="a", passed=True, index=0, results=(), **kwargs) -> Trial:
         status=TrialStatus.PASSED if passed else TrialStatus.FAILED,
         trace_status=TraceStatus.RECEIVED,
         latency_ms=100.0,
-        grader_results=list(results),
+        evaluator_results=list(results),
         **kwargs,
     )
 
 
-def result(kind="contains", passed=True, score=None, ungradable=False) -> GraderResult:
-    return GraderResult(
-        grader_name=kind, grader_type=kind,
+def result(kind="contains", passed=True, score=None, ungradable=False) -> EvaluatorResult:
+    return EvaluatorResult(
+        evaluator_name=kind, evaluator_type=kind,
         score=score if score is not None else (1.0 if passed else 0.0),
         passed=passed, ungradable=ungradable,
     )
@@ -78,28 +78,28 @@ class TestScopes:
         assert categories[0]["metric_scope_value"] == "billing"
         assert categories[0]["metric_value"] == 1.0
 
-    def test_per_grader_rows_include_how_often_it_could_not_judge(self):
-        # a grader that never manages a verdict contributes nothing while
+    def test_per_evaluator_rows_include_how_often_it_could_not_judge(self):
+        # a evaluator that never manages a verdict contributes nothing while
         # looking like coverage
         trials = [
             trial(results=[result("tool_call", ungradable=True)]),
             trial(index=1, results=[result("tool_call", passed=True)]),
         ]
-        assert at(trials, "grader", "ungradable_rate", "tool_call") == 0.5
-        assert at(trials, "grader", "pass_rate", "tool_call") == 1.0
+        assert at(trials, "evaluator", "ungradable_rate", "tool_call") == 0.5
+        assert at(trials, "evaluator", "pass_rate", "tool_call") == 1.0
 
-    def test_grader_family_rates_are_kept_apart(self):
+    def test_evaluator_family_rates_are_kept_apart(self):
         # one pass rate hides which half broke: right answers, wrong tools
         trials = [
             trial(results=[result("contains", passed=True),
                            result("tool_call", passed=False)])
         ]
-        assert at(trials, "grader_family", "pass_rate", "final_answer") == 1.0
-        assert at(trials, "grader_family", "pass_rate", "tool_use") == 0.0
+        assert at(trials, "evaluator_family", "pass_rate", "final_answer") == 1.0
+        assert at(trials, "evaluator_family", "pass_rate", "tool_use") == 0.0
 
-    def test_a_grader_type_with_no_family_is_counted_in_none(self):
+    def test_a_evaluator_type_with_no_family_is_counted_in_none(self):
         trials = [trial(results=[result("function", passed=False)])]
-        families = [r for r in rows(trials) if r["metric_scope"] == "grader_family"]
+        families = [r for r in rows(trials) if r["metric_scope"] == "evaluator_family"]
         assert families == []
 
     def test_the_score_distribution_sums_to_one(self):
@@ -207,10 +207,10 @@ class TestVarianceAndFlakiness:
         assert at(trials, "run", "flaky_task_rate") == 0.5
 
 
-def test_every_spec_grader_type_has_a_family_or_is_deliberately_absent():
-    # a new grader silently missing from the map would quietly stop counting
+def test_every_spec_evaluator_type_has_a_family_or_is_deliberately_absent():
+    # a new evaluator silently missing from the map would quietly stop counting
     # towards any family pass rate
-    from hopsworks_agent_eval.grader_spec import SPEC_TYPES
+    from hopsworks_agent_eval.evaluator_spec import SPEC_TYPES
 
-    unmapped = set(SPEC_TYPES) - set(GRADER_FAMILIES)
-    assert unmapped == set(), f"grader types with no family: {sorted(unmapped)}"
+    unmapped = set(SPEC_TYPES) - set(EVALUATOR_FAMILIES)
+    assert unmapped == set(), f"evaluator types with no family: {sorted(unmapped)}"

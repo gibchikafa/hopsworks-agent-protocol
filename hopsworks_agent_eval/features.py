@@ -4,7 +4,7 @@ The hard part is not the arithmetic, it is deciding *when* a trace is done. A
 trace is never explicitly finished: spans arrive incrementally, the agent
 batches its exports, the sidecar queues its inserts, and offline
 materialisation adds its own lag. Featurizing on the first sight of a root span
-produces a row describing half a trajectory, and a trajectory grader reading it
+produces a row describing half a trajectory, and a trajectory evaluator reading it
 will confidently mark a correct agent wrong.
 
 So completeness is a decision made here, from two clocks:
@@ -237,7 +237,7 @@ def trace_features(
     # Authoritative for SDK agents, which stamp the response object's text on
     # the root span. Falls back to the last assistant message for agents whose
     # root span was never stamped; left empty rather than guessed when there is
-    # neither, since a wrong final_output silently corrupts every grader that
+    # neither, since a wrong final_output silently corrupts every evaluator that
     # reads it.
     final_output = root_attrs.get(conventions.OUTPUT_VALUE, "")
     if not final_output:

@@ -1,4 +1,4 @@
-"""The LLM judge, which is the least trustworthy grader in the set.
+"""The LLM judge, which is the least trustworthy evaluator in the set.
 
 Almost every test is about that: what happens when the judge misbehaves. A
 judge that fails must never produce a score, because a score is a claim about
@@ -8,7 +8,7 @@ the agent and a broken judge has made no claim about anything.
 import pytest
 
 from hopsworks_agent_eval.judges import (
-    LlmJudgeGrader,
+    LlmJudgeEvaluator,
     _json_from,
     pairwise_verdict,
 )
@@ -35,7 +35,7 @@ def judge(reply, **config_overrides):
     from hopsworks_agent_eval.judge_config import parse_judge_config
 
     config = parse_judge_config({"type": "llm_judge", **config_overrides})
-    return LlmJudgeGrader(lambda _prompt: reply, config)
+    return LlmJudgeEvaluator(lambda _prompt: reply, config)
 
 
 # The unified judge asks for per-criterion scores even when there is one
@@ -85,7 +85,7 @@ class TestWhenTheJudgeMisbehaves:
         def explode(_prompt):
             raise RuntimeError("rate limited")
 
-        result = LlmJudgeGrader(explode).grade(task(), trial(), None)
+        result = LlmJudgeEvaluator(explode).grade(task(), trial(), None)
         assert result.ungradable is True
         assert result.score == 0.0
         assert "rate limited" in result.reason

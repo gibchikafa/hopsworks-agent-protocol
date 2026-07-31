@@ -168,8 +168,8 @@ def poll_trace(
     growing.
 
     Two numbers, because they answer different questions. Time-to-root is when
-    a final-answer grader could run. Time-to-stable is when a *trajectory*
-    grader could run — spans arrive incrementally, so grading the moment the
+    a final-answer evaluator could run. Time-to-stable is when a *trajectory*
+    evaluator could run — spans arrive incrementally, so grading the moment the
     root lands would judge a half-written trajectory. The gap between them is
     what the design's grace period has to cover.
     """

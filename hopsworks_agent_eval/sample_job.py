@@ -8,11 +8,11 @@ which is the larger and less flattering set.
 
 Two things make it different from a suite run, and both simplify it: there is
 no agent to call, because the traffic already happened; and there is no
-expected output, because nobody wrote one. So the graders that apply are the
+expected output, because nobody wrote one. So the evaluators that apply are the
 ones that judge a response on its own terms — a rubric judge, and the
 trajectory checks that need only the trace.
 
-Results go to the same ``agent_eval_grader_results`` feature group as offline
+Results go to the same ``agent_eval_evaluator_results`` feature group as offline
 runs, under a synthetic run id, so one query answers "how is this agent
 scoring" whether the evidence came from a suite or from production.
 """
@@ -27,13 +27,13 @@ import random
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .graders import NoToolErrorGrader, Trace, run_graders
-from .judges import DEFAULT_MODEL, LlmJudgeGrader, anthropic_completer
+from .evaluators import NoToolErrorEvaluator, Trace, run_evaluators
+from .judges import DEFAULT_MODEL, LlmJudgeEvaluator, anthropic_completer
 from .models import Task, Trial, TrialStatus
 
 log = logging.getLogger(__name__)
 
-GRADER_RESULTS_FG = "agent_eval_grader_results"
+EVALUATOR_RESULTS_FG = "agent_eval_evaluator_results"
 
 
 def _as_trace(detail: dict[str, Any]) -> Trace:
@@ -132,7 +132,7 @@ def main() -> None:
     if args.rubric:
         try:
             key = project.get_secrets_api().get_secret("EVAL_JUDGE_API_KEY").value
-            judge = LlmJudgeGrader(
+            judge = LlmJudgeEvaluator(
                 anthropic_completer(key, os.environ.get("EVAL_JUDGE_MODEL", DEFAULT_MODEL)),
                 model=os.environ.get("EVAL_JUDGE_MODEL", DEFAULT_MODEL),
             )
@@ -169,25 +169,25 @@ def main() -> None:
             status=TrialStatus.PASSED,
         )
 
-        graders = [NoToolErrorGrader()]
+        evaluators = [NoToolErrorEvaluator()]
         if judge is not None:
-            graders.insert(0, judge)
+            evaluators.insert(0, judge)
 
-        for result in run_graders(graders, task, trial, _as_trace(detail)):
+        for result in run_evaluators(evaluators, task, trial, _as_trace(detail)):
             rows.append({
                 "run_id": run_id,
-                "result_id": f"{trial.trial_id}/{result.grader_name}",
+                "result_id": f"{trial.trial_id}/{result.evaluator_name}",
                 "trial_id": trial.trial_id,
                 "task_id": trace_id,
-                "grader_name": result.grader_name,
-                "grader_type": result.grader_type,
+                "evaluator_name": result.evaluator_name,
+                "evaluator_type": result.evaluator_type,
                 "score": result.score,
                 "passed": result.passed,
                 "ungradable": result.ungradable,
                 "reason": result.reason,
                 "assertions_json": json.dumps(result.assertions),
                 "judge_model": str(result.assertions.get("judge_model", "")),
-                "grader_version": "1",
+                "evaluator_version": "1",
                 "created_at": now,
             })
 
@@ -195,7 +195,7 @@ def main() -> None:
         log.info("nothing gradable in the sample")
         return
 
-    project.get_feature_store().get_feature_group(GRADER_RESULTS_FG, 1).insert(
+    project.get_feature_store().get_feature_group(EVALUATOR_RESULTS_FG, 1).insert(
         pd.DataFrame(rows), write_options={"mode": "append"}
     )
     graded = len({r["trial_id"] for r in rows})

@@ -1,9 +1,9 @@
-"""Building graders from what a task declares.
+"""Building evaluators from what a task declares.
 
-Before this, graders were *inferred*: a rubric got a judge, an expected output
-got a substring check, tools got the tool graders. That covers the common cases
+Before this, evaluators were *inferred*: a rubric got a judge, an expected output
+got a substring check, tools got the tool evaluators. That covers the common cases
 and reaches none of the others — a task had no way to ask for a regex, a JSON
-shape, or a state check, so four implemented graders could never run.
+shape, or a state check, so four implemented evaluators could never run.
 
 A spec is a JSON array stored on the suite:
 
@@ -15,10 +15,10 @@ is measured the same way. There is no inference: checks derived from whatever a
 task happened to declare would make two tasks in one suite incomparable, which
 is the thing a suite exists to prevent.
 
-**Nothing here executes caller-supplied code.** ``FunctionGrader`` is
+**Nothing here executes caller-supplied code.** ``FunctionEvaluator`` is
 deliberately absent: it wraps a Python callable, and resolving one from a
 string in a task row would turn "author a task" into "run code in the job".
-Deterministic Python graders remain available to code that builds a run
+Deterministic Python evaluators remain available to code that builds a run
 directly.
 """
 
@@ -28,21 +28,21 @@ import json
 import logging
 from typing import Any, Callable, Sequence
 
-from .graders import (
-    ContainsGrader,
-    ExactMatchGrader,
-    Grader,
-    HumanReviewGrader,
-    JsonSchemaGrader,
-    NoToolErrorGrader,
-    RegexGrader,
-    SqlStateGrader,
-    ToolArgumentGrader,
-    ToolLatencyGrader,
-    ToolRetryGrader,
-    UnnecessaryToolGrader,
-    ToolCallGrader,
-    ToolOrderGrader,
+from .evaluators import (
+    ContainsEvaluator,
+    ExactMatchEvaluator,
+    Evaluator,
+    HumanReviewEvaluator,
+    JsonSchemaEvaluator,
+    NoToolErrorEvaluator,
+    RegexEvaluator,
+    SqlStateEvaluator,
+    ToolArgumentEvaluator,
+    ToolLatencyEvaluator,
+    ToolRetryEvaluator,
+    UnnecessaryToolEvaluator,
+    ToolCallEvaluator,
+    ToolOrderEvaluator,
 )
 from .judge_config import JudgeConfigError, completer_for, parse_judge_config
 from .judge_config import JudgeConfigError, completer_for, parse_judge_config
@@ -51,7 +51,7 @@ from .models import Suite
 log = logging.getLogger(__name__)
 
 # The types a task may name. Kept explicit rather than derived from a module
-# scan so adding a grader is a decision rather than an accident.
+# scan so adding a evaluator is a decision rather than an accident.
 SPEC_TYPES = (
     "exact_match",
     "contains",
@@ -74,7 +74,7 @@ SPEC_TYPES = (
 
 
 class SpecError(ValueError):
-    """A spec that cannot be turned into a grader, with the reason."""
+    """A spec that cannot be turned into a evaluator, with the reason."""
 
 
 def _one(
@@ -83,21 +83,21 @@ def _one(
     judge_completer: Callable[[str], str] | None,
     query: Callable[[str], Any] | None,
     secret_reader: Callable[[str], str | None] | None = None,
-) -> Grader | None:
+) -> Evaluator | None:
     kind = str(entry.get("type") or "").strip()
-    name = str(entry.get("name") or kind or "grader")
+    name = str(entry.get("name") or kind or "evaluator")
 
     if kind == "exact_match":
-        return ExactMatchGrader(
+        return ExactMatchEvaluator(
             name=name, case_sensitive=bool(entry.get("case_sensitive", False))
         )
     if kind == "contains":
-        return ContainsGrader(name=name, expected=entry.get("expected"))
+        return ContainsEvaluator(name=name, expected=entry.get("expected"))
     if kind == "regex":
         pattern = entry.get("pattern")
         if not pattern:
-            raise SpecError("a regex grader needs a pattern")
-        return RegexGrader(
+            raise SpecError("a regex evaluator needs a pattern")
+        return RegexEvaluator(
             pattern=str(pattern),
             name=name,
             should_match=bool(entry.get("should_match", True)),
@@ -105,17 +105,17 @@ def _one(
     if kind == "json_schema":
         keys = entry.get("required_keys") or entry.get("requiredKeys") or []
         if not isinstance(keys, (list, tuple)) or not keys:
-            raise SpecError("a json_schema grader needs required_keys")
-        return JsonSchemaGrader(required_keys=[str(k) for k in keys], name=name)
+            raise SpecError("a json_schema evaluator needs required_keys")
+        return JsonSchemaEvaluator(required_keys=[str(k) for k in keys], name=name)
     if kind == "tool_call":
-        return ToolCallGrader(name=name)
+        return ToolCallEvaluator(name=name)
     if kind == "tool_order":
-        return ToolOrderGrader(name=name)
+        return ToolOrderEvaluator(name=name)
     if kind == "no_tool_error":
-        return NoToolErrorGrader(name=name)
+        return NoToolErrorEvaluator(name=name)
     if kind == "tool_arguments":
         keys = entry.get("required_keys") or entry.get("requiredKeys") or []
-        return ToolArgumentGrader(
+        return ToolArgumentEvaluator(
             tool=str(entry.get("tool") or ""),
             required_keys=[str(k) for k in keys],
             must_parse=bool(entry.get("must_parse", True)),
@@ -123,9 +123,9 @@ def _one(
         )
     if kind == "no_unnecessary_tools":
         allowed = entry.get("allowed") or []
-        return UnnecessaryToolGrader(allowed=[str(a) for a in allowed], name=name)
+        return UnnecessaryToolEvaluator(allowed=[str(a) for a in allowed], name=name)
     if kind == "tool_retries":
-        return ToolRetryGrader(
+        return ToolRetryEvaluator(
             max_retries=int(entry.get("max_retries", 0)),
             tool=str(entry.get("tool") or ""),
             name=name,
@@ -133,17 +133,17 @@ def _one(
     if kind == "tool_latency":
         budget = entry.get("max_ms")
         if budget is None:
-            raise SpecError("a tool_latency grader needs max_ms")
-        return ToolLatencyGrader(
+            raise SpecError("a tool_latency evaluator needs max_ms")
+        return ToolLatencyEvaluator(
             max_ms=float(budget), tool=str(entry.get("tool") or ""), name=name
         )
     if kind == "human_review":
-        return HumanReviewGrader(prompt=str(entry.get("prompt") or ""), name=name)
+        return HumanReviewEvaluator(prompt=str(entry.get("prompt") or ""), name=name)
     if kind == "sql_state":
         sql = entry.get("sql") or entry.get("query")
         if not sql:
-            raise SpecError("a sql_state grader needs a sql query")
-        return SqlStateGrader(
+            raise SpecError("a sql_state evaluator needs a sql query")
+        return SqlStateEvaluator(
             sql=str(sql), expect=entry.get("expect"), query=query, name=name
         )
 
@@ -152,13 +152,13 @@ def _one(
         # suite with no judge configured should not need it loaded.
         from .judges import (
             DEFAULT_MODEL,
-            LlmJudgeGrader,
-            PairwiseGrader,
+            LlmJudgeEvaluator,
+            PairwiseEvaluator,
             ToolArgumentsJudge,
             ToolResultUsedJudge,
         )
 
-        # Every judged grader may bring its own provider, model and key, not
+        # Every judged evaluator may bring its own provider, model and key, not
         # only the rubric one — there is no reason a pairwise comparison should
         # be stuck with the project default when a rubric judge is not.
         try:
@@ -180,38 +180,38 @@ def _one(
 
         if completer is None:
             # Not an error: a project without a judge key still runs its
-            # deterministic graders, and the trial reports what was skipped
+            # deterministic evaluators, and the trial reports what was skipped
             # rather than pretending the judgement happened.
-            log.info("no judge configured; skipping %s grader %r", kind, name)
+            log.info("no judge configured; skipping %s evaluator %r", kind, name)
             return None
 
         model = config.model or DEFAULT_MODEL
         if kind == "llm_judge":
-            return LlmJudgeGrader(completer, config, name=name)
+            return LlmJudgeEvaluator(completer, config, name=name)
         if kind == "tool_arguments_judge":
             return ToolArgumentsJudge(
                 completer, tool=str(entry.get("tool") or ""), name=name, model=model
             )
         if kind == "tool_result_used":
             return ToolResultUsedJudge(completer, name=name, model=model)
-        return PairwiseGrader(
+        return PairwiseEvaluator(
             completer, reference=str(entry.get("reference") or ""), name=name,
             model=model,
         )
 
     raise SpecError(
-        f"unknown grader type {kind!r}; expected one of {', '.join(SPEC_TYPES)}"
+        f"unknown evaluator type {kind!r}; expected one of {', '.join(SPEC_TYPES)}"
     )
 
 
-def graders_from_spec(
+def evaluators_from_spec(
     spec: str | Sequence[dict[str, Any]] | None,
     *,
     judge_completer: Callable[[str], str] | None = None,
     query: Callable[[str], Any] | None = None,
     secret_reader: Callable[[str], str | None] | None = None,
-) -> list[Grader]:
-    """Every grader a spec asks for.
+) -> list[Evaluator]:
+    """Every evaluator a spec asks for.
 
     Raises :class:`SpecError` on anything malformed. The caller decides what a
     bad spec means — the backend refuses it at authoring time, so by the time a
@@ -226,39 +226,39 @@ def graders_from_spec(
         except (ValueError, TypeError) as err:
             raise SpecError(f"not valid JSON: {err}") from err
     if not isinstance(entries, (list, tuple)):
-        raise SpecError("a grader spec is an array of objects")
+        raise SpecError("a evaluator spec is an array of objects")
 
-    graders: list[Grader] = []
+    evaluators: list[Evaluator] = []
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             raise SpecError(f"entry {index + 1} is not an object")
         try:
-            grader = _one(entry, judge_completer=judge_completer, query=query,
+            evaluator = _one(entry, judge_completer=judge_completer, query=query,
                           secret_reader=secret_reader)
         except SpecError as err:
             raise SpecError(f"entry {index + 1}: {err}") from err
-        if grader is not None:
-            graders.append(grader)
-    return graders
+        if evaluator is not None:
+            evaluators.append(evaluator)
+    return evaluators
 
 
 def validate_spec(spec: str | None) -> None:
     """Raise :class:`SpecError` unless every entry could be built.
 
-    Uses stand-in judge and query callables so a spec naming those graders
+    Uses stand-in judge and query callables so a spec naming those evaluators
     validates without a provider key or a database session — authoring a task
     must not depend on runtime configuration that only the job has.
     """
-    graders_from_spec(spec, judge_completer=lambda _prompt: "", query=lambda _sql: None)
+    evaluators_from_spec(spec, judge_completer=lambda _prompt: "", query=lambda _sql: None)
 
 
-def graders_for_suite(
+def evaluators_for_suite(
     suite: "Suite",
     *,
     judge_completer: Callable[[str], str] | None = None,
     query: Callable[[str], Any] | None = None,
     secret_reader: Callable[[str], str | None] | None = None,
-) -> list[Grader]:
+) -> list[Evaluator]:
     """The checks every task in this suite is graded by.
 
     There is no per-task variation and no inference. Both were removed together,
@@ -271,8 +271,8 @@ def graders_for_suite(
     each task's own expected output — so tasks differ in substance while the
     measurement stays identical.
     """
-    return graders_from_spec(
-        suite.graders,
+    return evaluators_from_spec(
+        suite.evaluators,
         judge_completer=judge_completer,
         query=query,
         secret_reader=secret_reader,

@@ -12,7 +12,7 @@ import json
 
 import pytest
 
-from hopsworks_agent_eval.grader_spec import SpecError, graders_from_spec
+from hopsworks_agent_eval.evaluator_spec import SpecError, evaluators_from_spec
 from hopsworks_agent_eval.judge_config import (
     FAILURE_CATEGORIES,
     PROVIDERS,
@@ -21,7 +21,7 @@ from hopsworks_agent_eval.judge_config import (
     parse_judge_config,
     render_prompt,
 )
-from hopsworks_agent_eval.judges import LlmJudgeGrader
+from hopsworks_agent_eval.judges import LlmJudgeEvaluator
 from hopsworks_agent_eval.models import Task, Trial
 
 CRITERIA = {
@@ -57,9 +57,9 @@ def trial(output: str = "Done — order 4471 is cancelled.") -> Trial:
     )
 
 
-def judge(reply: dict | str, **overrides) -> LlmJudgeGrader:
+def judge(reply: dict | str, **overrides) -> LlmJudgeEvaluator:
     text = reply if isinstance(reply, str) else json.dumps(reply)
-    return LlmJudgeGrader(lambda _p: text, parse_judge_config(entry(**overrides)))
+    return LlmJudgeEvaluator(lambda _p: text, parse_judge_config(entry(**overrides)))
 
 
 class TestParsing:
@@ -208,11 +208,11 @@ class TestGrading:
         assert result.ungradable and result.passed is False
 
     def test_a_judge_that_raises_is_ungradable(self):
-        grader = LlmJudgeGrader(
+        evaluator = LlmJudgeEvaluator(
             lambda _p: (_ for _ in ()).throw(RuntimeError("rate limited")),
             parse_judge_config(entry()),
         )
-        result = grader.grade(task(), trial(), None)
+        result = evaluator.grade(task(), trial(), None)
         assert result.ungradable
         assert "rate limited" in result.reason
 
@@ -235,74 +235,74 @@ class TestGrading:
         assert "the order id was invented" in result.reason
 
     def test_a_judge_reading_tool_calls_needs_a_trace(self):
-        grader = judge({"scores": {}}, inputs=["user_request", "agent_response", "tool_calls"])
-        assert grader.needs_trace is True
-        assert grader.grade(task(), trial(), None).ungradable
+        evaluator = judge({"scores": {}}, inputs=["user_request", "agent_response", "tool_calls"])
+        assert evaluator.needs_trace is True
+        assert evaluator.grade(task(), trial(), None).ungradable
 
     def test_a_judge_not_reading_tool_calls_does_not_need_one(self):
         # otherwise it would go ungradable for want of a trace it never reads
-        grader = judge({"scores": {"task_completion": 5, "correctness": 5, "safety": 5}})
-        assert grader.needs_trace is False
-        assert grader.grade(task(), trial(), None).passed
+        evaluator = judge({"scores": {"task_completion": 5, "correctness": 5, "safety": 5}})
+        assert evaluator.needs_trace is False
+        assert evaluator.grade(task(), trial(), None).passed
 
 
 class TestSpecIntegration:
-    def test_criteria_are_carried_onto_the_grader(self):
-        graders = graders_from_spec([entry()], judge_completer=lambda _p: "{}")
-        assert [c.name for c in graders[0].config.criteria] == [
+    def test_criteria_are_carried_onto_the_evaluator(self):
+        evaluators = evaluators_from_spec([entry()], judge_completer=lambda _p: "{}")
+        assert [c.name for c in evaluators[0].config.criteria] == [
             "task_completion", "correctness", "safety",
         ]
 
     def test_a_judge_with_no_criteria_gets_one_called_overall(self):
         # not a different class, not a different code path — the same judge
         # scoring a single unnamed thing
-        graders = graders_from_spec(
+        evaluators = evaluators_from_spec(
             [{"type": "llm_judge"}], judge_completer=lambda _p: "{}"
         )
-        assert [c.name for c in graders[0].config.effective_criteria()] == ["overall"]
+        assert [c.name for c in evaluators[0].config.effective_criteria()] == ["overall"]
 
     def test_every_judged_type_can_bring_its_own_model(self):
         # a pairwise comparison has no reason to be stuck with the project
         # default when a rubric judge is not
         for kind in ("pairwise", "tool_arguments_judge", "tool_result_used"):
-            graders = graders_from_spec(
+            evaluators = evaluators_from_spec(
                 [{"type": kind, "provider": "openai", "model": "gpt-4o",
                   "api_key_secret": "K"}],
                 secret_reader=lambda name: "sk-test",
             )
-            assert graders[0].model == "gpt-4o", kind
+            assert evaluators[0].model == "gpt-4o", kind
 
     def test_a_bad_judge_config_is_a_spec_error(self):
         # so it is refused at authoring time like every other malformed entry
         with pytest.raises(SpecError, match="provider must be"):
-            graders_from_spec([entry(provider="mystery")], judge_completer=lambda _p: "")
+            evaluators_from_spec([entry(provider="mystery")], judge_completer=lambda _p: "")
 
     def test_a_judge_naming_a_missing_secret_is_skipped_not_failed(self):
-        graders = graders_from_spec(
+        evaluators = evaluators_from_spec(
             [entry(provider="openai", model="gpt-4o", api_key_secret="NOPE")],
             judge_completer=lambda _p: "{}",
             secret_reader=lambda _name: None,
         )
-        assert graders == []
+        assert evaluators == []
 
     def test_a_judge_naming_a_present_secret_gets_its_own_provider(self):
-        graders = graders_from_spec(
+        evaluators = evaluators_from_spec(
             [entry(provider="openai", model="gpt-4o", api_key_secret="MY_KEY")],
             secret_reader=lambda name: "sk-test" if name == "MY_KEY" else None,
         )
-        assert len(graders) == 1
-        assert graders[0].config.provider == "openai"
+        assert len(evaluators) == 1
+        assert evaluators[0].config.provider == "openai"
 
 
 def test_the_default_templates_all_build():
     for template in default_templates():
-        graders = graders_from_spec(template["spec"], judge_completer=lambda _p: "{}")
-        assert graders, template["name"]
+        evaluators = evaluators_from_spec(template["spec"], judge_completer=lambda _p: "{}")
+        assert evaluators, template["name"]
 
 
-def test_the_default_template_leaves_tool_checks_to_the_tool_graders():
+def test_the_default_template_leaves_tool_checks_to_the_tool_evaluators():
     # paying a model to decide whether a required tool ran is slower, costlier
-    # and less reliable than the grader that knows
+    # and less reliable than the evaluator that knows
     spec = json.loads(default_templates()[0]["spec"])
     names = set(spec[0]["criteria"])
     assert not names & {"tool_selection", "tool_execution", "efficiency"}

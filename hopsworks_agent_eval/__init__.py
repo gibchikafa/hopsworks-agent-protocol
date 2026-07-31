@@ -1,4 +1,4 @@
-"""Hopsworks agent evaluation: featurization, runner, and graders.
+"""Hopsworks agent evaluation: featurization, runner, and evaluators.
 
 Runs in a Hopsworks job, never in a serving pod. The one structural rule:
 
@@ -36,10 +36,10 @@ from .promotion import (
 )
 from .client import HopsworksAgentClient
 from .judge_config import JudgeConfig, JudgeConfigError, default_templates
-from .grader_spec import SpecError, graders_for_suite, graders_from_spec, validate_spec
+from .evaluator_spec import SpecError, evaluators_for_suite, evaluators_from_spec, validate_spec
 from .judges import (
-    LlmJudgeGrader,
-    PairwiseGrader,
+    LlmJudgeEvaluator,
+    PairwiseEvaluator,
     anthropic_completer,
     pairwise_verdict,
 )
@@ -48,16 +48,16 @@ from .runner import RunnerConfig, SuiteRefused, run_suite
 __all__ = [
     "ExecutionMode",
     "HopsworksAgentClient",
-    "LlmJudgeGrader",
+    "LlmJudgeEvaluator",
     "anthropic_completer",
     "pairwise_verdict",
-    "PairwiseGrader",
+    "PairwiseEvaluator",
     "SpecError",
     "JudgeConfig",
     "JudgeConfigError",
     "default_templates",
-    "graders_for_suite",
-    "graders_from_spec",
+    "evaluators_for_suite",
+    "evaluators_from_spec",
     "validate_spec",
     "RunnerConfig",
     "PassPolicy",

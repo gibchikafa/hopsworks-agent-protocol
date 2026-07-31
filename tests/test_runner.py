@@ -7,12 +7,12 @@ not are the reason this component exists.
 
 import pytest
 
-from hopsworks_agent_eval.graders import (
-    ContainsGrader,
-    ExactMatchGrader,
-    ToolCallGrader,
-    ToolOrderGrader,
-    run_graders,
+from hopsworks_agent_eval.evaluators import (
+    ContainsEvaluator,
+    ExactMatchEvaluator,
+    ToolCallEvaluator,
+    ToolOrderEvaluator,
+    run_evaluators,
     verdict,
 )
 from hopsworks_agent_eval.metrics import (
@@ -93,13 +93,13 @@ def suite(**kwargs):
     return Suite(**defaults)
 
 
-def go(client, s=None, graders=None, **config_kwargs):
+def go(client, s=None, evaluators=None, **config_kwargs):
     return run_suite(
         client,
         s or suite(),
         run_id="run-1",
         deployment_id=7,
-        graders=graders if graders is not None else [ExactMatchGrader()],
+        evaluators=evaluators if evaluators is not None else [ExactMatchEvaluator()],
         config=RunnerConfig(readiness_timeout_s=0.01, readiness_poll_s=0.001,
                             **config_kwargs),
         sleep=lambda _: None,
@@ -234,18 +234,18 @@ class TestGuardrails:
 
 
 class TestTraceReadiness:
-    def test_final_answer_graders_still_run_without_a_trace(self):
-        result = go(FakeClient(trace=None), graders=[ExactMatchGrader()])
+    def test_final_answer_evaluators_still_run_without_a_trace(self):
+        result = go(FakeClient(trace=None), evaluators=[ExactMatchEvaluator()])
         trial = result.trials[0]
         assert trial.trace_status is TraceStatus.MISSING
         assert trial.status is TrialStatus.PASSED  # the answer was still right
 
-    def test_trajectory_graders_go_ungradable_not_failing(self):
+    def test_trajectory_evaluators_go_ungradable_not_failing(self):
         # scoring zero would report a broken observability pipeline as a broken
         # agent, and block a good deployment
-        result = go(FakeClient(trace=None), graders=[ToolCallGrader()])
+        result = go(FakeClient(trace=None), evaluators=[ToolCallEvaluator()])
         trial = result.trials[0]
-        assert trial.grader_results[0].ungradable is True
+        assert trial.evaluator_results[0].ungradable is True
         assert trial.status is TrialStatus.TRACE_MISSING
 
     def test_a_trace_without_a_root_span_is_partial(self):
@@ -255,7 +255,7 @@ class TestTraceReadiness:
     def test_a_run_that_mostly_loses_traces_fails_itself(self):
         # the pipeline is broken, not the agent; passing would publish a pass
         # rate computed from answers while claiming to have judged trajectories
-        result = go(FakeClient(trace=None), graders=[ToolCallGrader()], n_trials=2)
+        result = go(FakeClient(trace=None), evaluators=[ToolCallEvaluator()], n_trials=2)
         assert result.status == "FAILED"
 
     def test_a_healthy_run_succeeds(self):
@@ -337,45 +337,45 @@ class TestMetrics:
                 assert row["metric_scope_value"]
 
 
-class TestGraderRobustness:
-    def test_a_grader_that_raises_does_not_break_the_run(self):
+class TestEvaluatorRobustness:
+    def test_a_evaluator_that_raises_does_not_break_the_run(self):
         class Exploding:
             name, type, needs_trace = "boom", "custom", False
 
             def grade(self, task, trial, trace):
-                raise ValueError("bad grader")
+                raise ValueError("bad evaluator")
 
-        results = run_graders([Exploding()], task(), Trial(
+        results = run_evaluators([Exploding()], task(), Trial(
             trial_id="x", run_id="r", task_id="t1", task_version=1,
             trial_index=0, deployment_id=7,
         ), None)
         assert results[0].ungradable is True
-        assert "bad grader" in results[0].reason
+        assert "bad evaluator" in results[0].reason
 
     def test_verdict_is_none_when_nothing_was_gradable(self):
         # not the same as failing: the trial says nothing either way
-        results = run_graders([ToolCallGrader()], task(), Trial(
+        results = run_evaluators([ToolCallEvaluator()], task(), Trial(
             trial_id="x", run_id="r", task_id="t1", task_version=1,
             trial_index=0, deployment_id=7,
         ), None)
         assert verdict(results) is None
 
-    def test_every_gradable_grader_must_pass(self):
+    def test_every_gradable_evaluator_must_pass(self):
         trial = Trial(trial_id="x", run_id="r", task_id="t1", task_version=1,
                       trial_index=0, deployment_id=7, final_output="4")
-        results = run_graders(
-            [ExactMatchGrader(), ContainsGrader(expected="five")], task(), trial, None
+        results = run_evaluators(
+            [ExactMatchEvaluator(), ContainsEvaluator(expected="five")], task(), trial, None
         )
         assert verdict(results) is False
 
 
-class TestToolGraders:
+class TestToolEvaluators:
     def _trial(self):
         return Trial(trial_id="x", run_id="r", task_id="t1", task_version=1,
                      trial_index=0, deployment_id=7, final_output="ok")
 
     def test_required_tools_must_be_called(self):
-        result = ToolCallGrader().grade(
+        result = ToolCallEvaluator().grade(
             task(required_tools=["recall"]), self._trial(),
             {"tool_names": '["purchase_history"]'},
         )
@@ -383,7 +383,7 @@ class TestToolGraders:
         assert result.assertions["missing_required"] == ["recall"]
 
     def test_forbidden_tools_must_not_be(self):
-        result = ToolCallGrader().grade(
+        result = ToolCallEvaluator().grade(
             task(forbidden_tools=["refund"]), self._trial(),
             {"tool_names": '["refund"]'},
         )
@@ -391,41 +391,41 @@ class TestToolGraders:
 
     def test_order_allows_extra_calls_in_between(self):
         # an agent that also checked something else has not done the wrong thing
-        result = ToolOrderGrader().grade(
+        result = ToolOrderEvaluator().grade(
             task(required_tools=["lookup", "refund"]), self._trial(),
             {"tool_names": '["lookup", "audit", "refund"]'},
         )
         assert result.passed is True
 
     def test_order_catches_a_reversed_sequence(self):
-        result = ToolOrderGrader().grade(
+        result = ToolOrderEvaluator().grade(
             task(required_tools=["lookup", "refund"]), self._trial(),
             {"tool_names": '["refund", "lookup"]'},
         )
         assert result.passed is False
 
 
-class TestPerTaskGraders:
-    """Which graders apply depends on what each task declares.
+class TestPerTaskEvaluators:
+    """Which evaluators apply depends on what each task declares.
 
     One fixed list for a whole suite either judges a task on tools it never
     claimed to use, or judges nothing at all — and a run that graded nothing
     reports cleanly while saying nothing, which is the worst of both.
     """
 
-    def test_each_task_gets_its_own_graders(self):
+    def test_each_task_gets_its_own_evaluators(self):
         answered = suite(tasks=[
             task(task_id="answer", expected_output="4"),
             task(task_id="tools", expected_output="", required_tools=["search"]),
         ])
 
         def per_task(t):
-            return [ExactMatchGrader()] if t.expected_output else [ToolCallGrader()]
+            return [ExactMatchEvaluator()] if t.expected_output else [ToolCallEvaluator()]
 
         result = go(FakeClient(trace={"root_span_id": "a", "tool_names": '["search"]'}),
-                    answered, graders=per_task)
+                    answered, evaluators=per_task)
 
-        by_task = {t.task_id: [g.grader_type for g in t.grader_results]
+        by_task = {t.task_id: [g.evaluator_type for g in t.evaluator_results]
                    for t in result.trials}
         assert by_task["answer"] == ["exact_match"]
         assert by_task["tools"] == ["tool_call"]
@@ -433,15 +433,15 @@ class TestPerTaskGraders:
     def test_a_plain_list_still_applies_to_every_task(self):
         # the simple case keeps working; per-task is an option, not a burden
         result = go(FakeClient(), suite(tasks=[task(task_id="a"), task(task_id="b")]),
-                    graders=[ExactMatchGrader()])
-        assert all(len(t.grader_results) == 1 for t in result.trials)
+                    evaluators=[ExactMatchEvaluator()])
+        assert all(len(t.evaluator_results) == 1 for t in result.trials)
 
     def test_a_task_declaring_nothing_is_ungradable_not_passing(self):
         # silence must not read as success
         result = go(FakeClient(), suite(tasks=[task(task_id="empty")]),
-                    graders=lambda _t: [])
+                    evaluators=lambda _t: [])
         assert result.trials[0].status is TrialStatus.TRACE_MISSING
-        assert result.trials[0].grader_results == []
+        assert result.trials[0].evaluator_results == []
 
 
 class TestPassPolicyAndReview:
@@ -449,18 +449,18 @@ class TestPassPolicyAndReview:
 
     def test_the_suite_policy_reaches_the_verdict(self):
         # `all` would fail this trial: the exact match passes, the second does not
-        from hopsworks_agent_eval.graders import RegexGrader
+        from hopsworks_agent_eval.evaluators import RegexEvaluator
         from hopsworks_agent_eval.models import PassPolicy
 
-        graders = [ExactMatchGrader(), RegexGrader(r"never matches this")]
+        evaluators = [ExactMatchEvaluator(), RegexEvaluator(r"never matches this")]
 
-        strict = go(FakeClient(answer="4"), graders=graders)
+        strict = go(FakeClient(answer="4"), evaluators=evaluators)
         assert strict.trials[0].status is TrialStatus.FAILED
 
         lenient = go(
             FakeClient(answer="4"),
             s=suite(pass_policy=PassPolicy.ANY),
-            graders=graders,
+            evaluators=evaluators,
         )
         assert lenient.trials[0].status is TrialStatus.PASSED
 
@@ -470,29 +470,29 @@ class TestPassPolicyAndReview:
         result = go(
             FakeClient(answer="4"),
             s=suite(pass_policy=PassPolicy.THRESHOLD, pass_threshold=0.4),
-            graders=[ExactMatchGrader(), ContainsGrader(expected="nowhere")],
+            evaluators=[ExactMatchEvaluator(), ContainsEvaluator(expected="nowhere")],
         )
         assert result.trials[0].status is TrialStatus.PASSED
 
     def test_a_task_awaiting_review_is_neither_passed_nor_failed(self):
-        # the other graders agreeing is not the judgement the task asked for
-        from hopsworks_agent_eval.graders import HumanReviewGrader
+        # the other evaluators agreeing is not the judgement the task asked for
+        from hopsworks_agent_eval.evaluators import HumanReviewEvaluator
 
         result = go(
             FakeClient(answer="4"),
-            graders=[ExactMatchGrader(), HumanReviewGrader("is the tone right?")],
+            evaluators=[ExactMatchEvaluator(), HumanReviewEvaluator("is the tone right?")],
         )
         assert result.trials[0].status is TrialStatus.AWAITING_REVIEW
 
     def test_the_deferred_result_is_kept_so_a_reviewer_can_see_the_prompt(self):
-        from hopsworks_agent_eval.graders import HumanReviewGrader
+        from hopsworks_agent_eval.evaluators import HumanReviewEvaluator
 
         result = go(
             FakeClient(answer="4"),
-            graders=[HumanReviewGrader("is the tone right?")],
+            evaluators=[HumanReviewEvaluator("is the tone right?")],
         )
         pending = [
-            r for r in result.trials[0].grader_results
+            r for r in result.trials[0].evaluator_results
             if r.assertions.get("awaiting_review")
         ]
         assert len(pending) == 1

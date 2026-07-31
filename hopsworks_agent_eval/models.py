@@ -47,11 +47,11 @@ class TrialStatus(str, Enum):
     AGENT_ERROR = "AGENT_ERROR"
     TOOL_ERROR = "TOOL_ERROR"
     TIMEOUT = "TIMEOUT"
-    GRADER_ERROR = "GRADER_ERROR"
+    EVALUATOR_ERROR = "EVALUATOR_ERROR"
     INFRA_ERROR = "INFRA_ERROR"
     INVALID_OUTPUT = "INVALID_OUTPUT"
     TRACE_MISSING = "TRACE_MISSING"
-    # A grader deferred to a person and no verdict has been recorded yet. Not a
+    # A evaluator deferred to a person and no verdict has been recorded yet. Not a
     # failure and not a pass: counting it either way answers a question nobody
     # has answered.
     AWAITING_REVIEW = "AWAITING_REVIEW"
@@ -98,7 +98,7 @@ class Task:
 
 
 class PassPolicy(str, Enum):
-    """How a trial's graders combine into one verdict.
+    """How a trial's evaluators combine into one verdict.
 
     ALL is the default and the safe one. ANY and THRESHOLD exist because some
     suites genuinely want them — a capability suite where three phrasings are
@@ -126,21 +126,21 @@ class Suite:
     # "60% passed" would aggregate incomparable things — and pass_policy below
     # could not be a suite-level rule at all, since the things it combines have
     # to be the same for every task.
-    graders: str = ""
+    evaluators: str = ""
     pass_policy: PassPolicy = PassPolicy.ALL
-    # Only read under THRESHOLD: the mean score every gradable grader must reach.
+    # Only read under THRESHOLD: the mean score every gradable evaluator must reach.
     pass_threshold: float = 0.7
 
 
 @dataclass
-class GraderResult:
-    grader_name: str
-    grader_type: str
+class EvaluatorResult:
+    evaluator_name: str
+    evaluator_type: str
     score: float
     passed: bool
     reason: str = ""
     assertions: dict[str, Any] = field(default_factory=dict)
-    # A grader that could not judge -- a trajectory grader with no trace, say.
+    # A evaluator that could not judge -- a trajectory evaluator with no trace, say.
     # Distinct from failing: an ungradable trial must not count against the
     # agent, and must not silently count for it either.
     ungradable: bool = False
@@ -161,7 +161,7 @@ class Trial:
     latency_ms: float = 0.0
     error_type: str = ""
     error_message: str = ""
-    grader_results: list[GraderResult] = field(default_factory=list)
+    evaluator_results: list[EvaluatorResult] = field(default_factory=list)
     # Read off the trace for run-level tool metrics. In memory only: the trials
     # feature group has no column for them, and adding one needs a version bump
     # that would leave existing projects on the old schema. The rate they feed
@@ -188,12 +188,12 @@ def derive_trial_id(run_id: str, task_id: str, task_version: int, trial_index: i
 def gradable_trials(trials: Sequence[Trial]) -> list[Trial]:
     """Trials whose outcome says something about the agent.
 
-    ``INFRA_ERROR`` and ``GRADER_ERROR`` are the harness failing, not the
+    ``INFRA_ERROR`` and ``EVALUATOR_ERROR`` are the harness failing, not the
     agent; counting them as failures makes a flaky network look like a
     regression and sends someone to debug a prompt.
     """
     return [
         t
         for t in trials
-        if t.status not in (TrialStatus.INFRA_ERROR, TrialStatus.GRADER_ERROR)
+        if t.status not in (TrialStatus.INFRA_ERROR, TrialStatus.EVALUATOR_ERROR)
     ]

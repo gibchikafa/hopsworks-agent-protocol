@@ -2,7 +2,7 @@
 
 The arithmetic here is easy to get right and easy to check. The part that
 silently produces wrong answers is *when* a trace is considered done: featurize
-too early and a trajectory grader reads half a trajectory and marks a correct
+too early and a trajectory evaluator reads half a trajectory and marks a correct
 agent wrong, with nothing in the output to say the trace was incomplete.
 """
 

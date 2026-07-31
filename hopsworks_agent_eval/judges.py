@@ -2,7 +2,7 @@
 
 A rubric judge earns its place where correctness is not a string comparison —
 "did it answer the question without inventing a policy", "was the tone right for
-a refund refusal". It is also the least trustworthy grader in the set, so
+a refund refusal". It is also the least trustworthy evaluator in the set, so
 everything here is built around that:
 
 - The judge model is recorded on every result. A score that moved because the
@@ -26,14 +26,14 @@ import logging
 import re
 from typing import Any, Callable
 
-from .graders import Trace, _ungradable
+from .evaluators import Trace, _ungradable
 from .judge_config import (
     FAILURE_CATEGORIES,
     JudgeConfig,
     render_prompt,
     tool_calls_text,
 )
-from .models import GraderResult, Task, Trial
+from .models import EvaluatorResult, Task, Trial
 
 log = logging.getLogger(__name__)
 
@@ -119,7 +119,7 @@ def anthropic_completer(api_key: str, model: str = DEFAULT_MODEL,
     """A ``complete`` backed by Anthropic.
 
     Imported lazily so the eval package does not require a provider SDK to be
-    installed for the graders that need no model at all.
+    installed for the evaluators that need no model at all.
     """
     def complete(prompt: str) -> str:
         import anthropic
@@ -137,7 +137,7 @@ def anthropic_completer(api_key: str, model: str = DEFAULT_MODEL,
     return complete
 
 
-class PairwiseGrader:
+class PairwiseEvaluator:
     """Is this answer at least as good as a reference one?
 
     A rubric judge scores an answer against a description. This compares it
@@ -146,7 +146,7 @@ class PairwiseGrader:
     shipped" is easier to agree on than "scores 0.7".
 
     Ties pass. A tie means the judge could not tell them apart, and failing a
-    trial on that would make the grader a coin toss on every equivalent answer.
+    trial on that would make the evaluator a coin toss on every equivalent answer.
 
     Position bias is real and worth knowing about: judges favour whichever
     response they see first. The reference is presented as A and the candidate
@@ -170,7 +170,7 @@ class PairwiseGrader:
         self.name = name
         self.model = model
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         reference = self.reference or task.expected_output
         if not reference:
             return _ungradable(
@@ -194,9 +194,9 @@ class PairwiseGrader:
         # b is the candidate; a tie passes, since the judge is saying it cannot
         # separate them rather than that the candidate is worse.
         passed = winner in ("b", "tie")
-        return GraderResult(
-            grader_name=self.name,
-            grader_type=self.type,
+        return EvaluatorResult(
+            evaluator_name=self.name,
+            evaluator_type=self.type,
             score=1.0 if winner == "b" else 0.5 if winner == "tie" else 0.0,
             passed=passed,
             reason=outcome.get("reason", ""),
@@ -257,7 +257,7 @@ def _tool_calls(trace) -> list:
     return calls if isinstance(calls, list) else []
 
 
-def _judged(name: str, kind: str, model: str, raw: str) -> GraderResult:
+def _judged(name: str, kind: str, model: str, raw: str) -> EvaluatorResult:
     """A judge reply turned into a result, or ungradable if it is not usable."""
     parsed = _json_from(raw)
     if parsed is None or "passed" not in parsed:
@@ -270,9 +270,9 @@ def _judged(name: str, kind: str, model: str, raw: str) -> GraderResult:
         score = max(0.0, min(1.0, float(parsed.get("score", 1.0 if parsed["passed"] else 0.0))))
     except (TypeError, ValueError):
         score = 1.0 if parsed["passed"] else 0.0
-    return GraderResult(
-        grader_name=name,
-        grader_type=kind,
+    return EvaluatorResult(
+        evaluator_name=name,
+        evaluator_type=kind,
         score=score,
         passed=bool(parsed["passed"]),
         reason=str(parsed.get("reason", ""))[:1000],
@@ -283,7 +283,7 @@ def _judged(name: str, kind: str, model: str, raw: str) -> GraderResult:
 class ToolArgumentsJudge:
     """Were the arguments *right*, not merely well-formed?
 
-    ToolArgumentGrader answers whether the payload parses and carries the keys
+    ToolArgumentEvaluator answers whether the payload parses and carries the keys
     it must. This answers whether `{"order_id": "4471"}` was the right order to
     look up given what the user asked — which no schema can express.
     """
@@ -304,7 +304,7 @@ class ToolArgumentsJudge:
         self.name = name
         self.model = model
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         calls = [
             c for c in _tool_calls(trace)
             if (not self.tool or c.get("name") == self.tool) and c.get("arguments")
@@ -335,7 +335,7 @@ class ToolResultUsedJudge:
 
     The failure this catches is an agent that calls the right tool, ignores what
     comes back, and answers from the model's own prior — which every other
-    grader here scores as a pass when the prior happens to be right, and which
+    evaluator here scores as a pass when the prior happens to be right, and which
     is exactly the behaviour that breaks when the underlying data changes.
     """
 
@@ -353,7 +353,7 @@ class ToolResultUsedJudge:
         self.name = name
         self.model = model
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         results = [c for c in _tool_calls(trace) if c.get("result")]
         if not results:
             return _ungradable(
@@ -377,7 +377,7 @@ class ToolResultUsedJudge:
         return _judged(self.name, self.type, self.model, raw)
 
 
-class LlmJudgeGrader:
+class LlmJudgeEvaluator:
     """Score a trial with a model, against one criterion or several.
 
     There is no separate single-criterion judge. A configuration that names no
@@ -415,7 +415,7 @@ class LlmJudgeGrader:
             {"tool_calls", "tool_results"} & set(self.config.inputs)
         )
 
-    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> GraderResult:
+    def grade(self, task: Task, trial: Trial, trace: Trace | None) -> EvaluatorResult:
         criteria = self.config.effective_criteria()
         if not self.config.multi and not task.rubric and not task.expected_output:
             # Nothing to grade against: a judge asked to score against nothing
@@ -512,9 +512,9 @@ class LlmJudgeGrader:
             f"{name}: {text}" for name, text in reasons.items() if text
         ) if isinstance(reasons, dict) else ""
 
-        return GraderResult(
-            grader_name=self.name,
-            grader_type=self.type,
+        return EvaluatorResult(
+            evaluator_name=self.name,
+            evaluator_type=self.type,
             score=self.config.normalise(weighted),
             passed=passed,
             reason=(reason + (f" ({detail})" if detail and not passed else ""))[:1000],

@@ -5,7 +5,7 @@ was it correct, was it safe" — and want to see those apart, because a release
 that got less correct and more polite should not read as unchanged.
 
 The whole configuration is one spec entry, so it is copied into a task like any
-other grader and cannot change under an already-published suite.
+other evaluator and cannot change under an already-published suite.
 
 Three decisions worth stating, because each has a quieter alternative that is
 worse:
@@ -525,7 +525,7 @@ def tool_calls_text(trace: dict[str, Any] | None, limit: int = 600) -> tuple[str
 def default_templates() -> list[dict[str, Any]]:
     """Starter configurations, so nobody meets an empty page.
 
-    The tool dimensions a deterministic grader answers exactly are deliberately
+    The tool dimensions a deterministic evaluator answers exactly are deliberately
     absent: paying a model to decide whether a required tool ran is slower,
     costlier and less reliable than `tool_call`, which knows.
     """
@@ -533,7 +533,7 @@ def default_templates() -> list[dict[str, Any]]:
         {
             "name": "Agent execution judge",
             "description": "Task completion, correctness and safety, weighted. "
-                           "Pair it with the tool graders rather than asking a "
+                           "Pair it with the tool evaluators rather than asking a "
                            "model to judge what they answer exactly.",
             "spec": json.dumps([{
                 "type": "llm_judge",
