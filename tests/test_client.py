@@ -154,3 +154,68 @@ class TestTrace:
     def test_an_empty_trace_is_none(self):
         session = FakeSession({"/traces/": FakeResponse({"spans": []})})
         assert client(session).fetch_trace("t") is None
+
+
+class TestWhereTheAgentIs:
+    """The address trials are sent to.
+
+    Assuming a /v1/{project}/{name} prefix produced a 404 that read as a missing
+    agent; the manifest and every endpoint are served at the root of the
+    deployment's own service.
+    """
+
+    def _client(self, deployment: dict):
+        from hopsworks_agent_eval.client import HopsworksAgentClient
+
+        class Session:
+            def get(self, url, **kwargs):
+                class R:
+                    @staticmethod
+                    def json():
+                        return deployment
+
+                    status_code = 200
+
+                    @staticmethod
+                    def raise_for_status():
+                        return None
+
+                return R()
+
+        return HopsworksAgentClient(
+            session=Session(), api_base="https://h", project_id=1,
+            project_name="g1", deployment_id=7,
+        )
+
+    def test_it_is_the_deployments_own_service(self):
+        client = self._client({"name": "customeragent", "projectNamespace": "g1"})
+        assert client._base_url() == "http://customeragent.g1.svc.cluster.local"
+
+    def test_there_is_no_project_and_name_path_prefix(self):
+        # what the 404 was: the agent serves its manifest at the root
+        client = self._client({"name": "customeragent", "projectNamespace": "g1"})
+        assert "/v1/g1/customeragent" not in client._base_url()
+
+    def test_the_namespace_is_not_assumed_to_be_the_project_name(self):
+        client = self._client({"name": "a", "projectNamespace": "ns-17"})
+        assert client._base_url() == "http://a.ns-17.svc.cluster.local"
+
+    def test_it_falls_back_to_the_project_name_when_no_namespace_is_given(self):
+        client = self._client({"name": "a"})
+        assert client._base_url() == "http://a.g1.svc.cluster.local"
+
+    def test_a_deployment_with_no_name_says_so(self):
+        # rather than building an address with a hole in it and failing at the request
+        import pytest
+
+        with pytest.raises(RuntimeError, match="no name"):
+            self._client({})._base_url()
+
+    def test_an_explicit_url_wins(self):
+        from hopsworks_agent_eval.client import HopsworksAgentClient
+
+        client = HopsworksAgentClient(
+            session=None, api_base="https://h", project_id=1, project_name="g1",
+            deployment_id=7, agent_url="https://elsewhere/agent/",
+        )
+        assert client._base_url() == "https://elsewhere/agent"

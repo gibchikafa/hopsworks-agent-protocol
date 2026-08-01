@@ -48,15 +48,35 @@ class HopsworksAgentClient:
     # ── the agent ───────────────────────────────────────────────────────────
 
     def _base_url(self) -> str:
+        """Where the agent answers, from inside the cluster.
+
+        The deployment's own Kubernetes service, which is what KServe creates and
+        what the istio VirtualService routes on. The agent serves its manifest and
+        its endpoints at the root of that host — there is no project-and-name path
+        prefix, and assuming one produced a 404 that read as a missing agent.
+
+        Built from the service name rather than read off the deployment: this
+        cluster's serving DTO carries no addresses at all, only a
+        `hopsworksInferencePath` for the KServe verb proxy, which cannot express
+        the agent protocol's paths.
+
+        `agent_url` overrides all of it, for reaching a deployment from outside.
+        """
         if self._agent_url:
             return self._agent_url.rstrip("/")
         deployment = self._session.get(
             f"{self._api}/serving/{self._deployment_id}", timeout=60
         ).json()
         name = deployment.get("name")
-        istio = deployment.get("internalIPs") or deployment.get("externalIPs") or []
-        host = istio[0] if istio else deployment.get("internalPath", "")
-        self._agent_url = f"{host}/v1/{self._project_name}/{name}"
+        if not name:
+            raise RuntimeError(
+                f"deployment {self._deployment_id} reports no name, so there is no "
+                "address to send trials to"
+            )
+        # The namespace a project's deployments live in, which is not always the
+        # project name.
+        namespace = deployment.get("projectNamespace") or self._project_name
+        self._agent_url = f"http://{name}.{namespace}.svc.cluster.local"
         return self._agent_url
 
     def manifest(self) -> dict[str, Any]:
