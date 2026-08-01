@@ -280,6 +280,29 @@ class EvalApi:
             "POST", f"/suites/{suite['suiteId']}/publish?version={suite['version']}"
         )
 
+    # ── the evaluator library ───────────────────────────────────────────────
+
+    def save_evaluator(self, name: str, checks: list[dict[str, Any]],
+                       description: str = "") -> dict[str, Any]:
+        """Save a named set of checks for reuse across suites.
+
+        A suite copies these in when it is created and never points back, so a
+        library entry changing later cannot alter what a published suite means.
+        That is the trade: the library is for not retyping a judge's criteria,
+        not for editing every suite at once.
+        """
+        return self._call("POST", "/evaluators", {
+            "name": name,
+            "description": description,
+            "spec": json.dumps(checks),
+        })
+
+    def evaluators(self) -> list[dict[str, Any]]:
+        return self._call("GET", "/evaluators")
+
+    def delete_evaluator(self, template_id: str) -> None:
+        self._call("DELETE", f"/evaluators/{template_id}")
+
     # ── tasks ───────────────────────────────────────────────────────────────
 
     def add_task(self, suite: dict[str, Any], question: str,

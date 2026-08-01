@@ -277,3 +277,21 @@ class TestReachingTheApiFromInsideAJob:
         monkeypatch.setitem(sys.modules, "hopsworks_common", type(sys)("hopsworks_common"))
         sys.modules["hopsworks_common"].client = module
         assert api_module._from_hopsworks_client() == ("auth-object", "/ca_chain.pem")
+
+
+class TestTheEvaluatorLibrary:
+    """Named sets of checks, so a judge's criteria are written once."""
+
+    def test_saving_one_sends_the_checks_as_a_spec(self):
+        client = api()
+        client.save_evaluator("Account untouched", [{"type": "tool_call"}], "why")
+        method, url, body, _ = client._session.sent[0]
+        assert (method, url.endswith("/evaluators")) == ("POST", True)
+        assert json.loads(body["spec"]) == [{"type": "tool_call"}]
+        assert body["description"] == "why"
+
+    def test_a_saved_entry_is_a_copy_source_not_a_reference(self):
+        # a suite copies these in when created; the library changing later must
+        # not alter what a published suite means
+        client = api([FakeResponse(body=[{"name": "Account untouched"}])])
+        assert client.evaluators()[0]["name"] == "Account untouched"
