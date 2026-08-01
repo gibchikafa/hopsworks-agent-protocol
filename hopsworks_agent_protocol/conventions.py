@@ -21,7 +21,13 @@ from __future__ import annotations
 # Injected by the platform when the deployment runs in eval mode (tools mocked
 # or pointed at scratch resources). The SDK only *reports* it in the manifest;
 # what eval mode means for a given agent is the agent's business.
-EVAL_MODE_ENV = "HOPSWORKS_EVAL_MODE"
+# Not HOPSWORKS_EVAL_MODE, and not AGENT_EVAL_MODE: the platform reserves the
+# HOPS_, HOPSWORKS_, HOPSFS_ and AGENT_ prefixes, so a deployment could not set
+# either of them and the flag was unusable by the only people who need it.
+#
+# EVAL_ is the prefix the evaluation side already uses — EVAL_JUDGE_API_KEY,
+# EVAL_JUDGE_MODEL — so this joins a family rather than starting one.
+EVAL_MODE_ENV = "EVAL_MODE"
 
 # ── span naming ───────────────────────────────────────────────────────────
 

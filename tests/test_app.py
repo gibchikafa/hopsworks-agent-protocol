@@ -3052,3 +3052,24 @@ class TestEvalCapabilities:
             .json()
         )
         assert manifest["capabilities"]["eval_mode"] is False
+
+
+class TestTheEvalModeVariableIsSettable:
+    def test_it_avoids_every_prefix_the_platform_reserves(self):
+        """The point of the name.
+
+        HOPSWORKS_EVAL_MODE was rejected by the deployment form — the platform
+        reserves HOPS_, HOPSWORKS_, HOPSFS_ and AGENT_ — so the flag could not be
+        set by the only people who need to set it, and a sandboxed suite could
+        never run.
+        """
+        from hopsworks_agent_protocol import conventions
+
+        reserved = ("HOPS_", "HOPSWORKS_", "HOPSFS_", "AGENT_")
+        assert not conventions.EVAL_MODE_ENV.startswith(reserved)
+
+    def test_it_joins_the_evaluation_family(self):
+        # EVAL_JUDGE_API_KEY, EVAL_JUDGE_MODEL, EVAL_MODE
+        from hopsworks_agent_protocol import conventions
+
+        assert conventions.EVAL_MODE_ENV.startswith("EVAL_")
