@@ -81,19 +81,31 @@ def _judge_for(project: Any) -> LlmJudgeEvaluator | None:
     return LlmJudgeEvaluator(anthropic_completer(api_key, model), model=model)
 
 
-def _to_suite(run: dict[str, Any], tasks: list[dict[str, Any]]) -> Suite:
-    def parse_tools(raw: Any) -> list[str]:
-        if not raw:
-            return []
+def _tags(raw: Any) -> list[str]:
+    """Tags are stored as a JSON array of strings; anything else is no tags."""
+    if isinstance(raw, list):
+        return [str(tag) for tag in raw]
+    if isinstance(raw, str) and raw.strip():
         try:
-            return json.loads(raw) if isinstance(raw, str) else list(raw)
-        except (ValueError, TypeError):
+            parsed = json.loads(raw)
+        except ValueError:
             return []
+        return [str(tag) for tag in parsed] if isinstance(parsed, list) else []
+    return []
 
+
+def _to_suite(run: dict[str, Any], tasks: list[dict[str, Any]]) -> Suite:
+    """The API's shape as the runner's models.
+
+    Expectations arrive keyed by check name, which is the same key results are
+    reported under, so this is a copy rather than a translation. It used to map
+    four fixed fields — expectedOutput, requiredTools, forbiddenTools, rubric —
+    which no longer exist on either side.
+    """
     return Suite(
         suite_id=run["suiteId"],
         suite_version=run.get("suiteVersion", 1),
-        tags=run.get("tags") or [],
+        tags=_tags(run.get("tags")),
         blocks_are_success=bool(run.get("blocksAreSuccess")),
         execution_mode=ExecutionMode(run.get("executionMode", "read_only")),
         evaluators=run.get("evaluators") or "",
@@ -105,10 +117,11 @@ def _to_suite(run: dict[str, Any], tasks: list[dict[str, Any]]) -> Suite:
                 task_version=t.get("version", 1),
                 input_messages=t.get("inputMessages") or "[]",
                 task_type=t.get("taskType", "single_turn"),
-                expected_output=t.get("expectedOutput") or "",
-                required_tools=parse_tools(t.get("requiredTools")),
-                forbidden_tools=parse_tools(t.get("forbiddenTools")),
-                rubric=t.get("rubric") or "",
+                expectations={
+                    name: value
+                    for name, value in (t.get("expectations") or {}).items()
+                    if value
+                },
                 category=t.get("category") or "",
             )
             for t in tasks
