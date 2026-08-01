@@ -93,8 +93,11 @@ class EvalApi:
             project_id = hopsworks.login().id
         return cls(host, project_id, os.environ["HOPSWORKS_API_KEY"], **kwargs)
 
-    def _call(self, method: str, path: str, body: Any = None) -> Any:
-        response = self._session.request(method, self._base + path, json=body, timeout=60)
+    def _call(self, method: str, path: str, body: Any = None,
+              params: dict[str, Any] | None = None) -> Any:
+        response = self._session.request(
+            method, self._base + path, json=body, params=params, timeout=60
+        )
         if response.status_code >= 400:
             # The API's own message, not the status: it says which rule refused and why,
             # and a bare 400 sends people to read the source instead.
@@ -177,10 +180,11 @@ class EvalApi:
                           gpus: int | None = None) -> dict[str, Any]:
         """Create the job that executes runs, if this project has none.
 
-        Starting a run does this anyway. Calling it first is how you size the job
-        or point it at your own environment before it exists — afterwards it is
-        an ordinary job, and an existing one is returned untouched so this cannot
-        undo resources or alerts set on it since.
+        One job serves the whole project, and `start_run` creates it the first
+        time any run is started, so this is optional. Calling it first is how you
+        size the job or point it at your own environment before that happens —
+        afterwards it is an ordinary job, and an existing one is returned
+        untouched so this cannot undo resources or alerts set on it since.
         """
         return self._call("POST", "/runner-job", {
             "environmentName": environment_name,
@@ -196,13 +200,17 @@ class EvalApi:
         `n_trials` above 1 is what separates pass@k from pass^k — whether the
         agent can do it at all from whether it does it every time.
         """
-        run = self._call("POST", "/runs", {
+        # Query parameters, not a body: the endpoint reads them from the query string, and a
+        # body here is silently ignored — the run is created against no suite at all.
+        return self._call("POST", "/runs", params={
             "suiteId": suite["suiteId"],
-            "suiteVersion": suite["version"],
+            "version": suite["version"],
             "deploymentId": deployment_id,
             "nTrials": n_trials,
+            # One call. Recording and starting are separable server-side, but a recorded run
+            # nobody started is only useful when the start failed.
+            "start": "true",
         })
-        return self._call("POST", f"/runs/{run['runId']}/start")
 
     def run(self, run_id: str) -> dict[str, Any]:
         return self._call("GET", f"/runs/{run_id}")

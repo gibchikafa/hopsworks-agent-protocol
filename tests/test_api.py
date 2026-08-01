@@ -33,8 +33,8 @@ class FakeSession:
         self.sent = []
         self._replies = list(replies or [])
 
-    def request(self, method, url, json=None, timeout=None):
-        self.sent.append((method, url, json))
+    def request(self, method, url, json=None, params=None, timeout=None):
+        self.sent.append((method, url, json, params))
         return self._replies.pop(0) if self._replies else FakeResponse()
 
 
@@ -78,7 +78,7 @@ class TestWhatItSends:
         # a suite with no checks grades by nothing and every trial comes back ungradable
         client = api()
         client.create_suite("s", evaluators=[evaluator("contains")], tags=["safety"])
-        method, url, body = client._session.sent[0]
+        method, url, body, _ = client._session.sent[0]
         assert (method, url.endswith("/suites")) == ("POST", True)
         assert body["evaluators"][0]["type"] == "contains"
         assert json.loads(body["tags"]) == ["safety"]
@@ -98,18 +98,29 @@ class TestWhatItSends:
         client.add_task({"suiteId": "s1", "version": 1}, "hello")
         assert client._session.sent[1][2] == {"expectations": {}}
 
-    def test_starting_a_run_records_it_then_starts_it(self):
-        client = api([FakeResponse(body={"runId": "r1"}), FakeResponse()])
+    def test_a_run_is_started_with_query_parameters_not_a_body(self):
+        # the endpoint reads the query string; a body is ignored, which would create a run
+        # against no suite at all and only show up as a job failing
+        client = api([FakeResponse(body={"runId": "r1"})])
         client.start_run({"suiteId": "s1", "version": 1}, deployment_id=7, n_trials=3)
-        record, start = client._session.sent
-        assert record[2]["deploymentId"] == 7
-        assert record[2]["nTrials"] == 3
-        assert start[1].endswith("/runs/r1/start")
+        [(method, url, body, params)] = client._session.sent
+        assert (method, url.endswith("/runs")) == ("POST", True)
+        assert body is None
+        assert params["suiteId"] == "s1"
+        assert params["version"] == 1
+        assert params["deploymentId"] == 7
+        assert params["nTrials"] == 3
+
+    def test_recording_and_starting_are_one_call(self):
+        # a recorded run nobody started is only useful when the start itself failed
+        client = api([FakeResponse(body={"runId": "r1"})])
+        client.start_run({"suiteId": "s1", "version": 1}, deployment_id=1)
+        assert client._session.sent[0][3]["start"] == "true"
 
     def test_the_runner_job_can_be_sized_before_it_exists(self):
         client = api()
         client.ensure_runner_job(environment_name="mine", cores=2, memory=4096)
-        method, url, body = client._session.sent[0]
+        method, url, body, _ = client._session.sent[0]
         assert (method, url.endswith("/runner-job")) == ("POST", True)
         assert (body["environmentName"], body["cores"]) == ("mine", 2)
 
