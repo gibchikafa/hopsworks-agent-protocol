@@ -297,31 +297,39 @@ class TestSpecIntegration:
     def test_every_judged_type_can_bring_its_own_model(self):
         # a pairwise comparison has no reason to be stuck with the project
         # default when a rubric judge is not
-        for kind in ("pairwise", "tool_arguments_judge", "tool_result_used"):
-            evaluators = evaluators_from_spec(
-                [{"type": kind, "provider": "openai", "model": "gpt-4o",
-                  "api_key_secret": "K"}],
-                secret_reader=lambda name: "sk-test",
-            )
-            assert evaluators[0].model == "gpt-4o", kind
+        import os
+
+        os.environ["OPENAI_API_KEY"] = "for-this-test"
+        try:
+            for kind in ("pairwise", "tool_arguments_judge", "tool_result_used"):
+                evaluators = evaluators_from_spec(
+                    [{"type": kind, "provider": "openai", "model": "gpt-4o"}]
+                )
+                assert evaluators[0].model == "gpt-4o", kind
+        finally:
+            del os.environ["OPENAI_API_KEY"]
 
     def test_a_bad_judge_config_is_a_spec_error(self):
         # so it is refused at authoring time like every other malformed entry
         with pytest.raises(SpecError, match="provider must be"):
             evaluators_from_spec([entry(provider="mystery")], judge_completer=lambda _p: "")
 
-    def test_a_judge_naming_a_missing_secret_is_skipped_not_failed(self):
+    def test_a_judge_whose_variable_is_unset_is_skipped_not_failed(self, monkeypatch):
+        # a project without a key still runs its deterministic checks, and the
+        # trial reports what was skipped rather than pretending it was judged
+        monkeypatch.delenv("NOPE", raising=False)
         evaluators = evaluators_from_spec(
-            [entry(provider="openai", model="gpt-4o", api_key_secret="NOPE")],
+            [entry(provider="openai", model="gpt-4o", api_key_env="NOPE")],
             judge_completer=lambda _p: "{}",
-            secret_reader=lambda _name: None,
         )
         assert evaluators == []
 
-    def test_a_judge_naming_a_present_secret_gets_its_own_provider(self):
+    def test_a_judge_naming_a_set_variable_gets_its_own_provider(self, monkeypatch):
+        # a suite can mix a cheap judge for canaries with an expensive one for a
+        # release gate, each on its own key
+        monkeypatch.setenv("MY_KEY", "its-own")
         evaluators = evaluators_from_spec(
-            [entry(provider="openai", model="gpt-4o", api_key_secret="MY_KEY")],
-            secret_reader=lambda name: "sk-test" if name == "MY_KEY" else None,
+            [entry(provider="openai", model="gpt-4o", api_key_env="MY_KEY")]
         )
         assert len(evaluators) == 1
         assert evaluators[0].config.provider == "openai"
@@ -381,10 +389,10 @@ class TestWhereAJudgesKeyComesFrom:
     """Every provider's own SDK reads a conventional variable, so a key already
     set for anything else is found without being named again."""
 
-    def config(self, provider="anthropic", secret=""):
+    def config(self, provider="anthropic", named=""):
         from hopsworks_agent_eval.judge_config import JudgeConfig
 
-        return JudgeConfig(provider=provider, api_key_secret=secret)
+        return JudgeConfig(provider=provider, api_key_env=named)
 
     def test_every_provider_but_custom_names_its_variable(self):
         # the whole point: without one there is nothing to look for
@@ -396,54 +404,48 @@ class TestWhereAJudgesKeyComesFrom:
         ]
         assert missing == []
 
-    def test_the_named_secret_wins_over_the_environment(self, monkeypatch):
-        # explicit beats ambient: a release gate naming a key means that key
+    def test_a_judge_naming_its_own_variable_uses_that_one(self, monkeypatch):
+        # for a judge that needs a different key from everything else — a release
+        # gate on its own quota
         from hopsworks_agent_eval.judge_config import api_key_for
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient")
-        assert api_key_for(
-            self.config(secret="GATE_KEY"), lambda name: "named"
-        ) == "named"
+        monkeypatch.setenv("GATE_KEY", "its-own")
+        assert api_key_for(self.config(named="GATE_KEY")) == "its-own"
 
-    def test_the_environment_variable_is_used_when_no_secret_names_one(
-        self, monkeypatch
-    ):
+    def test_the_providers_own_variable_is_the_default(self, monkeypatch):
+        # what a project already has set, because every SDK reads it
         from hopsworks_agent_eval.judge_config import api_key_for
 
         monkeypatch.setenv("OPENAI_API_KEY", "from-env")
-        assert api_key_for(self.config(provider="openai"), None) == "from-env"
-
-    def test_a_secret_of_the_variables_name_is_the_last_place_looked(
-        self, monkeypatch
-    ):
-        # the common case that silently skipped every judge: stored as a project
-        # secret under the obvious name
-        from hopsworks_agent_eval.judge_config import api_key_for
+        assert api_key_for(self.config(provider="openai")) == "from-env"
 
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        assert api_key_for(
-            self.config(), lambda name: "from-secret" if name == "ANTHROPIC_API_KEY" else None
-        ) == "from-secret"
+        assert api_key_for(self.config()) is None
 
-    def test_an_empty_named_secret_does_not_stop_the_fallback(self, monkeypatch):
-        # a secret that exists and is blank is not a key
+    def test_a_named_variable_that_is_unset_is_not_silently_replaced(
+        self, monkeypatch
+    ):
+        # naming one is a choice; falling back to the ambient key would grade with
+        # a key the suite did not ask for
         from hopsworks_agent_eval.judge_config import api_key_for
 
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
-        assert api_key_for(self.config(secret="EMPTY"), lambda name: "") == "from-env"
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient")
+        monkeypatch.delenv("GATE_KEY", raising=False)
+        assert api_key_for(self.config(named="GATE_KEY")) is None
 
     def test_a_custom_provider_has_nowhere_to_look(self, monkeypatch):
         # a gateway has no conventional variable, so it has to be told
         from hopsworks_agent_eval.judge_config import api_key_for
 
-        assert api_key_for(self.config(provider="custom"), None) is None
+        assert api_key_for(self.config(provider="custom")) is None
 
-    def test_the_places_looked_are_reportable(self):
+    def test_the_variable_read_is_reportable(self):
         # so a skipped judge says what to set, rather than that something is absent
         from hopsworks_agent_eval.judge_config import api_key_source
 
-        where = api_key_source(self.config(secret="GATE_KEY"))
-        assert "GATE_KEY" in where and "ANTHROPIC_API_KEY" in where
+        assert "GATE_KEY" in api_key_source(self.config(named="GATE_KEY"))
+        assert "account" in api_key_source(self.config())
 
 
 class TestWhenAModelRejectsTemperature:

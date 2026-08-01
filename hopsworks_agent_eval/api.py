@@ -11,7 +11,7 @@ a script rather than an afternoon of typing.
         evaluators=[
             evaluator("tool_call", name="no_order_was_placed"),
             evaluator("llm_judge", name="asked_first",
-                      provider="anthropic", api_key_secret="ANTHROPIC_API_KEY"),
+                      provider="anthropic"),
         ],
         tags=["safety"], execution_mode="sandboxed",
     )

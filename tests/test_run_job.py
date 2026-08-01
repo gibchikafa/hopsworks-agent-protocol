@@ -175,81 +175,35 @@ class TestWritingResultsMatchesTheSchema:
         assert frame["a"].tolist() == [1]
 
 
-def project():
-    return type("P", (), {"id": 1, "name": "g1"})()
-
-
-def secrets(monkeypatch, **values):
-    """What hopsworks.get_secrets_api() returns.
-
-    Patched at module level because that is where it lives — calling it on the
-    project raised AttributeError on every lookup, so every secret looked absent.
-    """
-    from hopsworks_agent_eval import run_job
-
-    def read(name):
-        return values.get(name)
-
-    monkeypatch.setattr(run_job, "_read_secret", read)
-
-
 class TestFindingTheDefaultJudgesKey:
-    """A key already set for anything else in the project should be found without
-    being configured a second time — every provider's SDK reads its own variable."""
+    """A key set on a Hopsworks account is injected into every job container, so
+    by the time the runner starts it is already an environment variable."""
 
-    def test_the_named_secret_wins(self, monkeypatch):
-        # the explicit choice: a release gate naming its own key means that one
+    def test_eval_judge_api_key_wins(self, monkeypatch):
+        # so evaluation can be pointed at a separate key from everything else
         from hopsworks_agent_eval import run_job
 
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
-        secrets(monkeypatch, EVAL_JUDGE_API_KEY="from-secret")
-        assert run_job._judge_for(project()) is not None
+        monkeypatch.setenv("EVAL_JUDGE_API_KEY", "for-evaluation")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "for-everything")
+        assert run_job._judge_for() is not None
 
-    def test_the_providers_environment_variable_is_used_when_no_secret_names_one(
-        self, monkeypatch
-    ):
-        # what silently skipped every judge before: the key was there, under the
-        # name its own SDK reads, and nothing looked
+    def test_the_providers_variable_is_used_otherwise(self, monkeypatch):
         from hopsworks_agent_eval import run_job
 
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
-        secrets(monkeypatch)
-        assert run_job._judge_for(project()) is not None
+        monkeypatch.delenv("EVAL_JUDGE_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "for-everything")
+        assert run_job._judge_for() is not None
 
-    def test_a_project_secret_of_that_name_is_the_last_place_looked(self, monkeypatch):
-        from hopsworks_agent_eval import run_job
-
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        secrets(monkeypatch, ANTHROPIC_API_KEY="from-secret")
-        assert run_job._judge_for(project()) is not None
-
-    def test_with_no_key_anywhere_it_says_where_it_looked(self, monkeypatch, caplog):
+    def test_with_no_key_it_says_where_to_put_one(self, monkeypatch, caplog):
         # not "no secret X": the reason a suite reported 100% while its only real
         # check never ran
         import logging
 
         from hopsworks_agent_eval import run_job
 
+        monkeypatch.delenv("EVAL_JUDGE_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        secrets(monkeypatch)
         with caplog.at_level(logging.INFO):
-            assert run_job._judge_for(project()) is None
-        assert "EVAL_JUDGE_API_KEY" in caplog.text
+            assert run_job._judge_for() is None
         assert "ANTHROPIC_API_KEY" in caplog.text
-        assert "report nothing" in caplog.text
-
-
-class TestTheSecretsApiIsWhereItSaysItIs:
-    def test_it_is_module_level_on_hopsworks_not_on_the_project(self):
-        """The accessor this calls, checked against the installed client.
-
-        Calling it on the project raised AttributeError on every lookup, so every
-        secret appeared absent and every judge naming one was skipped — while the
-        run reported success.
-        """
-        import pytest
-
-        hopsworks = pytest.importorskip(
-            "hopsworks", reason="the client is only installed in the job image"
-        )
-        assert hasattr(hopsworks, "get_secrets_api")
+        assert "account's environment variables" in caplog.text

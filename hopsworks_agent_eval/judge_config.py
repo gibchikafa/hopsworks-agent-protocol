@@ -21,7 +21,7 @@ one catastrophic score, which is exactly the case anyone configuring a `safety`
 dimension is worried about. `critical` sets a floor per criterion that no
 weighting can override.
 
-**The key is never in the spec.** `api_key_secret` names a project secret. A
+**The key is never in the spec.** `api_key_env` names an environment variable. A
 task row is not a place to keep credentials.
 """
 
@@ -179,7 +179,12 @@ class JudgeConfig:
     # OpenAI-compatible endpoints (vLLM, Together, most gateways) differ only by
     # base URL, so one adapter covers them.
     base_url: str = ""
-    api_key_secret: str = "EVAL_JUDGE_API_KEY"
+    #: Which environment variable holds the key, when not the provider's own.
+    #:
+    #: Empty means the provider's conventional variable, which is what a project
+    #: already has set. Naming one is for a judge that needs a different key from
+    #: everything else — a release gate on its own quota.
+    api_key_env: str = ""
     inputs: tuple[str, ...] = DEFAULT_INPUTS
     criteria: list[Criterion] = field(default_factory=list)
     score_min: float = 1.0
@@ -251,8 +256,8 @@ def parse_judge_config(entry: dict[str, Any]) -> JudgeConfig:
             "an OpenAI-compatible provider needs a base_url; there is nothing "
             "to guess from"
         )
-    config.api_key_secret = str(
-        entry.get("api_key_secret") or entry.get("apiKeySecret") or config.api_key_secret
+    config.api_key_env = str(
+        entry.get("api_key_env") or entry.get("apiKeyEnv") or config.api_key_env
     )
 
     if "temperature" in entry:
@@ -639,48 +644,38 @@ def default_templates() -> list[dict[str, Any]]:
     ]
 
 
-def api_key_for(config: "JudgeConfig", secret_reader=None) -> str | None:
-    """The key this judge should use, and where it is allowed to come from.
+def api_key_for(config: "JudgeConfig") -> str | None:
+    """The key this judge should use.
 
-    In order: the secret the judge names, then the provider's conventional
-    environment variable, then a secret named the same as that variable.
+    From the environment, and only from there. A key set on a Hopsworks account
+    is injected into every job container the user runs, so by the time this runs
+    it is already a variable — asking a secrets API for it was a second mechanism
+    that had to be configured separately and, being asked wrongly, silently
+    skipped every judge while the run reported success.
 
-    The secret comes first because it is the explicit choice — a release gate
-    naming its own key means to use that one. The environment variable comes
-    next because every provider's SDK reads it, so a key already configured for
-    anything else in the project is found without being named a second time.
-    Looking for a secret under the same name last covers the common case of
-    someone storing it as a project secret with the obvious name, which is what
-    the shipped suites did and what silently skipped every judge.
+    A judge naming its own variable wins, for one that needs a different key from
+    everything else. Otherwise the provider's conventional name, which is what its
+    own SDK reads and what a project will already have set.
     """
     import os
 
-    named = getattr(config, "api_key_secret", "") or ""
-    if named and secret_reader is not None:
-        key = secret_reader(named)
-        if key:
-            return key
+    named = getattr(config, "api_key_env", "") or ""
+    if named:
+        return os.environ.get(named) or None
 
     env_var = PROVIDERS.get(config.provider, {}).get("env_var") or ""
-    if env_var:
-        key = os.environ.get(env_var)
-        if key:
-            return key
-        if secret_reader is not None:
-            key = secret_reader(env_var)
-            if key:
-                return key
-    return None
+    return (os.environ.get(env_var) or None) if env_var else None
 
 
 def api_key_source(config: "JudgeConfig") -> str:
-    """Where a key would be looked for, for an error that can be acted on."""
-    named = getattr(config, "api_key_secret", "") or ""
-    env_var = PROVIDERS.get(config.provider, {}).get("env_var") or ""
-    places = []
+    """Which variable would be read, for an error that can be acted on."""
+    named = getattr(config, "api_key_env", "") or ""
     if named:
-        places.append(f"the project secret {named!r}")
+        return f"the environment variable {named}"
+    env_var = PROVIDERS.get(config.provider, {}).get("env_var") or ""
     if env_var:
-        places.append(f"the environment variable {env_var}")
-        places.append(f"a project secret named {env_var!r}")
-    return " or ".join(places) if places else "nowhere: this provider names no key"
+        return (
+            f"the environment variable {env_var}, which is set for a job by adding "
+            "it to your account's environment variables"
+        )
+    return "nowhere: an OpenAI-compatible endpoint must name its own variable"

@@ -87,7 +87,6 @@ def _one(
     *,
     judge_completer: Callable[[str], str] | None,
     query: Callable[[str], Any] | None,
-    secret_reader: Callable[[str], str | None] | None = None,
 ) -> Evaluator | None:
     kind = str(entry.get("type") or "").strip()
     name = str(entry.get("name") or kind or "evaluator")
@@ -173,7 +172,7 @@ def _one(
 
         completer = judge_completer
         if config.model or entry.get("provider"):
-            api_key = api_key_for(config, secret_reader)
+            api_key = api_key_for(config)
             if api_key:
                 completer = completer_for(config, api_key)
             else:
@@ -215,7 +214,6 @@ def evaluators_from_spec(
     *,
     judge_completer: Callable[[str], str] | None = None,
     query: Callable[[str], Any] | None = None,
-    secret_reader: Callable[[str], str | None] | None = None,
 ) -> list[Evaluator]:
     """Every evaluator a spec asks for.
 
@@ -239,8 +237,7 @@ def evaluators_from_spec(
         if not isinstance(entry, dict):
             raise SpecError(f"entry {index + 1} is not an object")
         try:
-            evaluator = _one(entry, judge_completer=judge_completer, query=query,
-                          secret_reader=secret_reader)
+            evaluator = _one(entry, judge_completer=judge_completer, query=query)
         except SpecError as err:
             raise SpecError(f"entry {index + 1}: {err}") from err
         if evaluator is not None:
@@ -294,7 +291,6 @@ def evaluators_for_suite(
     *,
     judge_completer: Callable[[str], str] | None = None,
     query: Callable[[str], Any] | None = None,
-    secret_reader: Callable[[str], str | None] | None = None,
 ) -> list[Evaluator]:
     """The checks every task in this suite is graded by.
 
@@ -311,6 +307,5 @@ def evaluators_for_suite(
     return evaluators_from_spec(
         flatten_rows(suite.evaluators),
         judge_completer=judge_completer,
-        query=query,
-        secret_reader=secret_reader,
+        query=query
     )

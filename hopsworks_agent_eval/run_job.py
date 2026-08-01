@@ -61,54 +61,34 @@ def _query_for(project: Any) -> Any:
     return query
 
 
-def _read_secret(name: str) -> str | None:
-    """A project secret, or None.
+def _judge_for() -> LlmJudgeEvaluator | None:
+    """The judge used by a spec that names no variable of its own.
 
-    `hopsworks.get_secrets_api()` is module level. Calling it on the project —
-    which is what this did — raised AttributeError on every lookup, so every
-    secret appeared absent and every judge naming one was skipped.
-    """
-    import hopsworks
+    EVAL_JUDGE_API_KEY when set, so evaluation can be pointed at a separate key,
+    otherwise the provider's own variable. Both are environment variables and
+    nothing else: a key set on a Hopsworks account is injected into every job
+    container, so it is already here by the time this runs.
 
-    try:
-        return hopsworks.get_secrets_api().get_secret(name).value
-    except Exception as err:  # noqa: BLE001 — an absent secret is a normal state
-        log.debug("no secret %r (%s: %s)", name, type(err).__name__, err)
-        return None
-
-
-def _judge_for(project: Any) -> LlmJudgeEvaluator | None:
-    """The judge used by a spec that names no key of its own.
-
-    Looks where a key is conventionally kept, in the order that respects an
-    explicit choice: the EVAL_JUDGE_API_KEY secret first, then ANTHROPIC_API_KEY
-    in the environment, then a project secret of that name. Every provider's own
-    SDK reads its variable, so a key already configured for anything else in the
-    project is found without having to be named a second time.
+    Asking a secrets API for it was a second mechanism that had to be configured
+    separately — and, being asked wrongly, silently skipped every judge while the
+    run reported success.
     """
     from .judge_config import PROVIDERS, JudgeConfig
 
     env_var = PROVIDERS["anthropic"]["env_var"]
-
-    def secret(name: str) -> str | None:
-        return _read_secret(name)
-
-    api_key = secret("EVAL_JUDGE_API_KEY") or os.environ.get(env_var) or secret(env_var)
+    api_key = os.environ.get("EVAL_JUDGE_API_KEY") or os.environ.get(env_var)
     if not api_key:
         log.info(
-            "no default judge key in the project secret 'EVAL_JUDGE_API_KEY', the "
-            "environment variable %s, or a project secret of that name. A judge "
-            "naming its own key is unaffected; tasks graded only by the default "
-            "judge report nothing.",
+            "no default judge key in EVAL_JUDGE_API_KEY or %s. Set one in your "
+            "account's environment variables and it reaches every job. A judge "
+            "naming its own variable is unaffected; tasks graded only by the "
+            "default judge report nothing.",
             env_var,
         )
         return None
 
     model = os.environ.get("EVAL_JUDGE_MODEL", DEFAULT_MODEL)
     log.info("LLM judge enabled (model=%s)", model)
-    # The model goes on the config, which is where the judge reads it from. Passing
-    # it as a keyword raised TypeError — the default judge would have failed the
-    # moment a key was found, and no key was ever found, so it never did.
     return LlmJudgeEvaluator(
         anthropic_completer(api_key, model), JudgeConfig(model=model)
     )
@@ -328,27 +308,12 @@ def main() -> None:
 
         from .client import HopsworksAgentClient
 
-        judge = _judge_for(project)
+        judge = _judge_for()
         # The judge is a evaluator; the spec needs the bare completer behind it, so
         # a task can ask for a rubric judge and a pairwise judge independently.
         completer = judge._complete if judge is not None else None  # noqa: SLF001
         query = _query_for(project)
 
-        def secret_reader(name: str) -> str | None:
-            """A project secret, for a judge that names its own key.
-
-            Looked up per name rather than passed in, so a suite can mix a
-            cheap judge for canaries with an expensive one for release gating
-            without either key leaving the project's secret store.
-            """
-            key = _read_secret(name)
-            if key is None:
-                log.warning(
-                    "no readable secret %r; a judge naming it falls back to its "
-                    "provider's environment variable, and is skipped if that is "
-                    "unset too", name,
-                )
-            return key
         client = HopsworksAgentClient(
             session=session,
             api_base=host,
@@ -366,8 +331,7 @@ def main() -> None:
             # way, which is what makes the run's pass rate comparable to the
             # next one's.
             evaluators=evaluators_for_suite(
-                suite, judge_completer=completer, query=query,
-                secret_reader=secret_reader,
+                suite, judge_completer=completer, query=query
             ),
             config=RunnerConfig(
                 n_trials=run.get("nTrials", 1),
