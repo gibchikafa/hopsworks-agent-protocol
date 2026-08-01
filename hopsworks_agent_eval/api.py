@@ -37,8 +37,51 @@ __all__ = [
     "EvalApi",
     "evaluator",
     "hopsworks_auth",
+    "hopsworks_session",
     "tool_expectation",
 ]
+
+
+def hopsworks_session():
+    """A session that can reach the Hopsworks API from wherever this is running.
+
+    Asks the hopsworks client first, because it has already solved this: inside a
+    job it reads the JWT the container was given and materialises the cluster's CA
+    chain out of the JKS truststore, since the internal endpoint is signed by a CA
+    no system trust store has heard of.
+
+    Rebuilding either of those by hand is how this failed twice — first demanding
+    an API key a job never has, then failing TLS verification against the cluster's
+    own certificate. Both were already answered by the client sitting in the same
+    process.
+
+    The fallback is for anywhere the client is not connected: a script, a test, a
+    notebook that has an API key and the public endpoint.
+    """
+    import requests
+
+    session = requests.Session()
+    resolved = _from_hopsworks_client()
+    if resolved is not None:
+        session.auth, session.verify = resolved
+        return session
+    session.auth = hopsworks_auth()
+    return session
+
+
+def _from_hopsworks_client():
+    """Auth and CA chain as the connected hopsworks client resolved them, or None."""
+    try:
+        from hopsworks_common import client
+
+        instance = client.get_instance()
+    except Exception:  # noqa: BLE001 — not connected, or an older client
+        return None
+    auth = getattr(instance, "_auth", None)
+    verify = getattr(instance, "_verify", None)
+    if auth is None or verify is None:
+        return None
+    return auth, verify
 
 
 def hopsworks_auth():
@@ -128,13 +171,16 @@ class EvalApi:
         self._base = (
             f"{host.rstrip('/')}/hopsworks-api/api/project/{project_id}/agent-evals"
         )
-        self._session = requests.Session()
-        # An explicit key when given; otherwise whatever this container has — a job
-        # has a JWT rather than a key.
-        self._session.auth = (
-            _StaticAuth("ApiKey " + api_key) if api_key else hopsworks_auth()
-        )
-        self._session.verify = verify
+        if api_key:
+            self._session = requests.Session()
+            self._session.auth = _StaticAuth("ApiKey " + api_key)
+            self._session.verify = verify
+        else:
+            # Whatever this container has, including the CA chain: inside a job the
+            # endpoint is signed by the cluster's own CA.
+            self._session = hopsworks_session()
+            if verify is not True:
+                self._session.verify = verify
 
     @classmethod
     def from_env(cls, project_id: int | None = None, **kwargs: Any) -> "EvalApi":

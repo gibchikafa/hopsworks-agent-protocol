@@ -208,3 +208,36 @@ class TestHowAJobAuthenticates:
 class FakeRequest:
     def __init__(self):
         self.headers = {}
+
+
+class TestReachingTheApiFromInsideAJob:
+    """Auth and the cluster's CA chain both come from the client that is already
+    connected. Rebuilding either by hand failed twice: a job has no API key, and
+    the internal endpoint is signed by a CA no system trust store carries."""
+
+    def test_the_connected_clients_auth_and_ca_chain_are_used(self, monkeypatch):
+        from hopsworks_agent_eval import api as api_module
+
+        monkeypatch.setattr(
+            api_module, "_from_hopsworks_client",
+            lambda: ("the-auth", "/srv/hops/certs/ca_chain.pem"),
+        )
+        session = api_module.hopsworks_session()
+        assert session.auth == "the-auth"
+        assert session.verify == "/srv/hops/certs/ca_chain.pem"
+
+    def test_it_falls_back_when_no_client_is_connected(self, tmp_path, monkeypatch):
+        # a script or a notebook, where there is an API key and a public endpoint
+        from hopsworks_agent_eval import api as api_module
+
+        monkeypatch.setattr(api_module, "_from_hopsworks_client", lambda: None)
+        monkeypatch.setenv("HOPSWORKS_API_KEY", "the-key")
+        request = FakeRequest()
+        api_module.hopsworks_session().auth(request)
+        assert request.headers["Authorization"] == "ApiKey the-key"
+
+    def test_a_client_that_cannot_be_asked_is_not_an_error(self, monkeypatch):
+        # an older client, or one not connected: fall back rather than fail
+        from hopsworks_agent_eval import api as api_module
+
+        assert api_module._from_hopsworks_client() is None

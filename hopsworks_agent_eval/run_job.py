@@ -22,7 +22,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from .api import hopsworks_auth
+from .api import hopsworks_session
 from .evaluator_spec import SpecError, evaluators_for_suite
 from .evaluators import (
     ContainsEvaluator,
@@ -206,15 +206,14 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
     import hopsworks
-    import requests
 
     project = hopsworks.login()
     host = os.environ.get("HOPSWORKS_HOST") or os.environ["REST_ENDPOINT"]
-    session = requests.Session()
-    # Whatever this container has. A job is handed a JWT on disk, not an API key:
-    # demanding HOPSWORKS_API_KEY failed on the first line inside the one
-    # environment this is built to run in.
-    session.auth = hopsworks_auth()
+    # Auth and the cluster's CA chain, both as the hopsworks client already
+    # resolved them for the login above. Building either by hand failed twice:
+    # a job has no API key, and the internal endpoint is signed by a CA no
+    # system trust store carries.
+    session = hopsworks_session()
     base = _api(host, project.id)
 
     def report(status: str, error: str | None = None) -> None:
