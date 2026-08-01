@@ -36,8 +36,60 @@ from typing import Any
 __all__ = [
     "EvalApi",
     "evaluator",
+    "hopsworks_auth",
     "tool_expectation",
 ]
+
+
+def hopsworks_auth():
+    """However this container is entitled to call the API.
+
+    A job is given a JWT on disk, not an API key — the same one `hopsworks.login()`
+    authenticates with — so requiring `HOPSWORKS_API_KEY` made the runner fail on
+    its first line inside the very environment it is meant to run in.
+
+    The token is re-read per request rather than once: it is rotated on disk while
+    a container runs, and a suite of five hundred tasks outlives the copy that was
+    read at startup.
+
+    An API key still wins when one is set, which is how this works from a notebook
+    or anywhere outside a job.
+    """
+    import requests.auth
+
+    api_key = os.environ.get("HOPSWORKS_API_KEY")
+    if api_key:
+        return _StaticAuth("ApiKey " + api_key)
+
+    token = os.path.join(os.environ.get("SECRETS_DIR", ""), "token.jwt")
+    if os.path.exists(token):
+        return _JwtFileAuth(token)
+
+    raise EvalApiError(
+        "no HOPSWORKS_API_KEY and no token.jwt in SECRETS_DIR: nothing to "
+        "authenticate with"
+    )
+
+
+class _StaticAuth:
+    def __init__(self, header: str):
+        self._header = header
+
+    def __call__(self, request):
+        request.headers["Authorization"] = self._header
+        return request
+
+
+class _JwtFileAuth:
+    """Reads the token at call time, so a rotation mid-run is picked up."""
+
+    def __init__(self, path: str):
+        self._path = path
+
+    def __call__(self, request):
+        with open(self._path) as token:
+            request.headers["Authorization"] = "Bearer " + token.read().strip()
+        return request
 
 
 def evaluator(kind: str, *, name: str | None = None, **config: Any) -> dict[str, Any]:
@@ -69,14 +121,19 @@ def tool_expectation(*, required: list[str] | None = None,
 class EvalApi:
     """The evaluation REST API for one project."""
 
-    def __init__(self, host: str, project_id: int, api_key: str, *, verify: bool = True):
+    def __init__(self, host: str, project_id: int, api_key: str | None = None, *,
+                 verify: bool = True):
         import requests
 
         self._base = (
             f"{host.rstrip('/')}/hopsworks-api/api/project/{project_id}/agent-evals"
         )
         self._session = requests.Session()
-        self._session.headers["Authorization"] = f"ApiKey {api_key}"
+        # An explicit key when given; otherwise whatever this container has — a job
+        # has a JWT rather than a key.
+        self._session.auth = (
+            _StaticAuth("ApiKey " + api_key) if api_key else hopsworks_auth()
+        )
         self._session.verify = verify
 
     @classmethod
@@ -91,7 +148,7 @@ class EvalApi:
             import hopsworks
 
             project_id = hopsworks.login().id
-        return cls(host, project_id, os.environ["HOPSWORKS_API_KEY"], **kwargs)
+        return cls(host, project_id, os.environ.get("HOPSWORKS_API_KEY"), **kwargs)
 
     def _call(self, method: str, path: str, body: Any = None,
               params: dict[str, Any] | None = None) -> Any:

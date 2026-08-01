@@ -22,6 +22,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+from .api import hopsworks_auth
 from .evaluator_spec import SpecError, evaluators_for_suite
 from .evaluators import (
     ContainsEvaluator,
@@ -209,9 +210,11 @@ def main() -> None:
 
     project = hopsworks.login()
     host = os.environ.get("HOPSWORKS_HOST") or os.environ["REST_ENDPOINT"]
-    api_key = os.environ["HOPSWORKS_API_KEY"]
     session = requests.Session()
-    session.headers["Authorization"] = f"ApiKey {api_key}"
+    # Whatever this container has. A job is handed a JWT on disk, not an API key:
+    # demanding HOPSWORKS_API_KEY failed on the first line inside the one
+    # environment this is built to run in.
+    session.auth = hopsworks_auth()
     base = _api(host, project.id)
 
     def report(status: str, error: str | None = None) -> None:

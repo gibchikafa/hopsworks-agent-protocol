@@ -143,3 +143,68 @@ class TestWhenTheApiRefuses:
         response.json = lambda: (_ for _ in ()).throw(ValueError("not json"))
         with pytest.raises(EvalApiError, match="502"):
             api([response]).suites()
+
+
+class TestHowAJobAuthenticates:
+    """A job has no API key. It has a JWT on disk, and demanding a key made the
+    runner fail on its first line inside the one place it is built to run."""
+
+    def test_a_jwt_on_disk_is_used_when_there_is_no_api_key(self, tmp_path, monkeypatch):
+        from hopsworks_agent_eval.api import hopsworks_auth
+
+        (tmp_path / "token.jwt").write_text("  the-token\n")
+        monkeypatch.delenv("HOPSWORKS_API_KEY", raising=False)
+        monkeypatch.setenv("SECRETS_DIR", str(tmp_path))
+
+        request = FakeRequest()
+        hopsworks_auth()(request)
+        assert request.headers["Authorization"] == "Bearer the-token"
+
+    def test_the_token_is_read_per_request_so_a_rotation_is_picked_up(
+        self, tmp_path, monkeypatch
+    ):
+        # a suite of five hundred tasks outlives the copy read at startup
+        from hopsworks_agent_eval.api import hopsworks_auth
+
+        token = tmp_path / "token.jwt"
+        token.write_text("first")
+        monkeypatch.delenv("HOPSWORKS_API_KEY", raising=False)
+        monkeypatch.setenv("SECRETS_DIR", str(tmp_path))
+
+        auth = hopsworks_auth()
+        first = FakeRequest()
+        auth(first)
+        token.write_text("second")
+        second = FakeRequest()
+        auth(second)
+
+        assert first.headers["Authorization"] == "Bearer first"
+        assert second.headers["Authorization"] == "Bearer second"
+
+    def test_an_api_key_wins_when_one_is_set(self, tmp_path, monkeypatch):
+        # how this works from a notebook, or anywhere outside a job
+        from hopsworks_agent_eval.api import hopsworks_auth
+
+        (tmp_path / "token.jwt").write_text("ignored")
+        monkeypatch.setenv("SECRETS_DIR", str(tmp_path))
+        monkeypatch.setenv("HOPSWORKS_API_KEY", "the-key")
+
+        request = FakeRequest()
+        hopsworks_auth()(request)
+        assert request.headers["Authorization"] == "ApiKey the-key"
+
+    def test_having_neither_says_so_rather_than_raising_a_key_error(
+        self, tmp_path, monkeypatch
+    ):
+        # KeyError: 'HOPSWORKS_API_KEY' is a stack trace, not an explanation
+        from hopsworks_agent_eval.api import hopsworks_auth
+
+        monkeypatch.delenv("HOPSWORKS_API_KEY", raising=False)
+        monkeypatch.setenv("SECRETS_DIR", str(tmp_path))
+        with pytest.raises(EvalApiError, match="nothing to authenticate with"):
+            hopsworks_auth()
+
+
+class FakeRequest:
+    def __init__(self):
+        self.headers = {}
