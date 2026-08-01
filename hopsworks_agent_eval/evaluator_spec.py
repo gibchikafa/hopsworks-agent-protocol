@@ -44,8 +44,13 @@ from .evaluators import (
     ToolCallEvaluator,
     ToolOrderEvaluator,
 )
-from .judge_config import JudgeConfigError, completer_for, parse_judge_config
-from .judge_config import JudgeConfigError, completer_for, parse_judge_config
+from .judge_config import (
+    JudgeConfigError,
+    api_key_for,
+    api_key_source,
+    completer_for,
+    parse_judge_config,
+)
 from .models import Suite
 
 log = logging.getLogger(__name__)
@@ -168,13 +173,14 @@ def _one(
 
         completer = judge_completer
         if config.model or entry.get("provider"):
-            api_key = secret_reader(config.api_key_secret) if secret_reader else None
+            api_key = api_key_for(config, secret_reader)
             if api_key:
                 completer = completer_for(config, api_key)
-            elif secret_reader is not None:
-                log.info(
-                    "no secret %r for judge %r; skipping it",
-                    config.api_key_secret, name,
+            else:
+                log.warning(
+                    "no key for judge %r (%s provider); looked in %s. It is "
+                    "skipped, and a task graded only by it reports nothing",
+                    name, config.provider, api_key_source(config),
                 )
                 return None
 

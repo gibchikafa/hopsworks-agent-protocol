@@ -175,32 +175,61 @@ class TestWritingResultsMatchesTheSchema:
         assert frame["a"].tolist() == [1]
 
 
-class TestWhenASecretCannotBeRead:
-    def test_the_reason_is_logged_not_just_the_absence(self, caplog):
-        """"no secret X" was said of a secret that exists and could not be read.
+class Secrets:
+    def __init__(self, **values):
+        self._values = values
 
-        The run then reported a suite fully passed while the only check that would
-        have judged it never ran — the most misleading shape a result can take.
-        """
+    def get_secret(self, name):
+        if name not in self._values:
+            raise PermissionError(f"no such secret {name}")
+        return type("S", (), {"value": self._values[name]})()
+
+
+def project(**secrets):
+    return type(
+        "P", (), {"id": 1, "name": "g1",
+                  "get_secrets_api": staticmethod(lambda: Secrets(**secrets))},
+    )()
+
+
+class TestFindingTheDefaultJudgesKey:
+    """A key already set for anything else in the project should be found without
+    being configured a second time — every provider's SDK reads its own variable."""
+
+    def test_the_named_secret_wins(self, monkeypatch):
+        # the explicit choice: a release gate naming its own key means that one
+        from hopsworks_agent_eval import run_job
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
+        judge = run_job._judge_for(project(EVAL_JUDGE_API_KEY="from-secret"))
+        assert judge is not None
+
+    def test_the_providers_environment_variable_is_used_when_no_secret_names_one(
+        self, monkeypatch
+    ):
+        # what silently skipped every judge before: the key was there, under the
+        # name its own SDK reads, and nothing looked
+        from hopsworks_agent_eval import run_job
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
+        assert run_job._judge_for(project()) is not None
+
+    def test_a_project_secret_of_that_name_is_the_last_place_looked(self, monkeypatch):
+        from hopsworks_agent_eval import run_job
+
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        assert run_job._judge_for(project(ANTHROPIC_API_KEY="from-secret")) is not None
+
+    def test_with_no_key_anywhere_it_says_where_it_looked(self, monkeypatch, caplog):
+        # not "no secret X": the reason a suite reported 100% while its only real
+        # check never ran
         import logging
 
         from hopsworks_agent_eval import run_job
 
-        class Secrets:
-            @staticmethod
-            def get_secret(name):
-                raise PermissionError("private to another user")
-
-        class Project:
-            id = 1
-            name = "g1"
-
-            @staticmethod
-            def get_secrets_api():
-                return Secrets()
-
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         with caplog.at_level(logging.INFO):
-            assert run_job._judge_for(Project()) is None
-
-        assert "PermissionError" in caplog.text
-        assert "private to another user" in caplog.text
+            assert run_job._judge_for(project()) is None
+        assert "EVAL_JUDGE_API_KEY" in caplog.text
+        assert "ANTHROPIC_API_KEY" in caplog.text
+        assert "report nothing" in caplog.text

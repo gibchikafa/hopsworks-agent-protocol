@@ -38,6 +38,12 @@ from typing import Any, Callable, Sequence
 # the whole reason the list can be this long without the code growing: only
 # Anthropic needs its own client.
 #
+# `env_var` is the variable each provider's own SDK and documentation use, so a
+# key already set for anything else in the environment is found without being
+# named again. It is the fallback, not the first choice: a judge naming its own
+# secret still wins, because a suite gating a release should be able to use a
+# different key from the one lying around in the environment.
+#
 # `default_model` is a starting point, not a recommendation that survives
 # contact with time — model names change faster than this file will. The UI asks
 # each provider what it currently offers rather than trusting these; they are
@@ -47,18 +53,21 @@ PROVIDERS: dict[str, dict[str, str]] = {
     "openai": {
         "label": "OpenAI",
         "adapter": "openai",
+        "env_var": "OPENAI_API_KEY",
         "base_url": "",
         "default_model": "gpt-5.6-terra",
     },
     "anthropic": {
         "label": "Anthropic",
         "adapter": "anthropic",
+        "env_var": "ANTHROPIC_API_KEY",
         "base_url": "",
         "default_model": "claude-sonnet-5",
     },
     "google": {
         "label": "Google Gemini",
         "adapter": "openai",
+        "env_var": "GEMINI_API_KEY",
         # Gemini's OpenAI-compatible surface, so it needs no separate client
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "default_model": "gemini-3.6-flash",
@@ -66,30 +75,35 @@ PROVIDERS: dict[str, dict[str, str]] = {
     "mistral": {
         "label": "Mistral AI",
         "adapter": "openai",
+        "env_var": "MISTRAL_API_KEY",
         "base_url": "https://api.mistral.ai/v1",
         "default_model": "mistral-medium-latest",
     },
     "fireworks": {
         "label": "Fireworks",
         "adapter": "openai",
+        "env_var": "FIREWORKS_API_KEY",
         "base_url": "https://api.fireworks.ai/inference/v1",
         "default_model": "",
     },
     "groq": {
         "label": "Groq",
         "adapter": "openai",
+        "env_var": "GROQ_API_KEY",
         "base_url": "https://api.groq.com/openai/v1",
         "default_model": "",
     },
     "deepseek": {
         "label": "DeepSeek",
         "adapter": "openai",
+        "env_var": "DEEPSEEK_API_KEY",
         "base_url": "https://api.deepseek.com",
         "default_model": "deepseek-v4-pro",
     },
     "xai": {
         "label": "xAI",
         "adapter": "openai",
+        "env_var": "XAI_API_KEY",
         "base_url": "https://api.x.ai/v1",
         "default_model": "grok-4.5",
     },
@@ -98,6 +112,9 @@ PROVIDERS: dict[str, dict[str, str]] = {
     "custom": {
         "label": "OpenAI-compatible",
         "adapter": "openai",
+        # No conventional name to guess: a gateway or an internal deployment has
+        # to be told which secret or variable holds its key.
+        "env_var": "",
         "base_url": "",
         "default_model": "",
     },
@@ -583,3 +600,50 @@ def default_templates() -> list[dict[str, Any]]:
             }]),
         },
     ]
+
+
+def api_key_for(config: "JudgeConfig", secret_reader=None) -> str | None:
+    """The key this judge should use, and where it is allowed to come from.
+
+    In order: the secret the judge names, then the provider's conventional
+    environment variable, then a secret named the same as that variable.
+
+    The secret comes first because it is the explicit choice — a release gate
+    naming its own key means to use that one. The environment variable comes
+    next because every provider's SDK reads it, so a key already configured for
+    anything else in the project is found without being named a second time.
+    Looking for a secret under the same name last covers the common case of
+    someone storing it as a project secret with the obvious name, which is what
+    the shipped suites did and what silently skipped every judge.
+    """
+    import os
+
+    named = getattr(config, "api_key_secret", "") or ""
+    if named and secret_reader is not None:
+        key = secret_reader(named)
+        if key:
+            return key
+
+    env_var = PROVIDERS.get(config.provider, {}).get("env_var") or ""
+    if env_var:
+        key = os.environ.get(env_var)
+        if key:
+            return key
+        if secret_reader is not None:
+            key = secret_reader(env_var)
+            if key:
+                return key
+    return None
+
+
+def api_key_source(config: "JudgeConfig") -> str:
+    """Where a key would be looked for, for an error that can be acted on."""
+    named = getattr(config, "api_key_secret", "") or ""
+    env_var = PROVIDERS.get(config.provider, {}).get("env_var") or ""
+    places = []
+    if named:
+        places.append(f"the project secret {named!r}")
+    if env_var:
+        places.append(f"the environment variable {env_var}")
+        places.append(f"a project secret named {env_var!r}")
+    return " or ".join(places) if places else "nowhere: this provider names no key"

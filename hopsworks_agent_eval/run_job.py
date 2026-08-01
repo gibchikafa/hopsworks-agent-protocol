@@ -62,26 +62,44 @@ def _query_for(project: Any) -> Any:
 
 
 def _judge_for(project: Any) -> LlmJudgeEvaluator | None:
-    """An LLM judge, if the project has configured one.
+    """The judge used by a spec that names no key of its own.
 
-    The key comes from a project secret named ``EVAL_JUDGE_API_KEY``: the
-    provider is the project's choice, and a run should never carry credentials
-    of its own. Absent, tasks with rubrics simply go ungradable — better than a
-    run that quietly grades nothing while looking complete.
+    Looks where a key is conventionally kept, in the order that respects an
+    explicit choice: the EVAL_JUDGE_API_KEY secret first, then ANTHROPIC_API_KEY
+    in the environment, then a project secret of that name. Every provider's own
+    SDK reads its variable, so a key already configured for anything else in the
+    project is found without having to be named a second time.
     """
-    try:
-        secret = project.get_secrets_api().get_secret("EVAL_JUDGE_API_KEY")
-        api_key = secret.value
-    except Exception as err:  # noqa: BLE001 — no judge configured is a normal state
+    from .judge_config import PROVIDERS, JudgeConfig
+
+    env_var = PROVIDERS["anthropic"]["env_var"]
+
+    def secret(name: str) -> str | None:
+        try:
+            return project.get_secrets_api().get_secret(name).value
+        except Exception as err:  # noqa: BLE001 — an absent secret is normal
+            log.debug("no secret %r (%s: %s)", name, type(err).__name__, err)
+            return None
+
+    api_key = secret("EVAL_JUDGE_API_KEY") or os.environ.get(env_var) or secret(env_var)
+    if not api_key:
         log.info(
-            "could not read EVAL_JUDGE_API_KEY (%s: %s); rubric tasks will be "
-            "ungradable", type(err).__name__, err,
+            "no default judge key in the project secret 'EVAL_JUDGE_API_KEY', the "
+            "environment variable %s, or a project secret of that name. A judge "
+            "naming its own key is unaffected; tasks graded only by the default "
+            "judge report nothing.",
+            env_var,
         )
         return None
 
     model = os.environ.get("EVAL_JUDGE_MODEL", DEFAULT_MODEL)
     log.info("LLM judge enabled (model=%s)", model)
-    return LlmJudgeEvaluator(anthropic_completer(api_key, model), model=model)
+    # The model goes on the config, which is where the judge reads it from. Passing
+    # it as a keyword raised TypeError — the default judge would have failed the
+    # moment a key was found, and no key was ever found, so it never did.
+    return LlmJudgeEvaluator(
+        anthropic_completer(api_key, model), JudgeConfig(model=model)
+    )
 
 
 def _tags(raw: Any) -> list[str]:
