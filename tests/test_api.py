@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -236,8 +237,43 @@ class TestReachingTheApiFromInsideAJob:
         api_module.hopsworks_session().auth(request)
         assert request.headers["Authorization"] == "ApiKey the-key"
 
-    def test_a_client_that_cannot_be_asked_is_not_an_error(self, monkeypatch):
-        # an older client, or one not connected: fall back rather than fail
+    def test_the_accessor_this_calls_is_the_one_the_client_has(self):
+        """The test that was missing.
+
+        The previous version asserted only that _from_hopsworks_client() returns
+        None with nothing connected — which it did, but because the accessor name
+        was wrong, not because no client was there. The runner then fell back to
+        the system trust store and failed TLS against the cluster's certificate,
+        twice, with a green suite.
+        """
+        client = pytest.importorskip(
+            "hopsworks_common.client",
+            reason="the hopsworks client is only installed in the job image",
+        )
+        assert hasattr(client, "_get_instance") or hasattr(client, "get_instance")
+
+    def test_a_client_that_is_not_connected_falls_back(self, monkeypatch):
         from hopsworks_agent_eval import api as api_module
 
+        module = type(sys)("hopsworks_common.client")
+
+        def _get_instance():
+            raise RuntimeError("not connected")
+
+        module._get_instance = _get_instance
+        monkeypatch.setitem(sys.modules, "hopsworks_common.client", module)
+        monkeypatch.setitem(sys.modules, "hopsworks_common", type(sys)("hopsworks_common"))
+        sys.modules["hopsworks_common"].client = module
         assert api_module._from_hopsworks_client() is None
+
+    def test_a_connected_client_supplies_both_halves(self, monkeypatch):
+        from hopsworks_agent_eval import api as api_module
+
+        module = type(sys)("hopsworks_common.client")
+        module._get_instance = lambda: type(
+            "C", (), {"_auth": "auth-object", "_verify": "/ca_chain.pem"}
+        )()
+        monkeypatch.setitem(sys.modules, "hopsworks_common.client", module)
+        monkeypatch.setitem(sys.modules, "hopsworks_common", type(sys)("hopsworks_common"))
+        sys.modules["hopsworks_common"].client = module
+        assert api_module._from_hopsworks_client() == ("auth-object", "/ca_chain.pem")

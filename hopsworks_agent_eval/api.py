@@ -30,8 +30,11 @@ come back under.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "EvalApi",
@@ -70,16 +73,44 @@ def hopsworks_session():
 
 
 def _from_hopsworks_client():
-    """Auth and CA chain as the connected hopsworks client resolved them, or None."""
+    """Auth and CA chain as the connected hopsworks client resolved them, or None.
+
+    The accessor is looked up by name and the failure to find one is separated from
+    the failure to connect. Catching everything and returning None made a typo —
+    `get_instance` for `_get_instance` — indistinguishable from "no client here",
+    so the runner silently fell back to a session with no CA chain and failed TLS
+    against the cluster's own certificate. A test asserting None passed for the
+    wrong reason and confirmed it.
+    """
     try:
         from hopsworks_common import client
-
-        instance = client.get_instance()
-    except Exception:  # noqa: BLE001 — not connected, or an older client
+    except ImportError:
         return None
+
+    accessor = getattr(client, "_get_instance", None) or getattr(
+        client, "get_instance", None
+    )
+    if accessor is None:
+        log.warning(
+            "the hopsworks client exposes no instance accessor; falling back to "
+            "environment credentials and the system trust store"
+        )
+        return None
+
+    try:
+        instance = accessor()
+    except Exception:  # noqa: BLE001 — genuinely not connected
+        return None
+    if instance is None:
+        return None
+
     auth = getattr(instance, "_auth", None)
     verify = getattr(instance, "_verify", None)
     if auth is None or verify is None:
+        log.warning(
+            "the connected hopsworks client exposes no %s; falling back",
+            "auth" if auth is None else "verify",
+        )
         return None
     return auth, verify
 
