@@ -173,3 +173,34 @@ class TestWritingResultsMatchesTheSchema:
 
         frame = _match_schema(type("G", (), {})(), self.frame(a=[1]))
         assert frame["a"].tolist() == [1]
+
+
+class TestWhenASecretCannotBeRead:
+    def test_the_reason_is_logged_not_just_the_absence(self, caplog):
+        """"no secret X" was said of a secret that exists and could not be read.
+
+        The run then reported a suite fully passed while the only check that would
+        have judged it never ran — the most misleading shape a result can take.
+        """
+        import logging
+
+        from hopsworks_agent_eval import run_job
+
+        class Secrets:
+            @staticmethod
+            def get_secret(name):
+                raise PermissionError("private to another user")
+
+        class Project:
+            id = 1
+            name = "g1"
+
+            @staticmethod
+            def get_secrets_api():
+                return Secrets()
+
+        with caplog.at_level(logging.INFO):
+            assert run_job._judge_for(Project()) is None
+
+        assert "PermissionError" in caplog.text
+        assert "private to another user" in caplog.text

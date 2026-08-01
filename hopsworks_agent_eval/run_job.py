@@ -72,8 +72,11 @@ def _judge_for(project: Any) -> LlmJudgeEvaluator | None:
     try:
         secret = project.get_secrets_api().get_secret("EVAL_JUDGE_API_KEY")
         api_key = secret.value
-    except Exception:  # noqa: BLE001 — no judge configured is a normal state
-        log.info("no EVAL_JUDGE_API_KEY secret; rubric tasks will be ungradable")
+    except Exception as err:  # noqa: BLE001 — no judge configured is a normal state
+        log.info(
+            "could not read EVAL_JUDGE_API_KEY (%s: %s); rubric tasks will be "
+            "ungradable", type(err).__name__, err,
+        )
         return None
 
     model = os.environ.get("EVAL_JUDGE_MODEL", DEFAULT_MODEL)
@@ -310,8 +313,15 @@ def main() -> None:
             """
             try:
                 return project.get_secrets_api().get_secret(name).value
-            except Exception:  # noqa: BLE001 — a missing secret is a normal state
-                log.info("no secret %r; judges naming it will be skipped", name)
+            except Exception as err:  # noqa: BLE001 — a missing secret is normal
+                # With the reason. "no secret X" was true of a secret that exists
+                # and could not be read, and the run reported a suite fully passed
+                # while the check that would have judged it never ran.
+                log.warning(
+                    "could not read secret %r (%s: %s); judges naming it are "
+                    "skipped, and tasks graded only by them report nothing",
+                    name, type(err).__name__, err,
+                )
                 return None
         client = HopsworksAgentClient(
             session=session,
