@@ -61,6 +61,22 @@ def _query_for(project: Any) -> Any:
     return query
 
 
+def _read_secret(name: str) -> str | None:
+    """A project secret, or None.
+
+    `hopsworks.get_secrets_api()` is module level. Calling it on the project —
+    which is what this did — raised AttributeError on every lookup, so every
+    secret appeared absent and every judge naming one was skipped.
+    """
+    import hopsworks
+
+    try:
+        return hopsworks.get_secrets_api().get_secret(name).value
+    except Exception as err:  # noqa: BLE001 — an absent secret is a normal state
+        log.debug("no secret %r (%s: %s)", name, type(err).__name__, err)
+        return None
+
+
 def _judge_for(project: Any) -> LlmJudgeEvaluator | None:
     """The judge used by a spec that names no key of its own.
 
@@ -75,11 +91,7 @@ def _judge_for(project: Any) -> LlmJudgeEvaluator | None:
     env_var = PROVIDERS["anthropic"]["env_var"]
 
     def secret(name: str) -> str | None:
-        try:
-            return project.get_secrets_api().get_secret(name).value
-        except Exception as err:  # noqa: BLE001 — an absent secret is normal
-            log.debug("no secret %r (%s: %s)", name, type(err).__name__, err)
-            return None
+        return _read_secret(name)
 
     api_key = secret("EVAL_JUDGE_API_KEY") or os.environ.get(env_var) or secret(env_var)
     if not api_key:
@@ -329,18 +341,14 @@ def main() -> None:
             cheap judge for canaries with an expensive one for release gating
             without either key leaving the project's secret store.
             """
-            try:
-                return project.get_secrets_api().get_secret(name).value
-            except Exception as err:  # noqa: BLE001 — a missing secret is normal
-                # With the reason. "no secret X" was true of a secret that exists
-                # and could not be read, and the run reported a suite fully passed
-                # while the check that would have judged it never ran.
+            key = _read_secret(name)
+            if key is None:
                 log.warning(
-                    "could not read secret %r (%s: %s); judges naming it are "
-                    "skipped, and tasks graded only by them report nothing",
-                    name, type(err).__name__, err,
+                    "no readable secret %r; a judge naming it falls back to its "
+                    "provider's environment variable, and is skipped if that is "
+                    "unset too", name,
                 )
-                return None
+            return key
         client = HopsworksAgentClient(
             session=session,
             api_base=host,

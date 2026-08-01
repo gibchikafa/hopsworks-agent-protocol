@@ -27,6 +27,7 @@ task row is not a place to keep credentials.
 
 from __future__ import annotations
 
+import logging
 import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
@@ -49,6 +50,8 @@ from typing import Any, Callable, Sequence
 # each provider what it currently offers rather than trusting these; they are
 # what the runner falls back to when a spec names no model at all.
 # Verified against provider documentation on 31 July 2026.
+log = logging.getLogger(__name__)
+
 PROVIDERS: dict[str, dict[str, str]] = {
     "openai": {
         "label": "OpenAI",
@@ -490,13 +493,17 @@ def completer_for(
             client = openai.OpenAI(
                 api_key=api_key, **({"base_url": base_url} if base_url else {})
             )
-            response = client.chat.completions.create(
-                model=model or "gpt-5.6-terra",
-                temperature=config.temperature,
-                max_tokens=config.max_tokens,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return response.choices[0].message.content or ""
+
+            def call(**extra: Any) -> str:
+                response = client.chat.completions.create(
+                    model=model or "gpt-5.6-terra",
+                    max_tokens=config.max_tokens,
+                    messages=[{"role": "user", "content": prompt}],
+                    **extra,
+                )
+                return response.choices[0].message.content or ""
+
+            return _without_rejected_temperature(call, config.temperature)
 
         return complete_openai
 
@@ -506,18 +513,48 @@ def completer_for(
         client = anthropic.Anthropic(
             api_key=api_key, **({"base_url": base_url} if base_url else {})
         )
-        response = client.messages.create(
-            model=model or "claude-sonnet-5",
-            max_tokens=config.max_tokens,
-            temperature=config.temperature,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return "".join(
-            block.text for block in response.content
-            if getattr(block, "type", "") == "text"
-        )
+
+        def call(**extra: Any) -> str:
+            response = client.messages.create(
+                model=model or "claude-sonnet-5",
+                max_tokens=config.max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+                **extra,
+            )
+            return "".join(
+                block.text for block in response.content
+                if getattr(block, "type", "") == "text"
+            )
+
+        return _without_rejected_temperature(call, config.temperature)
 
     return complete_anthropic
+
+
+def _without_rejected_temperature(call: Any, temperature: float) -> str:
+    """Send temperature, and send it again without when the model refuses it.
+
+    Newer models fix their own sampling and reject the parameter outright —
+    "`temperature` is deprecated for this model" — with a 400 that fails the
+    judge and leaves every task it graded ungradable. That is a provider changing
+    under a suite that was working, not a configuration mistake, so it is
+    absorbed here rather than reported.
+
+    Retried once, only on that specific complaint. A 400 about anything else is a
+    real problem and must not be swallowed by a blind retry.
+    """
+    try:
+        return call(temperature=temperature)
+    except Exception as err:  # noqa: BLE001 — the SDKs raise their own error types
+        message = str(err).lower()
+        if "temperature" not in message:
+            raise
+        log.info(
+            "the model rejects temperature (%s); retrying without it, which is "
+            "the value it fixes internally anyway",
+            type(err).__name__,
+        )
+        return call()
 
 
 def tool_calls_text(trace: dict[str, Any] | None, limit: int = 600) -> tuple[str, str]:

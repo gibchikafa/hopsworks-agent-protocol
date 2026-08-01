@@ -175,21 +175,22 @@ class TestWritingResultsMatchesTheSchema:
         assert frame["a"].tolist() == [1]
 
 
-class Secrets:
-    def __init__(self, **values):
-        self._values = values
-
-    def get_secret(self, name):
-        if name not in self._values:
-            raise PermissionError(f"no such secret {name}")
-        return type("S", (), {"value": self._values[name]})()
+def project():
+    return type("P", (), {"id": 1, "name": "g1"})()
 
 
-def project(**secrets):
-    return type(
-        "P", (), {"id": 1, "name": "g1",
-                  "get_secrets_api": staticmethod(lambda: Secrets(**secrets))},
-    )()
+def secrets(monkeypatch, **values):
+    """What hopsworks.get_secrets_api() returns.
+
+    Patched at module level because that is where it lives — calling it on the
+    project raised AttributeError on every lookup, so every secret looked absent.
+    """
+    from hopsworks_agent_eval import run_job
+
+    def read(name):
+        return values.get(name)
+
+    monkeypatch.setattr(run_job, "_read_secret", read)
 
 
 class TestFindingTheDefaultJudgesKey:
@@ -201,8 +202,8 @@ class TestFindingTheDefaultJudgesKey:
         from hopsworks_agent_eval import run_job
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
-        judge = run_job._judge_for(project(EVAL_JUDGE_API_KEY="from-secret"))
-        assert judge is not None
+        secrets(monkeypatch, EVAL_JUDGE_API_KEY="from-secret")
+        assert run_job._judge_for(project()) is not None
 
     def test_the_providers_environment_variable_is_used_when_no_secret_names_one(
         self, monkeypatch
@@ -212,13 +213,15 @@ class TestFindingTheDefaultJudgesKey:
         from hopsworks_agent_eval import run_job
 
         monkeypatch.setenv("ANTHROPIC_API_KEY", "from-env")
+        secrets(monkeypatch)
         assert run_job._judge_for(project()) is not None
 
     def test_a_project_secret_of_that_name_is_the_last_place_looked(self, monkeypatch):
         from hopsworks_agent_eval import run_job
 
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        assert run_job._judge_for(project(ANTHROPIC_API_KEY="from-secret")) is not None
+        secrets(monkeypatch, ANTHROPIC_API_KEY="from-secret")
+        assert run_job._judge_for(project()) is not None
 
     def test_with_no_key_anywhere_it_says_where_it_looked(self, monkeypatch, caplog):
         # not "no secret X": the reason a suite reported 100% while its only real
@@ -228,8 +231,25 @@ class TestFindingTheDefaultJudgesKey:
         from hopsworks_agent_eval import run_job
 
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        secrets(monkeypatch)
         with caplog.at_level(logging.INFO):
             assert run_job._judge_for(project()) is None
         assert "EVAL_JUDGE_API_KEY" in caplog.text
         assert "ANTHROPIC_API_KEY" in caplog.text
         assert "report nothing" in caplog.text
+
+
+class TestTheSecretsApiIsWhereItSaysItIs:
+    def test_it_is_module_level_on_hopsworks_not_on_the_project(self):
+        """The accessor this calls, checked against the installed client.
+
+        Calling it on the project raised AttributeError on every lookup, so every
+        secret appeared absent and every judge naming one was skipped — while the
+        run reported success.
+        """
+        import pytest
+
+        hopsworks = pytest.importorskip(
+            "hopsworks", reason="the client is only installed in the job image"
+        )
+        assert hasattr(hopsworks, "get_secrets_api")

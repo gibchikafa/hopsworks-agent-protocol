@@ -444,3 +444,54 @@ class TestWhereAJudgesKeyComesFrom:
 
         where = api_key_source(self.config(secret="GATE_KEY"))
         assert "GATE_KEY" in where and "ANTHROPIC_API_KEY" in where
+
+
+class TestWhenAModelRejectsTemperature:
+    """Newer models fix their own sampling and refuse the parameter. Every judge
+    call failed with a 400, leaving every task graded by them ungradable, while
+    the run reported SUCCEEDED."""
+
+    def calls(self):
+        seen = []
+
+        def call(**extra):
+            seen.append(extra)
+            if "temperature" in extra:
+                raise RuntimeError(
+                    "Error code: 400 - `temperature` is deprecated for this model."
+                )
+            return "graded"
+
+        return call, seen
+
+    def test_it_retries_without_the_parameter(self):
+        from hopsworks_agent_eval.judge_config import _without_rejected_temperature
+
+        call, seen = self.calls()
+        assert _without_rejected_temperature(call, 0.0) == "graded"
+        assert seen == [{"temperature": 0.0}, {}]
+
+    def test_a_model_that_accepts_it_is_called_once(self):
+        # the retry is for the refusal, not a second call on every judgement
+        from hopsworks_agent_eval.judge_config import _without_rejected_temperature
+
+        seen = []
+
+        def call(**extra):
+            seen.append(extra)
+            return "graded"
+
+        assert _without_rejected_temperature(call, 0.7) == "graded"
+        assert seen == [{"temperature": 0.7}]
+
+    def test_any_other_400_is_raised(self):
+        # a blind retry would swallow a real problem — a bad model name, no quota
+        import pytest
+
+        from hopsworks_agent_eval.judge_config import _without_rejected_temperature
+
+        def call(**extra):
+            raise RuntimeError("Error code: 400 - model not found")
+
+        with pytest.raises(RuntimeError, match="model not found"):
+            _without_rejected_temperature(call, 0.0)
