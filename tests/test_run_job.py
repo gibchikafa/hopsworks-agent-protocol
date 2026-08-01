@@ -110,3 +110,66 @@ class TestTags:
 
     def test_nothing_is_no_tags(self):
         assert _tags(None) == []
+
+
+class TestWritingResultsMatchesTheSchema:
+    """Python has one integer type and pandas reads it as int64, so a column the
+    feature group declares `int` arrives as `bigint` and the insert is refused —
+    after the whole suite has run, which is the most expensive moment to find out.
+    """
+
+    def frame(self, **columns):
+        import pandas as pd
+
+        return pd.DataFrame(columns)
+
+    def group(self, **types):
+        features = [
+            type("F", (), {"name": name, "type": kind})() for name, kind in types.items()
+        ]
+        return type("G", (), {"features": features})()
+
+    def test_an_int_column_is_narrowed_to_what_the_group_declares(self):
+        from hopsworks_agent_eval.run_job import _match_schema
+
+        frame = _match_schema(
+            self.group(trial_index="int"), self.frame(trial_index=[0, 1])
+        )
+        assert str(frame["trial_index"].dtype) == "int32"
+
+    def test_a_bigint_column_is_left_wide(self):
+        from hopsworks_agent_eval.run_job import _match_schema
+
+        frame = _match_schema(
+            self.group(deployment_id="bigint"), self.frame(deployment_id=[1, 2])
+        )
+        assert str(frame["deployment_id"].dtype) == "int64"
+
+    def test_a_column_with_nulls_is_left_alone(self):
+        # pandas cannot hold a null in a plain integer type, and refusing the whole
+        # write over one absent value would be worse
+        from hopsworks_agent_eval.run_job import _match_schema
+
+        frame = _match_schema(
+            self.group(input_tokens="bigint"), self.frame(input_tokens=[1, None])
+        )
+        assert frame["input_tokens"].isna().any()
+
+    def test_a_column_the_frame_does_not_have_is_not_invented(self):
+        from hopsworks_agent_eval.run_job import _match_schema
+
+        frame = _match_schema(self.group(absent="int"), self.frame(present=[1]))
+        assert list(frame.columns) == ["present"]
+
+    def test_a_type_it_does_not_know_is_left_alone(self):
+        from hopsworks_agent_eval.run_job import _match_schema
+
+        frame = _match_schema(self.group(reason="string"), self.frame(reason=["ok"]))
+        assert frame["reason"].tolist() == ["ok"]
+
+    def test_a_group_that_reports_no_schema_is_not_an_error(self):
+        # rather than failing the write over an introspection detail
+        from hopsworks_agent_eval.run_job import _match_schema
+
+        frame = _match_schema(type("G", (), {})(), self.frame(a=[1]))
+        assert frame["a"].tolist() == [1]

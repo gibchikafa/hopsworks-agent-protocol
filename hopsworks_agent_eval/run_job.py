@@ -202,10 +202,55 @@ def _write_results(feature_store: Any, result: Any, run: dict[str, Any],
     ):
         if not rows:
             continue
-        feature_store.get_feature_group(name, 1).insert(
-            pd.DataFrame(rows), write_options={"mode": "append"}
+        group = feature_store.get_feature_group(name, 1)
+        group.insert(
+            _match_schema(group, pd.DataFrame(rows)),
+            write_options={"mode": "append"},
         )
         log.info("wrote %d rows to %s", len(rows), name)
+
+
+# What pandas infers, against what a feature group declares.
+_FEATURE_TYPES = {
+    "int": "int32",
+    "bigint": "int64",
+    "smallint": "int16",
+    "tinyint": "int8",
+    "float": "float32",
+    "double": "float64",
+}
+
+
+def _match_schema(group: Any, frame: Any) -> Any:
+    """Widths as the feature group declares them, not as pandas guessed.
+
+    Python has one integer type and pandas reads it as int64, so a column the
+    feature group declares `int` arrives as `bigint` and the insert is refused
+    before a single row is written — after the whole suite has run, which is the
+    most expensive moment to discover it.
+
+    Read off the group rather than a list of column names here: the schema is
+    defined in the backend, and a list kept in this file would be a copy that
+    drifts the first time a column is added there.
+
+    A column carrying nulls is left alone: pandas cannot hold those in a plain
+    integer type, and refusing the whole write over one absent value would be
+    worse than letting the feature store say what it makes of it.
+    """
+    for feature in getattr(group, "features", None) or []:
+        target = _FEATURE_TYPES.get((getattr(feature, "type", "") or "").lower())
+        name = getattr(feature, "name", None)
+        if not target or name not in frame.columns:
+            continue
+        if frame[name].isna().any():
+            continue
+        try:
+            frame[name] = frame[name].astype(target)
+        except (TypeError, ValueError):
+            # Not a number at all; the feature store's own error will be clearer
+            # than one invented here.
+            log.debug("left %s as %s", name, frame[name].dtype)
+    return frame
 
 
 def main() -> None:
