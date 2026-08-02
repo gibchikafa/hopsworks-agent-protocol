@@ -293,6 +293,20 @@ class TestFrameworkAndTracing:
         app = AgentApp(framework="llamaindex")
         assert app.framework == "llamaindex"
 
+    @pytest.mark.parametrize(
+        ("framework", "expected"),
+        [
+            ("openai_agents", "openai_agents"),
+            ("openai-agents", "openai_agents"),
+            ("claude_agents", "claude_agents"),
+            ("claude-agent-sdk", "claude_agents"),
+        ],
+    )
+    def test_new_frameworks_and_aliases(self, monkeypatch, framework, expected):
+        monkeypatch.delenv("AGENT_FRAMEWORK", raising=False)
+        app = AgentApp(framework=framework)
+        assert app.framework == expected
+
     def test_unknown_framework_falls_back(self, monkeypatch):
         monkeypatch.delenv("AGENT_FRAMEWORK", raising=False)
         app = AgentApp(framework="prolog")
@@ -1805,6 +1819,55 @@ class TestMemoryTools:
         ]
         with pytest.raises(ValueError, match="Unknown framework"):
             app.memory_tools("nope")
+
+    def test_memory_tools_openai_agents_wrapper(self, tmp_path, monkeypatch):
+        import sys
+        import types
+
+        fake_agents = types.ModuleType("agents")
+        fake_agents.function_tool = lambda fn: {"name": fn.__name__, "fn": fn}
+        monkeypatch.setitem(sys.modules, "agents", fake_agents)
+
+        app, _ = self._app(tmp_path)
+        tools = app.memory_tools("openai-agents", include=("recall", "search"))
+        assert [tool["name"] for tool in tools] == ["recall", "search"]
+
+    def test_memory_tools_claude_agents_wrapper(self, tmp_path, monkeypatch):
+        import sys
+        import types
+
+        fake_sdk = types.ModuleType("claude_agent_sdk")
+
+        def sdk_tool(name, description, schema):
+            def decorator(fn):
+                return {
+                    "name": name,
+                    "description": description,
+                    "schema": schema,
+                    "fn": fn,
+                }
+
+            return decorator
+
+        fake_sdk.tool = sdk_tool
+        monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake_sdk)
+
+        app, _ = self._app(tmp_path)
+        tools = app.memory_tools("claude-agent-sdk", include=("remember",))
+        assert tools[0]["name"] == "remember"
+        assert tools[0]["schema"] == {"key": str, "value": str, "scope": str}
+        result = asyncio.run(tools[0]["fn"]({"key": "genre", "value": "jazz"}))
+        assert result == {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "Memory is unavailable in this call, so nothing was "
+                        "stored. Continue without it and do not retry."
+                    ),
+                }
+            ]
+        }
 
 
 class TestSubjectIdentity:

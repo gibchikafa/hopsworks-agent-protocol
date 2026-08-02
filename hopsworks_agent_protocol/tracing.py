@@ -9,6 +9,8 @@ OpenInference instrumentor is activated — no tracing code in the agent.
 Frameworks:
 - ``langgraph``  -> openinference-instrumentation-langchain (LangChain/LangGraph)
 - ``llamaindex`` -> openinference-instrumentation-llama-index
+- ``openai_agents`` -> openinference-instrumentation-openai-agents
+- ``claude_agents`` -> openinference-instrumentation-claude-agent-sdk
 - ``custom``     -> provider only; instrument manually via ``app.tracer_provider``
 
 It also owns the *turn span*: one SERVER span per request, continuing whatever
@@ -37,14 +39,32 @@ FRAMEWORK_ENV = "AGENT_FRAMEWORK"
 
 FRAMEWORK_LANGGRAPH = "langgraph"
 FRAMEWORK_LLAMAINDEX = "llamaindex"
+FRAMEWORK_OPENAI_AGENTS = "openai_agents"
+FRAMEWORK_CLAUDE_AGENTS = "claude_agents"
 FRAMEWORK_CUSTOM = "custom"
-KNOWN_FRAMEWORKS = (FRAMEWORK_LANGGRAPH, FRAMEWORK_LLAMAINDEX, FRAMEWORK_CUSTOM)
+FRAMEWORK_ALIASES = {
+    "openai-agents": FRAMEWORK_OPENAI_AGENTS,
+    "openaiagents": FRAMEWORK_OPENAI_AGENTS,
+    "claude-agents": FRAMEWORK_CLAUDE_AGENTS,
+    "claudeagents": FRAMEWORK_CLAUDE_AGENTS,
+    "claude-agent-sdk": FRAMEWORK_CLAUDE_AGENTS,
+    "claude_agent_sdk": FRAMEWORK_CLAUDE_AGENTS,
+}
+KNOWN_FRAMEWORKS = (
+    FRAMEWORK_LANGGRAPH,
+    FRAMEWORK_LLAMAINDEX,
+    FRAMEWORK_OPENAI_AGENTS,
+    FRAMEWORK_CLAUDE_AGENTS,
+    FRAMEWORK_CUSTOM,
+)
 
 
 def resolve_framework(framework: str | None) -> str:
     """Explicit argument wins; else the platform-injected AGENT_FRAMEWORK
     env var; else 'custom'."""
-    value = (framework or os.environ.get(FRAMEWORK_ENV) or FRAMEWORK_CUSTOM).lower()
+    raw = framework or os.environ.get(FRAMEWORK_ENV) or FRAMEWORK_CUSTOM
+    value = raw.strip().lower()
+    value = FRAMEWORK_ALIASES.get(value, value)
     if value not in KNOWN_FRAMEWORKS:
         log.warning(
             "Unknown agent framework %r, falling back to 'custom' "
@@ -256,5 +276,33 @@ def _instrument(framework: str, provider: Any) -> None:
                 "framework='llamaindex' but openinference-instrumentation-llama-index "
                 "is not installed; spans from the framework will be missing. "
                 "Install hopsworks-agent-protocol[llamaindex].",
+            )
+    elif framework == FRAMEWORK_OPENAI_AGENTS:
+        try:
+            from openinference.instrumentation.openai_agents import (
+                OpenAIAgentsInstrumentor,
+            )
+
+            OpenAIAgentsInstrumentor().instrument(tracer_provider=provider)
+        except ImportError:
+            log.warning(
+                "framework='openai_agents' but "
+                "openinference-instrumentation-openai-agents is not installed; "
+                "spans from the framework will be missing. Install "
+                "hopsworks-agent-protocol[openai-agents].",
+            )
+    elif framework == FRAMEWORK_CLAUDE_AGENTS:
+        try:
+            from openinference.instrumentation.claude_agent_sdk import (
+                ClaudeAgentSDKInstrumentor,
+            )
+
+            ClaudeAgentSDKInstrumentor().instrument(tracer_provider=provider)
+        except ImportError:
+            log.warning(
+                "framework='claude_agents' but "
+                "openinference-instrumentation-claude-agent-sdk is not "
+                "installed; spans from the framework will be missing. Install "
+                "hopsworks-agent-protocol[claude-agents].",
             )
     # 'custom': provider only — the agent instruments itself

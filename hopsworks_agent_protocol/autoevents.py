@@ -1,9 +1,10 @@
 """Automatic tool-event emission from OpenInference spans.
 
 When ``tool_events`` is on and tracing is active, this bridges the framework
-instrumentation the SDK already runs (LangChain/LangGraph, LlamaIndex) to
-``tool_event`` SSE frames — so tool calls show up in the chat panel with zero
-code in the agent, the same way they do in framework tracing.
+instrumentation the SDK already runs (LangChain/LangGraph, LlamaIndex, OpenAI
+Agents, Claude Agent SDK) to ``tool_event`` SSE frames — so tool calls show up
+in the chat panel with zero code in the agent, the same way they do in
+framework tracing.
 
 A span processor watches for TOOL/RETRIEVER spans and, using the request's
 :class:`HandlerContext` tracked in a context variable, emits a ``running``

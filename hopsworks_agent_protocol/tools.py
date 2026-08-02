@@ -13,9 +13,11 @@ would have to invent values for. Register them with
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
+from typing import get_type_hints
 
 from .memory import WRITABLE_SCOPES, WRITTEN_BY_AGENT
 
@@ -227,6 +229,22 @@ def search(query: str) -> str:
 MEMORY_TOOLS = (remember, recall, forget, search)
 
 
+def _normalize_framework(framework: str | None) -> str:
+    if framework is None:
+        return "plain"
+    value = str(framework).strip().lower()
+    aliases = {
+        "langchain": "langgraph",
+        "openai-agents": "openai_agents",
+        "openaiagents": "openai_agents",
+        "claude-agents": "claude_agents",
+        "claudeagents": "claude_agents",
+        "claude-agent-sdk": "claude_agents",
+        "claude_agent_sdk": "claude_agents",
+    }
+    return aliases.get(value, value)
+
+
 def _select(include):
     """The named subset of MEMORY_TOOLS, in the canonical order."""
     if include is None:
@@ -238,6 +256,44 @@ def _select(include):
             f"Unknown memory tool(s) {unknown}. Available: {sorted(by_name)}."
         )
     return [fn for fn in MEMORY_TOOLS if fn.__name__ in set(include)]
+
+
+def _description(fn) -> str:
+    return inspect.getdoc(fn) or fn.__name__.replace("_", " ")
+
+
+def _claude_input_schema(fn) -> dict[str, object]:
+    schema: dict[str, object] = {}
+    try:
+        type_hints = get_type_hints(fn)
+    except Exception:  # noqa: BLE001
+        type_hints = {}
+    for name, param in inspect.signature(fn).parameters.items():
+        if param.kind in (param.VAR_POSITIONAL, param.VAR_KEYWORD):
+            continue
+        annotation = type_hints.get(name, param.annotation)
+        if annotation is inspect.Signature.empty:
+            annotation = str
+        schema[name] = annotation
+    return schema
+
+
+def _as_claude_agent_tool(fn, sdk_tool):
+    params = inspect.signature(fn).parameters
+
+    async def invoke(args):
+        values = {}
+        for name, param in params.items():
+            if name in args:
+                values[name] = args[name]
+            elif param.default is inspect.Signature.empty:
+                raise ValueError(f"Missing required argument {name!r}.")
+        result = fn(**values)
+        return {"content": [{"type": "text", "text": str(result)}]}
+
+    invoke.__name__ = fn.__name__
+    invoke.__doc__ = fn.__doc__
+    return sdk_tool(fn.__name__, _description(fn), _claude_input_schema(fn))(invoke)
 
 
 def memory_tools(framework: str = "plain", include=None):
@@ -262,9 +318,10 @@ def memory_tools(framework: str = "plain", include=None):
     not the prompt mentions it.
     """
     tools = _select(include)
-    if framework in ("plain", "custom", None):
+    framework = _normalize_framework(framework)
+    if framework in ("plain", "custom"):
         return tools
-    if framework in ("langgraph", "langchain"):
+    if framework == "langgraph":
         try:
             from langchain_core.tools import tool as lc_tool
         except ImportError as err:
@@ -282,7 +339,26 @@ def memory_tools(framework: str = "plain", include=None):
                 "pip install llama-index-core"
             ) from err
         return [FunctionTool.from_defaults(fn=fn) for fn in tools]
+    if framework == "openai_agents":
+        try:
+            from agents import function_tool
+        except ImportError as err:
+            raise ImportError(
+                "memory_tools('openai_agents') requires openai-agents: "
+                "pip install openai-agents"
+            ) from err
+        return [function_tool(fn) for fn in tools]
+    if framework == "claude_agents":
+        try:
+            from claude_agent_sdk import tool as sdk_tool
+        except ImportError as err:
+            raise ImportError(
+                "memory_tools('claude_agents') requires claude-agent-sdk: "
+                "pip install claude-agent-sdk"
+            ) from err
+        return [_as_claude_agent_tool(fn, sdk_tool) for fn in tools]
     raise ValueError(
         f"Unknown framework {framework!r}. Supported: 'langgraph', "
-        "'llamaindex', 'plain' (bare functions to wrap yourself)."
+        "'llamaindex', 'openai_agents', 'claude_agents', 'plain' "
+        "(bare functions to wrap yourself)."
     )

@@ -96,11 +96,13 @@ agent. Declare the framework so the right OpenInference instrumentor is used
 (or let the platform-injected `AGENT_FRAMEWORK` env var decide):
 
 ```python
-agent_app = AgentApp(name="My agent", framework="langgraph")  # or "llamaindex" / "custom"
+agent_app = AgentApp(name="My agent", framework="langgraph")
 ```
 
 - `framework="langgraph"` → LangChain/LangGraph instrumentation (`pip install 'hopsworks-agent-protocol[langgraph]'`)
 - `framework="llamaindex"` → LlamaIndex instrumentation (`[llamaindex]` extra)
+- `framework="openai_agents"` → OpenAI Agents SDK instrumentation (`[openai-agents]` extra)
+- `framework="claude_agents"` → Claude Agent SDK instrumentation (`[claude-agents]` extra)
 - `framework="custom"` → provider only; instrument manually via `agent_app.tracer_provider`
 - `tracing=False` opts out; `tracing=True` warns if the deployment has no tracing endpoint
 - Missing instrumentation packages never crash the agent — it runs untraced with a warning
@@ -166,7 +168,10 @@ your back would be worse than asking:
 from hopsworks_agent_protocol import memory_tools
 
 agent = create_react_agent(llm, [*my_tools, *memory_tools("langgraph")])
-# or memory_tools("llamaindex") -> [FunctionTool]; memory_tools("plain") -> bare functions
+# memory_tools("llamaindex") -> [FunctionTool]
+# memory_tools("openai_agents") -> [@function_tool wrappers]
+# memory_tools("claude_agents") -> [Claude Agent SDK tools]
+# memory_tools("plain") -> bare functions
 ```
 
 They take no store or user argument — those resolve from the request context, so
@@ -238,11 +243,11 @@ With `AgentApp(tool_events=True)`, tool calls surface as `tool_event` SSE frames
 otherwise), which the chat panel renders as progress chips.
 
 - **Automatic** — when tracing is active, the SDK taps the framework
-  instrumentation it already runs (LangChain/LangGraph, LlamaIndex) and emits a
-  `running`/`done` event per tool span, keyed by span id. Zero code in the
-  agent. (Requires the framework to propagate context into worker threads;
-  LangChain does. Frameworks that don't will not auto-emit — use manual events
-  or the trace view.)
+  instrumentation it already runs (LangChain/LangGraph, LlamaIndex, OpenAI
+  Agents, Claude Agent SDK) and emits a `running`/`done` event per tool span,
+  keyed by span id. Zero code in the agent. (Requires the framework to
+  propagate context into worker threads; LangChain does. Frameworks that don't
+  will not auto-emit — use manual events or the trace view.)
 - **Manual** — `await ctx.emit_event(name, status, message, data, event_id)`
   for custom progress; pass the same `event_id` for a call's start and end so
   the client shows one updating chip.
@@ -323,4 +328,5 @@ pytest
 ```
 
 Optional extras keep the base install thin (FastAPI + Pydantic only):
-`[tracing]`, `[langgraph]`, `[llamaindex]`, `[memory-sql]`, `[memory-search]`.
+`[tracing]`, `[langgraph]`, `[llamaindex]`, `[openai-agents]`,
+`[claude-agents]`, `[memory-sql]`, `[memory-search]`.
