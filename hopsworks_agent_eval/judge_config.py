@@ -30,7 +30,8 @@ from __future__ import annotations
 import logging
 import json
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from threading import Lock
+from typing import Any, Callable
 
 # Providers, and which of the two adapters each one actually needs.
 #
@@ -136,6 +137,17 @@ FAILURE_CATEGORIES = (
     "other",
 )
 
+REASONING_EFFORTS = (
+    "none",
+    "default",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
+
 # What a judge may be shown. Naming them is not bureaucracy: a judge that sees
 # the expected answer anchors on it, which is right when grading correctness and
 # wrong when asking whether the agent could have got there alone.
@@ -176,6 +188,7 @@ class JudgeConfig:
     model: str = ""
     temperature: float = 0.0
     max_tokens: int = 1500
+    reasoning_effort: str = ""
     # OpenAI-compatible endpoints (vLLM, Together, most gateways) differ only by
     # base URL, so one adapter covers them.
     base_url: str = ""
@@ -268,6 +281,14 @@ def parse_judge_config(entry: dict[str, Any]) -> JudgeConfig:
         config.max_tokens = int(_as_float(entry["max_tokens"], "max_tokens"))
         if config.max_tokens < 1:
             raise JudgeConfigError("max_tokens must be at least 1")
+    raw_effort = entry.get("reasoning_effort", entry.get("reasoningEffort", ""))
+    if raw_effort not in ("", None):
+        config.reasoning_effort = str(raw_effort).strip().lower()
+        if config.reasoning_effort not in REASONING_EFFORTS:
+            raise JudgeConfigError(
+                "reasoning_effort must be one of "
+                + ", ".join(REASONING_EFFORTS)
+            )
 
     raw_inputs = entry.get("inputs")
     if raw_inputs is not None:
@@ -490,8 +511,15 @@ def completer_for(
     # a known provider at a proxy without inventing a new provider name.
     base_url = config.base_url or registry["base_url"]
     model = config.model or registry["default_model"]
-
     if registry["adapter"] == "openai":
+        parameters = _ChatCompletionParameters(
+            config.provider,
+            model,
+            config.temperature,
+            config.max_tokens,
+            config.reasoning_effort,
+        )
+
         def complete_openai(prompt: str) -> str:
             import openai
 
@@ -502,15 +530,18 @@ def completer_for(
             def call(**extra: Any) -> str:
                 response = client.chat.completions.create(
                     model=model or "gpt-5.6-terra",
-                    max_tokens=config.max_tokens,
                     messages=[{"role": "user", "content": prompt}],
                     **extra,
                 )
-                return response.choices[0].message.content or ""
+                return _message_text(response.choices[0].message.content)
 
-            return _without_rejected_temperature(call, config.temperature)
+            return parameters.call(call)
 
         return complete_openai
+
+    parameters = _AnthropicMessagesParameters(
+        model, config.temperature, config.reasoning_effort
+    )
 
     def complete_anthropic(prompt: str) -> str:
         import anthropic
@@ -531,9 +562,228 @@ def completer_for(
                 if getattr(block, "type", "") == "text"
             )
 
-        return _without_rejected_temperature(call, config.temperature)
+        return parameters.call(call)
 
     return complete_anthropic
+
+
+def _message_text(content: Any) -> str:
+    """Final text out of OpenAI-compatible content shapes.
+
+    Reasoning models often return structured blocks. The judge wants the final
+    answer text; feeding hidden thinking back into the parser would make a valid
+    JSON judgement look like malformed prose.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        pieces: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                pieces.append(block)
+                continue
+            block_type = _block_value(block, "type")
+            if block_type and str(block_type) not in ("text", "output_text"):
+                continue
+            text = _block_value(block, "text")
+            if text is not None:
+                pieces.append(str(text))
+        return "".join(pieces)
+    return str(content)
+
+
+def _block_value(block: Any, key: str) -> Any:
+    if isinstance(block, dict):
+        return block.get(key)
+    return getattr(block, key, None)
+
+
+class _TemperatureParameter:
+    """Send temperature until a provider proves this model rejects it."""
+
+    def __init__(self, value: float, state: str = "probe"):
+        self.value = value
+        self._state = state
+        self._lock = Lock()
+
+    @classmethod
+    def for_model(cls, provider: str, model: str, value: float) -> "_TemperatureParameter":
+        return cls(value, "omit" if _omits_temperature(provider, model) else "probe")
+
+    def extra(self) -> dict[str, float]:
+        return (
+            {"temperature": self.value}
+            if self._state in ("probe", "send")
+            else {}
+        )
+
+    def accepted(self) -> None:
+        if self._state == "probe":
+            self._state = "send"
+
+    def rejected(self, err: Exception) -> bool:
+        if self._state not in ("probe", "send") or not _rejects_temperature(err):
+            return False
+        self._state = "omit"
+        _log_rejected_temperature(err)
+        return True
+
+    @property
+    def probing(self) -> bool:
+        return self._state == "probe"
+
+    def call(self, call: Any) -> str:
+        if self._state == "omit":
+            return call()
+        if self._state == "send":
+            return call(temperature=self.value)
+
+        with self._lock:
+            if self._state == "omit":
+                return call()
+            if self._state == "send":
+                return call(temperature=self.value)
+            try:
+                result = call(temperature=self.value)
+            except Exception as err:  # noqa: BLE001 — SDK-specific error types
+                if not self.rejected(err):
+                    raise
+                return call()
+            self.accepted()
+            return result
+
+
+class _ReasoningEffortParameter:
+    """Provider-specific kwargs for reasoning effort, with one rejection retry."""
+
+    def __init__(self, extra: dict[str, Any]):
+        self._extra = extra
+
+    @classmethod
+    def for_anthropic(cls, model: str, effort: str) -> "_ReasoningEffortParameter":
+        if not _supports_anthropic_reasoning_effort(model, effort):
+            return cls({})
+        return cls({"output_config": {"effort": effort}})
+
+    @classmethod
+    def for_chat_completion(
+        cls, provider: str, model: str, effort: str
+    ) -> "_ReasoningEffortParameter":
+        return cls(_chat_completion_reasoning_effort_extra(provider, model, effort))
+
+    def extra(self) -> dict[str, Any]:
+        return dict(self._extra)
+
+    def rejected(self, err: Exception) -> bool:
+        if not self._extra or not _rejects_reasoning_effort(err):
+            return False
+        self._extra = {}
+        log.info(
+            "the model rejects reasoning_effort (%s); retrying without it",
+            type(err).__name__,
+        )
+        return True
+
+
+class _AnthropicMessagesParameters:
+    """Keyword arguments for Anthropic Messages requests."""
+
+    def __init__(self, model: str, temperature: float, reasoning_effort: str):
+        self._temperature = _TemperatureParameter.for_model(
+            "anthropic", model, temperature
+        )
+        self._reasoning_effort = _ReasoningEffortParameter.for_anthropic(
+            model, reasoning_effort
+        )
+        self._lock = Lock()
+
+    def call(self, call: Any) -> str:
+        if not self._temperature.probing:
+            return self._call(call)
+        with self._lock:
+            return self._call(call)
+
+    def _call(self, call: Any) -> str:
+        last: Exception | None = None
+        for _attempt in range(3):
+            extra: dict[str, Any] = {}
+            extra.update(self._temperature.extra())
+            extra.update(self._reasoning_effort.extra())
+            try:
+                result = call(**extra)
+            except Exception as err:  # noqa: BLE001 — SDK-specific error types
+                last = err
+                if self._temperature.rejected(err):
+                    continue
+                if self._reasoning_effort.rejected(err):
+                    continue
+                raise
+            self._temperature.accepted()
+            return result
+        if last is not None:
+            raise last
+        raise RuntimeError("could not build an Anthropic Messages request")
+
+
+class _ChatCompletionParameters:
+    """Keyword arguments for OpenAI-compatible chat completion requests."""
+
+    def __init__(
+        self,
+        provider: str,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        reasoning_effort: str = "",
+    ):
+        self.max_tokens = max_tokens
+        self._token_limit = _token_limit_parameter(model)
+        self._temperature = _TemperatureParameter.for_model(
+            provider, model, temperature
+        )
+        self._reasoning_effort = _ReasoningEffortParameter.for_chat_completion(
+            provider, model, reasoning_effort
+        )
+        self._lock = Lock()
+
+    def call(self, call: Any) -> str:
+        if not self._temperature.probing:
+            return self._call(call)
+        with self._lock:
+            return self._call(call)
+
+    def _call(self, call: Any) -> str:
+        last: Exception | None = None
+        for _attempt in range(3):
+            extra: dict[str, Any] = {self._token_limit: self.max_tokens}
+            extra.update(self._temperature.extra())
+            extra.update(self._reasoning_effort.extra())
+            try:
+                result = call(**extra)
+            except Exception as err:  # noqa: BLE001 — SDK-specific error types
+                last = err
+                replacement = _replacement_token_limit(err, self._token_limit)
+                if replacement:
+                    log.info(
+                        "the model rejects %s (%s); retrying with %s",
+                        self._token_limit,
+                        type(err).__name__,
+                        replacement,
+                    )
+                    self._token_limit = replacement
+                    continue
+                if self._temperature.rejected(err):
+                    continue
+                if self._reasoning_effort.rejected(err):
+                    continue
+                raise
+            self._temperature.accepted()
+            return result
+        if last is not None:
+            raise last
+        raise RuntimeError("could not build a chat completion request")
 
 
 def _without_rejected_temperature(call: Any, temperature: float) -> str:
@@ -548,18 +798,259 @@ def _without_rejected_temperature(call: Any, temperature: float) -> str:
     Retried once, only on that specific complaint. A 400 about anything else is a
     real problem and must not be swallowed by a blind retry.
     """
-    try:
-        return call(temperature=temperature)
-    except Exception as err:  # noqa: BLE001 — the SDKs raise their own error types
-        message = str(err).lower()
-        if "temperature" not in message:
-            raise
-        log.info(
-            "the model rejects temperature (%s); retrying without it, which is "
-            "the value it fixes internally anyway",
-            type(err).__name__,
+    return _TemperatureParameter(temperature).call(call)
+
+
+def _rejects_temperature(err: Exception) -> bool:
+    message = str(err).lower()
+    return "temperature" in message and any(
+        fragment in message
+        for fragment in (
+            "deprecated",
+            "not support",
+            "not supported",
+            "only the default",
+            "unsupported",
         )
-        return call()
+    )
+
+
+def _log_rejected_temperature(err: Exception) -> None:
+    log.info(
+        "the model rejects temperature (%s); retrying without it, which is "
+        "the value it fixes internally anyway",
+        type(err).__name__,
+    )
+
+
+def _replacement_token_limit(err: Exception, current: str) -> str:
+    message = str(err).lower()
+    if current == "max_tokens" and "max_tokens" in message \
+            and "max_completion_tokens" in message:
+        return "max_completion_tokens"
+    if current == "max_completion_tokens" and "max_completion_tokens" in message \
+            and "max_tokens" in message and "not support" in message:
+        return "max_tokens"
+    return ""
+
+
+def _rejects_reasoning_effort(err: Exception) -> bool:
+    message = str(err).lower()
+    if not any(
+        marker in message
+        for marker in (
+            "reasoning_effort",
+            "reasoning effort",
+            "output_config",
+            "thinking",
+            "effort",
+        )
+    ):
+        return False
+    return any(
+        fragment in message
+        for fragment in (
+            "invalid",
+            "not support",
+            "not supported",
+            "unknown",
+            "unrecognized",
+            "unexpected",
+            "unsupported",
+        )
+    )
+
+
+def _chat_completion_reasoning_effort_extra(
+    provider: str, model: str, effort: str
+) -> dict[str, Any]:
+    provider = (provider or "").strip().lower()
+    effort = (effort or "").strip().lower()
+    if not _supports_chat_completion_reasoning_effort(provider, model, effort):
+        return {}
+    if provider == "deepseek":
+        thinking_type = "disabled" if effort == "none" else "enabled"
+        extra: dict[str, Any] = {
+            "extra_body": {"thinking": {"type": thinking_type}},
+        }
+        if effort != "none":
+            extra["reasoning_effort"] = effort
+        return extra
+    return {"reasoning_effort": effort}
+
+
+def _supports_chat_completion_reasoning_effort(
+    provider: str, model: str, effort: str
+) -> bool:
+    provider = (provider or "").strip().lower()
+    effort = (effort or "").strip().lower()
+    if not effort:
+        return False
+    if provider == "openai":
+        return effort in {"none", "minimal", "low", "medium", "high", "xhigh"} \
+            and _is_openai_reasoning_model(model)
+    if provider == "google":
+        return effort in {"none", "minimal", "low", "medium", "high"} \
+            and _has_model_prefix(model, "gemini-")
+    if provider == "deepseek":
+        return effort in {"none", "low", "medium", "high", "xhigh", "max"} \
+            and _is_deepseek_thinking_model(model)
+    if provider == "fireworks":
+        return effort in {"none", "low", "medium", "high", "xhigh", "max"} \
+            and bool(_model_identifiers(model))
+    if provider == "groq":
+        return effort in {"none", "default", "low", "medium", "high"} \
+            and _has_model_prefix(model, "qwen", "gpt-oss")
+    if provider == "mistral":
+        return effort in {"none", "minimal", "low", "medium", "high", "xhigh"} \
+            and (
+                _has_model_prefix(model, "magistral-")
+                or _has_model_prefix(
+                    model,
+                    "mistral-small-latest",
+                    "mistral-medium-latest",
+                    "mistral-medium-3-5",
+                )
+            )
+    if provider == "xai":
+        return effort in {"low", "medium", "high"} \
+            and _has_model_prefix(model, "grok-4", "grok-4.5", "grok-4.3")
+    if provider == "custom":
+        return _supports_inferred_chat_reasoning_effort(model, effort)
+    return False
+
+
+def _supports_inferred_chat_reasoning_effort(model: str, effort: str) -> bool:
+    if _is_openai_reasoning_model(model):
+        return effort in {"none", "minimal", "low", "medium", "high", "xhigh"}
+    if _has_model_prefix(model, "gemini-"):
+        return effort in {"none", "minimal", "low", "medium", "high"}
+    if _is_deepseek_thinking_model(model):
+        return effort in {"none", "low", "medium", "high", "xhigh", "max"}
+    if _has_model_prefix(model, "kimi-", "qwen", "glm", "minimax", "gpt-oss"):
+        return effort in {"none", "low", "medium", "high", "xhigh", "max"}
+    if _has_model_prefix(
+        model,
+        "grok-4",
+        "magistral-",
+        "mistral-small-latest",
+        "mistral-medium-latest",
+        "mistral-medium-3-5",
+    ):
+        return effort in {"none", "minimal", "low", "medium", "high", "xhigh"}
+    return False
+
+
+def _supports_anthropic_reasoning_effort(model: str, effort: str) -> bool:
+    effort = (effort or "").strip().lower()
+    if not effort:
+        return False
+    if effort not in {"low", "medium", "high", "xhigh", "max"}:
+        return False
+    if effort == "xhigh":
+        return _has_model_prefix(
+            model,
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-sonnet-5",
+        )
+    return _has_model_prefix(
+        model,
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-mythos-preview",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-opus-4-5",
+        "claude-sonnet-5",
+        "claude-sonnet-4-6",
+    )
+
+
+def _token_limit_parameter(model: str) -> str:
+    if _is_openai_reasoning_model(model):
+        return "max_completion_tokens"
+    return "max_tokens"
+
+
+def _omits_temperature(provider: str, model: str) -> bool:
+    """Whether sending temperature is known to make this model request invalid."""
+    return (
+        _is_openai_reasoning_model(model)
+        or _is_claude_fixed_sampling_model(model)
+        or _is_gemini_fixed_sampling_model(model)
+        or _is_deepseek_thinking_model(model)
+        or _is_kimi_fixed_sampling_model(model)
+    )
+
+
+def _is_openai_reasoning_model(model: str) -> bool:
+    return _has_model_prefix(model, "o1", "o3", "o4", "gpt-5")
+
+
+def _is_claude_fixed_sampling_model(model: str) -> bool:
+    if _has_model_prefix(
+        model,
+        "claude-mythos-preview",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+    ):
+        return True
+    for identifier in _model_identifiers(model):
+        if not identifier.startswith("claude-"):
+            continue
+        for part in identifier.split("-")[1:]:
+            if part.isdigit():
+                return int(part) >= 5
+    return False
+
+
+def _is_gemini_fixed_sampling_model(model: str) -> bool:
+    for identifier in _model_identifiers(model):
+        if identifier.startswith("gemini-3.5-flash-lite"):
+            return True
+        if identifier.startswith("gemini-") and _version_at_least(identifier, 3, 6):
+            return True
+    return False
+
+
+def _is_deepseek_thinking_model(model: str) -> bool:
+    return _has_model_prefix(model, "deepseek-reasoner", "deepseek-v4")
+
+
+def _is_kimi_fixed_sampling_model(model: str) -> bool:
+    return _has_model_prefix(model, "kimi-k2.5", "kimi-k2-5", "kimi-k2.6", "kimi-k2-6")
+
+
+def _has_model_prefix(model: str, *prefixes: str) -> bool:
+    return any(
+        identifier.startswith(prefix)
+        for identifier in _model_identifiers(model)
+        for prefix in prefixes
+    )
+
+
+def _model_identifiers(model: str) -> tuple[str, ...]:
+    normalised = (model or "").strip().lower()
+    for separator in "/", ":":
+        normalised = normalised.replace(separator, " ")
+    return tuple(part for part in normalised.split() if part)
+
+
+def _version_at_least(identifier: str, major: int, minor: int) -> bool:
+    version = identifier.split("-", 2)[1] if "-" in identifier else ""
+    pieces = version.split(".", 1)
+    try:
+        found_major = int(pieces[0])
+        found_minor = int(pieces[1]) if len(pieces) > 1 else 0
+    except ValueError:
+        return False
+    return (found_major, found_minor) >= (major, minor)
 
 
 def tool_calls_text(trace: dict[str, Any] | None, limit: int = 600) -> tuple[str, str]:

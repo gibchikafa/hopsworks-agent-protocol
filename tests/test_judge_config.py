@@ -16,6 +16,7 @@ from hopsworks_agent_eval.evaluator_spec import SpecError, evaluators_from_spec
 from hopsworks_agent_eval.judge_config import (
     FAILURE_CATEGORIES,
     PROVIDERS,
+    REASONING_EFFORTS,
     JudgeConfigError,
     default_templates,
     parse_judge_config,
@@ -144,6 +145,15 @@ class TestParsing:
     def test_temperature_is_bounded(self):
         with pytest.raises(JudgeConfigError, match="temperature"):
             parse_judge_config(entry(temperature=5))
+
+    def test_reasoning_effort_is_enumerated(self):
+        assert parse_judge_config(entry(reasoning_effort="High")).reasoning_effort \
+            == "high"
+        assert parse_judge_config(
+            entry(**{"reasoningEffort": "max"})
+        ).reasoning_effort == "max"
+        with pytest.raises(JudgeConfigError, match="reasoning_effort"):
+            parse_judge_config(entry(reasoning_effort="heroic"))
 
     def test_normalisation_maps_the_scale_onto_zero_to_one(self):
         config = parse_judge_config(entry())
@@ -497,3 +507,272 @@ class TestWhenAModelRejectsTemperature:
 
         with pytest.raises(RuntimeError, match="model not found"):
             _without_rejected_temperature(call, 0.0)
+
+
+class TestProviderRequestShape:
+    @pytest.mark.parametrize(
+        ("provider", "model"),
+        [
+            ("anthropic", "claude-sonnet-5"),
+            ("anthropic", "claude-opus-5"),
+            ("anthropic", "claude-opus-4-8"),
+            ("anthropic", "claude-mythos-preview"),
+            ("openai", "gpt-5.6-terra"),
+            ("custom", "openrouter/openai/o3-mini"),
+            ("google", "gemini-3.6-flash"),
+            ("google", "gemini-3.5-flash-lite"),
+            ("deepseek", "deepseek-v4-pro"),
+            ("fireworks", "accounts/acme/models/kimi-k2.6"),
+        ],
+    )
+    def test_fixed_sampling_models_do_not_send_temperature_first(
+        self, provider, model
+    ):
+        from hopsworks_agent_eval.judge_config import _TemperatureParameter
+
+        seen = []
+
+        def call(**extra):
+            seen.append(extra)
+            return "graded"
+
+        temperature = _TemperatureParameter.for_model(provider, model, 0.0)
+        assert temperature.call(call) == "graded"
+        assert seen == [{}]
+
+    @pytest.mark.parametrize(
+        ("provider", "model"),
+        [
+            ("anthropic", "claude-sonnet-4-5"),
+            ("openai", "gpt-4o"),
+            ("google", "gemini-2.5-pro"),
+            ("mistral", "mistral-medium-latest"),
+            ("xai", "grok-4.5"),
+        ],
+    )
+    def test_models_with_sampling_controls_still_send_temperature(
+        self, provider, model
+    ):
+        from hopsworks_agent_eval.judge_config import _TemperatureParameter
+
+        seen = []
+
+        def call(**extra):
+            seen.append(extra)
+            return "graded"
+
+        temperature = _TemperatureParameter.for_model(provider, model, 0.7)
+        assert temperature.call(call) == "graded"
+        assert seen == [{"temperature": 0.7}]
+
+    @pytest.mark.parametrize(
+        "model",
+        ["gpt-5.6-terra", "openrouter/openai/o4-mini", "o3-mini"],
+    )
+    def test_openai_reasoning_chat_uses_completion_token_limit(self, model):
+        from hopsworks_agent_eval.judge_config import _ChatCompletionParameters
+
+        seen = []
+
+        def call(**extra):
+            seen.append(extra)
+            return "graded"
+
+        parameters = _ChatCompletionParameters("openai", model, 0.0, 1500)
+        assert parameters.call(call) == "graded"
+        assert seen == [{"max_completion_tokens": 1500}]
+
+    def test_non_reasoning_chat_keeps_max_tokens_and_temperature(self):
+        from hopsworks_agent_eval.judge_config import _ChatCompletionParameters
+
+        seen = []
+
+        def call(**extra):
+            seen.append(extra)
+            return "graded"
+
+        parameters = _ChatCompletionParameters("openai", "gpt-4o", 0.2, 1500)
+        assert parameters.call(call) == "graded"
+        assert seen == [{"max_tokens": 1500, "temperature": 0.2}]
+
+    def test_anthropic_reasoning_effort_uses_output_config(self):
+        from hopsworks_agent_eval.judge_config import _AnthropicMessagesParameters
+
+        seen = []
+
+        def call(**extra):
+            seen.append(extra)
+            return "graded"
+
+        parameters = _AnthropicMessagesParameters("claude-sonnet-5", 0.0, "high")
+        assert parameters.call(call) == "graded"
+        assert seen == [{"output_config": {"effort": "high"}}]
+
+    def test_anthropic_omits_effort_for_models_that_do_not_support_it(self):
+        from hopsworks_agent_eval.judge_config import _AnthropicMessagesParameters
+
+        seen = []
+
+        def call(**extra):
+            seen.append(extra)
+            return "graded"
+
+        parameters = _AnthropicMessagesParameters("claude-sonnet-4-5", 0.0, "high")
+        assert parameters.call(call) == "graded"
+        assert seen == [{"temperature": 0.0}]
+
+    def test_openai_reasoning_effort_is_top_level(self):
+        from hopsworks_agent_eval.judge_config import _ChatCompletionParameters
+
+        seen = []
+
+        def call(**extra):
+            seen.append(extra)
+            return "graded"
+
+        parameters = _ChatCompletionParameters(
+            "openai", "gpt-5.6-terra", 0.0, 1500, "high"
+        )
+        assert parameters.call(call) == "graded"
+        assert seen == [
+            {"max_completion_tokens": 1500, "reasoning_effort": "high"}
+        ]
+
+    def test_non_reasoning_chat_omits_reasoning_effort(self):
+        from hopsworks_agent_eval.judge_config import _ChatCompletionParameters
+
+        seen = []
+
+        def call(**extra):
+            seen.append(extra)
+            return "graded"
+
+        parameters = _ChatCompletionParameters("openai", "gpt-4o", 0.2, 1500, "high")
+        assert parameters.call(call) == "graded"
+        assert seen == [{"max_tokens": 1500, "temperature": 0.2}]
+
+    def test_deepseek_reasoning_effort_enables_thinking(self):
+        from hopsworks_agent_eval.judge_config import _ChatCompletionParameters
+
+        seen = []
+
+        def call(**extra):
+            seen.append(extra)
+            return "graded"
+
+        parameters = _ChatCompletionParameters(
+            "deepseek", "deepseek-v4-pro", 0.0, 1500, "max"
+        )
+        assert parameters.call(call) == "graded"
+        assert seen == [
+            {
+                "max_tokens": 1500,
+                "reasoning_effort": "max",
+                "extra_body": {"thinking": {"type": "enabled"}},
+            }
+        ]
+
+    def test_deepseek_none_disables_thinking(self):
+        from hopsworks_agent_eval.judge_config import _ChatCompletionParameters
+
+        seen = []
+
+        def call(**extra):
+            seen.append(extra)
+            return "graded"
+
+        parameters = _ChatCompletionParameters(
+            "deepseek", "deepseek-v4-pro", 0.0, 1500, "none"
+        )
+        assert parameters.call(call) == "graded"
+        assert seen == [
+            {
+                "max_tokens": 1500,
+                "extra_body": {"thinking": {"type": "disabled"}},
+            }
+        ]
+
+    def test_reasoning_effort_rejections_are_learned_for_later_calls(self):
+        from hopsworks_agent_eval.judge_config import _ChatCompletionParameters
+
+        seen = []
+
+        def call(**extra):
+            seen.append(extra)
+            if "reasoning_effort" in extra:
+                raise RuntimeError(
+                    "Error code: 400 - unsupported parameter reasoning_effort"
+                )
+            return "graded"
+
+        parameters = _ChatCompletionParameters("custom", "gpt-oss-120b", 0.0, 1500, "high")
+        assert parameters.call(call) == "graded"
+        assert parameters.call(call) == "graded"
+        assert seen == [
+            {"max_tokens": 1500, "temperature": 0.0, "reasoning_effort": "high"},
+            {"max_tokens": 1500, "temperature": 0.0},
+            {"max_tokens": 1500, "temperature": 0.0},
+        ]
+
+    def test_structured_chat_content_reads_text_blocks_only(self):
+        from hopsworks_agent_eval.judge_config import _message_text
+
+        assert _message_text([
+            {"type": "reasoning", "text": "private"},
+            {"type": "text", "text": "{\"scores\": {}}"},
+        ]) == "{\"scores\": {}}"
+
+    def test_unknown_model_rejections_are_learned_for_later_calls(self):
+        from hopsworks_agent_eval.judge_config import _ChatCompletionParameters
+
+        seen = []
+
+        def call(**extra):
+            seen.append(extra)
+            if "temperature" in extra:
+                raise RuntimeError(
+                    "Error code: 400 - `temperature` is deprecated for this model."
+                )
+            return "graded"
+
+        parameters = _ChatCompletionParameters("custom", "new-fixed-model", 0.0, 1500)
+        assert parameters.call(call) == "graded"
+        assert parameters.call(call) == "graded"
+        assert seen == [
+            {"max_tokens": 1500, "temperature": 0.0},
+            {"max_tokens": 1500},
+            {"max_tokens": 1500},
+        ]
+
+    def test_unknown_gpt_style_token_limit_rejection_is_retried(self):
+        from hopsworks_agent_eval.judge_config import _ChatCompletionParameters
+
+        seen = []
+
+        def call(**extra):
+            seen.append(extra)
+            if "max_tokens" in extra:
+                raise RuntimeError(
+                    "Unsupported parameter: 'max_tokens' is not supported with "
+                    "this model. Use 'max_completion_tokens' instead."
+                )
+            return "graded"
+
+        parameters = _ChatCompletionParameters("custom", "maybe-reasoning", 0.0, 1500)
+        assert parameters.call(call) == "graded"
+        assert seen == [
+            {"max_tokens": 1500, "temperature": 0.0},
+            {"max_completion_tokens": 1500, "temperature": 0.0},
+        ]
+
+    def test_reasoning_effort_values_stay_in_sync_with_the_parser(self):
+        assert set(REASONING_EFFORTS) == {
+            "none",
+            "default",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        }
