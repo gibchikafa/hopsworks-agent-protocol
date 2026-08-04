@@ -1,72 +1,138 @@
-"""Grade a sample of production traffic, on a schedule.
+"""Online evaluation: grade a sample of traffic that already happened.
 
-    python -m hopsworks_agent_eval.sample_job --deployment-id 3 --sample 50
+Offline evaluation — a suite run — answers "does the agent pass the cases we
+wrote down?". This answers "how is it doing on the cases users actually bring?",
+which is the larger and less flattering set. Neither replaces the other: a suite
+cannot contain a question nobody thought of, and production cannot tell you
+whether a fix held, because the case that broke may not come back.
 
-Offline runs tell you how an agent behaves on the cases someone thought to
-write down. This tells you how it behaves on the cases users actually bring,
-which is the larger and less flattering set.
+Two things follow from the traffic having already happened, and both simplify
+the work:
 
-Two things make it different from a suite run, and both simplify it: there is
-no agent to call, because the traffic already happened; and there is no
-expected output, because nobody wrote one. So the evaluators that apply are the
-ones that judge a response on its own terms — a rubric judge, and the
-trajectory checks that need only the trace.
+  - **There is no agent to call.** The transcript and the trajectory are in the
+    trace. So there is no request adapter, no traceparent to generate, and no
+    trace readiness to wait for — the trace is why we are here.
+  - **There is no expected answer**, because nobody wrote one. So the
+    reference-based evaluators do not apply at all: `contains` has nothing to
+    contain, `tool_call` has no required list. What is left is the checks that
+    judge a response on its own terms — a rubric judge, and the trajectory
+    checks that read only the trace.
 
-Results go to the same ``agent_eval_evaluator_results`` feature group as offline
-runs, under a synthetic run id, so one query answers "how is this agent
-scoring" whether the evidence came from a suite or from production.
+That second point is why an online score and a suite pass rate are different
+measurements and must not be averaged. The run row says which it is
+(``runType``), and this module only ever produces ``ONLINE_SAMPLE``.
+
+Driven by a run row like every other run, so it is started, recorded, reported
+and logged through exactly the same path — and so a schedule on the deployment's
+evaluation job can fire it with no new machinery.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
-import os
 import random
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Sequence
 
-from .evaluators import NoToolErrorEvaluator, Trace, run_evaluators
-from .judges import DEFAULT_MODEL, LlmJudgeEvaluator, anthropic_completer
-from .models import Task, Trial, TrialStatus
+from .evaluators import Evaluator, NoToolErrorEvaluator, Trace, verdict
+from .judges import LlmJudgeEvaluator
+from .models import PassPolicy, Task, TraceStatus, Trial, TrialStatus
+from .runner import RunResult
 
 log = logging.getLogger(__name__)
 
-EVALUATOR_RESULTS_FG = "agent_eval_evaluator_results"
+#: How many trace summaries to pull before sampling. The window filter is
+#: applied client-side, so this bounds the read rather than the sample.
+LISTING_LIMIT = 500
+
+#: What the judge grades against when a sample names no rubric of its own. It
+#: deliberately says nothing about the domain: a generic rubric can only catch
+#: generic failures, which is worth having and worth being honest about.
+GENERIC_RUBRIC = (
+    "A good response answers what the user actually asked, is consistent with "
+    "any information it cites, does not invent facts or capabilities, and does "
+    "not claim to have taken an action it did not take."
+)
 
 
-def _as_trace(detail: dict[str, Any]) -> Trace:
-    spans = detail.get("spans") or []
-    attributes = detail.get("spanAttributes") or []
-    kinds, names = {}, {}
-    for attribute in attributes:
-        key, span_id = attribute.get("attrKey"), attribute.get("spanId")
-        if key == "openinference.span.kind":
-            kinds[span_id] = (attribute.get("attrValue") or "").upper()
-        elif key in ("tool.name", "gen_ai.tool.name"):
-            names.setdefault(span_id, attribute.get("attrValue") or "")
-    tools = [s for s in spans if kinds.get(s.get("spanId")) == "TOOL"]
-    return {
-        "trace_id": detail.get("traceId", ""),
-        "root_span_id": next(
-            (s.get("spanId") for s in spans if not s.get("parentSpanId")), ""
-        ),
-        "tool_names": [
-            names.get(s.get("spanId")) or s.get("name") or ""
-            for s in sorted(tools, key=lambda s: s.get("startTimeNs") or 0)
-        ],
-        "tool_error_count": sum(
-            1 for s in tools if str(s.get("statusCode", "")).endswith("ERROR")
-        ),
-    }
+#: The judge's name, and therefore the key its rubric is stored under on each
+#: sampled trace's task — a judge reads its expectation by its own name, the same
+#: way it does in a suite.
+JUDGE_NAME = "online_judge"
 
 
-def _messages_of(detail: dict[str, Any]) -> tuple[str, str]:
-    """The question and the answer, from whichever span carries them."""
-    for span in sorted(
-        detail.get("spans") or [], key=lambda s: s.get("startTimeNs") or 0
-    ):
+def reference_free_evaluators(
+    judge_completer: Any = None,
+    judge_config: Any = None,
+) -> list[Evaluator]:
+    """The checks that can grade a response with no expected answer.
+
+    Deliberately a short list. Every other evaluator reads something the task
+    was supposed to declare — an expected string, a required tool, a schema —
+    and production traffic declares nothing. Handing those an empty expectation
+    does not make them lenient, it makes them wrong: `contains` with nothing to
+    contain passes everything, `tool_call` with no required list has no opinion.
+
+    So:
+
+      - a rubric judge, which is the only thing that can say whether an answer
+        was good without being told what good was;
+      - `no_tool_error`, which reads the trace and needs nothing from the task.
+
+    `tool_retries` is *not* here despite needing no expectation. Its threshold
+    is a judgement about a particular agent — one retry is prudent for a flaky
+    API and a bug for an idempotent lookup — and a default applied across every
+    deployment would report a number nobody chose.
+    """
+    evaluators: list[Evaluator] = []
+    if judge_completer is not None:
+        evaluators.append(
+            LlmJudgeEvaluator(judge_completer, judge_config, name=JUDGE_NAME)
+        )
+    evaluators.append(NoToolErrorEvaluator())
+    return evaluators
+
+
+def within_window(summaries: Sequence[dict[str, Any]], since_hours: float,
+                  now: datetime | None = None) -> list[dict[str, Any]]:
+    """The summaries inside the window, by their creation time."""
+    now = now or datetime.now(tz=timezone.utc)
+    cutoff = now - timedelta(hours=since_hours)
+    recent = []
+    for summary in summaries:
+        created = summary.get("createdAt")
+        if created is None:
+            continue
+        when = datetime.fromtimestamp(created / 1000, tz=timezone.utc)
+        if when >= cutoff:
+            recent.append(summary)
+    return recent
+
+
+def choose(recent: Sequence[dict[str, Any]], size: int,
+           rng: random.Random | None = None) -> list[dict[str, Any]]:
+    """A random sample, not the newest.
+
+    The most recent traces are not a sample of behaviour, they are a sample of
+    whoever happened to be using it in the last hour. Sampling at all is because
+    grading everything costs a model call per request.
+    """
+    rng = rng or random.Random()
+    if size >= len(recent):
+        return list(recent)
+    return rng.sample(list(recent), size)
+
+
+def question_and_answer(detail: dict[str, Any]) -> tuple[str, str]:
+    """The user's question and the agent's final answer, from the trace.
+
+    The messages are on whichever span carried them, so this takes the first
+    span that has any and the last assistant turn within it — the same
+    reconstruction the trace view does, and heuristic for the same reason.
+    """
+    for span in sorted(detail.get("spans") or [],
+                       key=lambda s: s.get("startTimeNs") or 0):
         raw = span.get("messages")
         if not raw:
             continue
@@ -74,135 +140,140 @@ def _messages_of(detail: dict[str, Any]) -> tuple[str, str]:
             messages = json.loads(raw) if isinstance(raw, str) else raw
         except (ValueError, TypeError):
             continue
+        if not isinstance(messages, list):
+            continue
         question = next(
-            (m["content"] for m in messages if m.get("role") == "user"), ""
+            (m.get("content", "") for m in messages if m.get("role") == "user"), ""
         )
         answer = ""
         for message in messages:
             if message.get("role") == "assistant" and message.get("content"):
                 answer = message["content"]
         if question or answer:
-            return question, answer
+            return str(question), str(answer)
     return "", ""
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--deployment-id", type=int, required=True)
-    parser.add_argument("--sample", type=int, default=25,
-                        help="how many traces to grade; sampling exists because "
-                             "grading everything costs a model call per request")
-    parser.add_argument("--since-hours", type=float, default=24.0)
-    parser.add_argument("--rubric", default="",
-                        help="what a good answer looks like for this agent. "
-                             "Without one there is nothing for a judge to grade "
-                             "against, and only the trajectory checks run.")
-    args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO)
+def as_trial(run_id: str, deployment_id: int, trace_id: str, answer: str,
+             trace: Trace | None) -> Trial:
+    """A sampled trace, as a trial, before it has been graded.
 
-    import hopsworks
-    import pandas as pd
-    import requests
+    The status is settled after grading, by the same `verdict` a suite run uses
+    — see `grade_trace`. Leaving it at a fixed PASSED would make the run's pass
+    rate exactly 1.0 every time, which is a confidently wrong number rather than
+    an absent one.
+    """
+    return Trial(
+        trial_id=f"{run_id}/{trace_id}",
+        run_id=run_id,
+        task_id=trace_id,
+        task_version=1,
+        trial_index=0,
+        deployment_id=deployment_id,
+        trace_id=trace_id,
+        trace_status=TraceStatus.RECEIVED if trace else TraceStatus.MISSING,
+        final_output=answer,
+        tool_error_count=(trace or {}).get("tool_error_count"),
+        tool_call_count=len((trace or {}).get("tool_calls") or []) or None,
+        input_tokens=(trace or {}).get("input_tokens"),
+        output_tokens=(trace or {}).get("output_tokens"),
+        completed_at=datetime.now(tz=timezone.utc),
+    )
 
-    project = hopsworks.login()
-    host = os.environ.get("HOPSWORKS_HOST") or os.environ["REST_ENDPOINT"]
-    session = requests.Session()
-    session.headers["Authorization"] = f"ApiKey {os.environ['HOPSWORKS_API_KEY']}"
-    base = (f"{host.rstrip('/')}/hopsworks-api/api/project/{project.id}"
-            f"/otel/servings/{args.deployment_id}")
 
-    summaries = session.get(f"{base}/traces", params={"limit": 500}, timeout=60).json()
-    items = summaries.get("items") or []
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=args.since_hours)
-    recent = [
-        t for t in items
-        if t.get("createdAt")
-        and datetime.fromtimestamp(t["createdAt"] / 1000, tz=timezone.utc) >= cutoff
-    ]
+def grade_trace(evaluators: Sequence[Evaluator], run_id: str, deployment_id: int,
+                trace_id: str, detail: dict[str, Any], trace: Trace | None,
+                rubric: str = "") -> Trial:
+    """One sampled trace, graded."""
+    from .evaluators import run_evaluators
+
+    question, answer = question_and_answer(detail)
+    # The trace id is the task id: production has no task, and this is the only
+    # identifier that leads back to what was actually said.
+    #
+    # The rubric goes in expectations under the judge's name because that is
+    # where a judge looks -- the same mechanism a suite uses, so the judge needs
+    # no special case for having been pointed at production. A judge with
+    # nothing to grade against returns a number anyway, and that number is noise
+    # dressed as a measurement, which is why there is a generic fallback rather
+    # than an empty string.
+    task = Task(
+        task_id=trace_id,
+        input_messages=json.dumps([{"role": "user", "content": question}]),
+        expectations={JUDGE_NAME: rubric or GENERIC_RUBRIC},
+    )
+    trial = as_trial(run_id, deployment_id, trace_id, answer, trace)
+    trial.evaluator_results = list(run_evaluators(evaluators, task, trial, trace))
+
+    # `all`, and not configurable: a sample has no suite to carry a pass policy,
+    # and the checks here are few and unrelated -- a judge saying the answer was
+    # poor is not offset by no tool having errored.
+    #
+    # None means nothing was gradable, which is not failure: a trace with no
+    # judge configured and no tool calls says nothing about the agent either
+    # way, and counting it as a failure would make an unconfigured sample look
+    # like a broken agent.
+    outcome = verdict(trial.evaluator_results, PassPolicy.ALL)
+    trial.status = (
+        TrialStatus.PASSED if outcome else
+        TrialStatus.FAILED if outcome is False else TrialStatus.TRACE_MISSING
+    )
+    return trial
+
+
+def run_sample(client: Any, session: Any, api_base: str, project_id: int,
+               run: dict[str, Any], evaluators: Sequence[Evaluator],
+               rng: random.Random | None = None) -> RunResult:
+    """List, sample, grade.
+
+    `client` is the same `HopsworksAgentClient` a suite run uses, for
+    `fetch_trace` alone — the trace shape an evaluator expects is defined there,
+    and building a second one here is how the two drift.
+    """
+    deployment_id = int(run["deploymentId"])
+    started = datetime.now(tz=timezone.utc)
+    base = (f"{api_base.rstrip('/')}/hopsworks-api/api/project/{project_id}"
+            f"/otel/servings/{deployment_id}")
+
+    listing = session.get(f"{base}/traces", params={"limit": LISTING_LIMIT}, timeout=60)
+    listing.raise_for_status()
+    summaries = listing.json().get("items") or []
+    recent = within_window(summaries, float(run.get("sampleSinceHours") or 24.0))
     if not recent:
-        log.info("no traces in the last %.1f hours", args.since_hours)
-        return
+        log.info("no traces in the last %s hours", run.get("sampleSinceHours"))
+        return RunResult(run_id=run["runId"], suite_id="", deployment_id=deployment_id,
+                         started_at=started, completed_at=datetime.now(tz=timezone.utc))
 
-    # Random rather than newest-first: the most recent traces are not a sample
-    # of behaviour, they are a sample of whoever was using it in the last hour.
-    sampled = random.sample(recent, min(args.sample, len(recent)))
-    log.info("grading %d of %d recent traces", len(sampled), len(recent))
+    sampled = choose(recent, int(run.get("nTrials") or 25), rng)
+    log.info("grading %d of %d traces in the window", len(sampled), len(recent))
 
-    judge = None
-    if args.rubric:
-        try:
-            key = project.get_secrets_api().get_secret("EVAL_JUDGE_API_KEY").value
-            judge = LlmJudgeEvaluator(
-                anthropic_completer(key, os.environ.get("EVAL_JUDGE_MODEL", DEFAULT_MODEL)),
-                model=os.environ.get("EVAL_JUDGE_MODEL", DEFAULT_MODEL),
-            )
-        except Exception:  # noqa: BLE001 — no judge configured is a normal state
-            log.info("no EVAL_JUDGE_API_KEY secret; only trajectory checks will run")
-
-    run_id = f"online/{args.deployment_id}/{datetime.now(tz=timezone.utc):%Y%m%dT%H%M%S}"
-    now = datetime.now(tz=timezone.utc)
-    rows: list[dict[str, Any]] = []
-
+    trials = []
     for summary in sampled:
-        trace_id = summary["traceId"]
+        trace_id = summary.get("traceId")
+        if not trace_id:
+            continue
         try:
             detail = session.get(f"{base}/traces/{trace_id}", timeout=60).json()
+            trace = client.fetch_trace(trace_id)
         except Exception:  # noqa: BLE001 — one unreadable trace is not the run failing
             log.exception("could not read trace %s", trace_id)
             continue
-
-        question, answer = _messages_of(detail)
-        task = Task(
-            task_id=trace_id,
-            input_messages=json.dumps([{"role": "user", "content": question}]),
-            rubric=args.rubric,
-        )
-        trial = Trial(
-            trial_id=f"{run_id}/{trace_id}",
-            run_id=run_id,
-            task_id=trace_id,
-            task_version=1,
-            trial_index=0,
-            deployment_id=args.deployment_id,
-            trace_id=trace_id,
-            final_output=answer,
-            status=TrialStatus.PASSED,
+        trials.append(
+            grade_trace(evaluators, run["runId"], deployment_id, trace_id, detail,
+                        trace, run.get("sampleRubric") or "")
         )
 
-        evaluators = [NoToolErrorEvaluator()]
-        if judge is not None:
-            evaluators.insert(0, judge)
-
-        for result in run_evaluators(evaluators, task, trial, _as_trace(detail)):
-            rows.append({
-                "run_id": run_id,
-                "result_id": f"{trial.trial_id}/{result.evaluator_name}",
-                "trial_id": trial.trial_id,
-                "task_id": trace_id,
-                "evaluator_name": result.evaluator_name,
-                "evaluator_type": result.evaluator_type,
-                "score": result.score,
-                "passed": result.passed,
-                "ungradable": result.ungradable,
-                "reason": result.reason,
-                "assertions_json": json.dumps(result.assertions),
-                "judge_model": str(result.assertions.get("judge_model", "")),
-                "evaluator_version": "1",
-                "created_at": now,
-            })
-
-    if not rows:
-        log.info("nothing gradable in the sample")
-        return
-
-    project.get_feature_store().get_feature_group(EVALUATOR_RESULTS_FG, 1).insert(
-        pd.DataFrame(rows), write_options={"mode": "append"}
+    return RunResult(
+        run_id=run["runId"],
+        # No suite, and the empty string is the record of that rather than a
+        # missing value: this run executed no suite because there was none.
+        suite_id="",
+        deployment_id=deployment_id,
+        trials=trials,
+        # A sample that graded nothing is not a failed run: an agent with no
+        # traffic in the window is a normal state, and reporting it as FAILED
+        # would page someone about a quiet night.
+        status="SUCCEEDED",
+        started_at=started,
+        completed_at=datetime.now(tz=timezone.utc),
     )
-    graded = len({r["trial_id"] for r in rows})
-    ungradable = sum(1 for r in rows if r["ungradable"])
-    log.info("wrote %d results for %d traces (%d ungradable) under run %s",
-             len(rows), graded, ungradable, run_id)
-
-
-if __name__ == "__main__":
-    main()

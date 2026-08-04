@@ -36,6 +36,7 @@ from .judges import DEFAULT_MODEL, LlmJudgeEvaluator, anthropic_completer
 from .metrics import run_metrics
 from .models import ExecutionMode, PassPolicy, Suite, Task
 from .runner import RunnerConfig, SuiteRefused, run_suite
+from .sample_job import reference_free_evaluators, run_sample
 
 log = logging.getLogger(__name__)
 
@@ -193,10 +194,14 @@ def _write_results(feature_store: Any, result: Any, run: dict[str, Any],
         for g in t.evaluator_results
     ]
     metric_rows = [
-        {**m, "suite_version": run.get("suiteVersion", 1), "created_at": now}
+        # A sample has no suite, so its metric rows carry an empty suite id and
+        # version 0. Empty rather than absent: the row records that this run
+        # executed no suite, which is what tells a query reading both kinds
+        # apart when it has only the metrics in hand.
+        {**m, "suite_version": run.get("suiteVersion") or 0, "created_at": now}
         for m in run_metrics(
             result.run_id,
-            run["suiteId"],
+            run.get("suiteId") or "",
             run["deploymentId"],
             result.trials,
             blocks_are_success=bool(run.get("blocksAreSuccess")),
@@ -299,12 +304,6 @@ def main() -> None:
 
     try:
         run = session.get(f"{base}/runs/{args.run_id}", timeout=60).json()
-        tasks = session.get(
-            f"{base}/suites/{run['suiteId']}/tasks",
-            params={"version": run.get("suiteVersion")},
-            timeout=60,
-        ).json()
-        suite = _to_suite(run, tasks)
 
         from .client import HopsworksAgentClient
 
@@ -321,6 +320,30 @@ def main() -> None:
             project_name=project.name,
             deployment_id=run["deploymentId"],
         )
+
+        # Which question this run answers. Read off the row rather than taken as
+        # an argument, so a scheduled execution and a hand-started one cannot
+        # differ, and so the deployment's one evaluation job serves both --
+        # which is what keeps its resources, environment and alerts in one place.
+        if run.get("runType") == "ONLINE_SAMPLE":
+            result = run_sample(
+                client, session, host, project.id, run,
+                reference_free_evaluators(
+                    completer, judge.config if judge is not None else None
+                ),
+            )
+            _write_results(project.get_feature_store(), result, run)
+            report(result.status)
+            log.info("online sample %s finished: %d traces graded",
+                     args.run_id, len(result.trials))
+            return
+
+        tasks = session.get(
+            f"{base}/suites/{run['suiteId']}/tasks",
+            params={"version": run.get("suiteVersion")},
+            timeout=60,
+        ).json()
+        suite = _to_suite(run, tasks)
 
         result = run_suite(
             client,

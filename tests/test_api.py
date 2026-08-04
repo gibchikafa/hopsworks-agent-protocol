@@ -129,6 +129,27 @@ class TestWhatItSends:
         # server has nothing to name the job after and nothing to attach the sizing to.
         assert params["deploymentId"] == 7
 
+    def test_production_can_be_sampled_without_a_suite(self):
+        # online evaluation: the traffic already happened, so there is no suite
+        # to name and no expected answer to compare against
+        client = api([FakeResponse(body={"runId": "r1", "runType": "ONLINE_SAMPLE"})])
+        client.sample_production(deployment_id=3, sample=50, since_hours=12.0,
+                                 rubric="be helpful")
+        [(method, url, body, params)] = client._session.sent
+        assert (method, url.endswith("/sample-runs")) == ("POST", True)
+        assert body is None
+        assert params["deploymentId"] == 3
+        assert params["sample"] == 50
+        assert params["sinceHours"] == 12.0
+        assert params["rubric"] == "be helpful"
+
+    def test_a_sample_with_no_rubric_sends_none(self):
+        # the server falls back to a generic rubric; sending an empty string
+        # would store one that reads as a rubric someone chose
+        client = api([FakeResponse(body={"runId": "r1"})])
+        client.sample_production(deployment_id=3)
+        assert "rubric" not in client._session.sent[0][3]
+
     def test_the_runner_job_belongs_to_a_deployment(self):
         # the sizing, environment and alerts on it are that agent's, which is the whole
         # reason the job is not shared -- so there is no project-wide call to make

@@ -376,6 +376,34 @@ class EvalApi:
             "start": "true",
         })
 
+    def sample_production(self, *, deployment_id: int, sample: int = 25,
+                          since_hours: float = 24.0, rubric: str = "",
+                          start: bool = True) -> dict[str, Any]:
+        """Grade a sample of this deployment's production traffic.
+
+        Online evaluation, as against a suite run's offline evaluation. The
+        traffic already happened, so there is no agent to call and no expected
+        answer — only the checks that judge a response on its own terms, which
+        is the rubric judge and the trajectory checks.
+
+        `rubric` is what the judge grades against; without one it falls back to
+        a generic one that can only catch generic failures. The score this
+        produces is **not** comparable with a suite's pass rate: one says how
+        the agent does on cases someone wrote down, the other how it does on the
+        cases users bring.
+
+        It runs in the deployment's own evaluation job, the same one a suite run
+        uses, so a schedule set on that job under Jobs is how this becomes
+        continuous rather than occasional.
+        """
+        return self._call("POST", "/sample-runs", params={
+            "deploymentId": deployment_id,
+            "sample": sample,
+            "sinceHours": since_hours,
+            **({"rubric": rubric} if rubric else {}),
+            "start": "true" if start else "false",
+        })
+
     def run(self, run_id: str) -> dict[str, Any]:
         return self._call("GET", f"/runs/{run_id}")
 
