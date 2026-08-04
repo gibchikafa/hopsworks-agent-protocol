@@ -120,10 +120,21 @@ class TestWhatItSends:
 
     def test_the_runner_job_can_be_sized_before_it_exists(self):
         client = api()
-        client.ensure_runner_job(environment_name="mine", cores=2, memory=4096)
-        method, url, body, _ = client._session.sent[0]
+        client.ensure_runner_job(deployment_id=7, environment_name="mine", cores=2,
+                                 memory=4096)
+        method, url, body, params = client._session.sent[0]
         assert (method, url.endswith("/runner-job")) == ("POST", True)
         assert (body["environmentName"], body["cores"]) == ("mine", 2)
+        # One job per deployment, so which deployment is not optional: without it the
+        # server has nothing to name the job after and nothing to attach the sizing to.
+        assert params["deploymentId"] == 7
+
+    def test_the_runner_job_belongs_to_a_deployment(self):
+        # the sizing, environment and alerts on it are that agent's, which is the whole
+        # reason the job is not shared -- so there is no project-wide call to make
+        client = api()
+        with pytest.raises(TypeError):
+            client.ensure_runner_job(environment_name="mine")
 
 
 class TestWhenTheApiRefuses:

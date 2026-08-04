@@ -332,23 +332,30 @@ class EvalApi:
 
     # ── running ─────────────────────────────────────────────────────────────
 
-    def ensure_runner_job(self, *, environment_name: str | None = None,
+    def ensure_runner_job(self, *, deployment_id: int,
+                          environment_name: str | None = None,
                           cores: int | None = None, memory: int | None = None,
                           gpus: int | None = None) -> dict[str, Any]:
-        """Create the job that executes runs, if this project has none.
+        """Create this deployment's evaluation job, if it has none.
 
-        One job serves the whole project, and `start_run` creates it the first
-        time any run is started, so this is optional. Calling it first is how you
-        size the job or point it at your own environment before that happens —
-        afterwards it is an ordinary job, and an existing one is returned
-        untouched so this cannot undo resources or alerts set on it since.
+        One job per deployment, named after it, and `start_run` creates it the
+        first time a run against that deployment is started — so this is
+        optional. Calling it first is how you size the job or point it at your
+        own environment before that happens; afterwards it is an ordinary job,
+        and an existing one is returned untouched so this cannot undo resources
+        or alerts set on it since.
+
+        Per deployment rather than per project because those settings are what
+        differ: a suite of six questions against a small agent and a thousand
+        trials against a large one want different sizing, and an alert on a
+        failed evaluation is only actionable if it names which agent failed.
         """
         return self._call("POST", "/runner-job", {
             "environmentName": environment_name,
             "cores": cores,
             "memory": memory,
             "gpus": gpus,
-        })
+        }, params={"deploymentId": deployment_id})
 
     def start_run(self, suite: dict[str, Any], *, deployment_id: int,
                   n_trials: int = 1) -> dict[str, Any]:
