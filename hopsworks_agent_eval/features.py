@@ -126,7 +126,43 @@ def _as_int(value: Any) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
-        return 0
+        try:
+            return round(float(value))
+        except (TypeError, ValueError):
+            return 0
+
+
+def _span_kind(attrs: dict[str, str]) -> str:
+    kind = attrs.get(conventions.SPAN_KIND, "").upper()
+    if kind:
+        return kind
+    operation = attrs.get(conventions.GEN_AI_OPERATION_NAME, "").lower()
+    return {
+        conventions.OPERATION_CHAT: conventions.SPAN_KIND_LLM,
+        conventions.OPERATION_EXECUTE_TOOL: conventions.SPAN_KIND_TOOL,
+        conventions.OPERATION_INVOKE_AGENT: conventions.SPAN_KIND_AGENT,
+    }.get(operation, "")
+
+
+def _parse_token_count(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return round(float(value))
+        except (TypeError, ValueError):
+            return None
+
+
+def _token_count(attrs: dict[str, str], keys: Sequence[str]) -> int:
+    for key in keys:
+        value = attrs.get(key)
+        if value is None or value == "":
+            continue
+        parsed = _parse_token_count(value)
+        if parsed is not None:
+            return parsed
+    return 0
 
 
 def _messages(span: Span) -> list[dict[str, str]]:
@@ -175,13 +211,30 @@ def trace_features(
         return ""
 
     kinds = {
-        span.get("span_id"): attrs_by_span.get(span.get("span_id"), {})
-        .get(conventions.SPAN_KIND, "")
-        .upper()
+        span.get("span_id"): _span_kind(attrs_by_span.get(span.get("span_id"), {}))
         for span in ordered
     }
-    tool_spans = [s for s in ordered if kinds.get(s.get("span_id")) == conventions.SPAN_KIND_TOOL]
-    llm_spans = [s for s in ordered if kinds.get(s.get("span_id")) == conventions.SPAN_KIND_LLM]
+    tool_spans = [
+        s for s in ordered
+        if kinds.get(s.get("span_id")) == conventions.SPAN_KIND_TOOL
+    ]
+    token_spans = [
+        s for s in ordered
+        if kinds.get(s.get("span_id")) == conventions.SPAN_KIND_LLM
+        or (
+            kinds.get(s.get("span_id")) == conventions.SPAN_KIND_AGENT
+            and (
+                _token_count(
+                    attrs_by_span.get(s.get("span_id"), {}),
+                    conventions.INPUT_TOKEN_KEYS,
+                )
+                or _token_count(
+                    attrs_by_span.get(s.get("span_id"), {}),
+                    conventions.OUTPUT_TOKEN_KEYS,
+                )
+            )
+        )
+    ]
 
     tool_names = []
     for span in tool_spans:
@@ -197,34 +250,12 @@ def trace_features(
             tool_names.append(name)
 
     input_tokens = sum(
-        _as_int(
-            _first(
-                [
-                    attrs_by_span.get(s.get("span_id"), {}).get(
-                        conventions.GEN_AI_USAGE_INPUT_TOKENS
-                    ),
-                    attrs_by_span.get(s.get("span_id"), {}).get(
-                        conventions.LLM_TOKEN_COUNT_PROMPT
-                    ),
-                ]
-            )
-        )
-        for s in llm_spans
+        _token_count(attrs_by_span.get(s.get("span_id"), {}), conventions.INPUT_TOKEN_KEYS)
+        for s in token_spans
     )
     output_tokens = sum(
-        _as_int(
-            _first(
-                [
-                    attrs_by_span.get(s.get("span_id"), {}).get(
-                        conventions.GEN_AI_USAGE_OUTPUT_TOKENS
-                    ),
-                    attrs_by_span.get(s.get("span_id"), {}).get(
-                        conventions.LLM_TOKEN_COUNT_COMPLETION
-                    ),
-                ]
-            )
-        )
-        for s in llm_spans
+        _token_count(attrs_by_span.get(s.get("span_id"), {}), conventions.OUTPUT_TOKEN_KEYS)
+        for s in token_spans
     )
 
     guardrail_events = [

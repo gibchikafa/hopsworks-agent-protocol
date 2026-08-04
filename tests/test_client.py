@@ -151,6 +151,36 @@ class TestTrace:
         session = FakeSession({"/traces/": self._trace(spans, attrs)})
         assert client(session).fetch_trace("t")["tool_error_count"] == 1
 
+    def test_counts_tokens_from_model_and_token_bearing_agent_spans(self):
+        spans = [
+            {"spanId": "root", "parentSpanId": "", "startTimeNs": 0},
+            {"spanId": "chat", "parentSpanId": "root", "startTimeNs": 1},
+            {"spanId": "agent", "parentSpanId": "root", "startTimeNs": 2},
+            {"spanId": "tool", "parentSpanId": "root", "startTimeNs": 3},
+        ]
+        attrs = [
+            {"spanId": "chat", "attrKey": "gen_ai.operation.name",
+             "attrValue": "chat"},
+            {"spanId": "chat", "attrKey": "gen_ai.usage.input_tokens",
+             "attrValue": "10"},
+            {"spanId": "chat", "attrKey": "gen_ai.usage.output_tokens",
+             "attrValue": "5"},
+            {"spanId": "agent", "attrKey": "openinference.span.kind",
+             "attrValue": "AGENT"},
+            {"spanId": "agent", "attrKey": "gen_ai.usage.prompt_tokens",
+             "attrValue": "7"},
+            {"spanId": "agent", "attrKey": "gen_ai.usage.completion_tokens",
+             "attrValue": "3"},
+            {"spanId": "tool", "attrKey": "openinference.span.kind",
+             "attrValue": "TOOL"},
+            {"spanId": "tool", "attrKey": "gen_ai.usage.input_tokens",
+             "attrValue": "999"},
+        ]
+
+        trace = client(FakeSession({"/traces/": self._trace(spans, attrs)})).fetch_trace("t")
+        assert trace["input_tokens"] == 17
+        assert trace["output_tokens"] == 8
+
     def test_an_empty_trace_is_none(self):
         session = FakeSession({"/traces/": FakeResponse({"spans": []})})
         assert client(session).fetch_trace("t") is None

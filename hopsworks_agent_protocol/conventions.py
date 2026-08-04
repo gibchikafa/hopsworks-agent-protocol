@@ -32,6 +32,8 @@ EVAL_MODE_ENV = "EVAL_MODE"
 # ── span naming ───────────────────────────────────────────────────────────
 
 OPERATION_INVOKE_AGENT = "invoke_agent"
+OPERATION_EXECUTE_TOOL = "execute_tool"
+OPERATION_CHAT = "chat"
 
 # ── agent identity (OTel GenAI) ───────────────────────────────────────────
 
@@ -41,6 +43,8 @@ GEN_AI_AGENT_VERSION = "gen_ai.agent.version"
 GEN_AI_CONVERSATION_ID = "gen_ai.conversation.id"
 GEN_AI_USAGE_INPUT_TOKENS = "gen_ai.usage.input_tokens"
 GEN_AI_USAGE_OUTPUT_TOKENS = "gen_ai.usage.output_tokens"
+GEN_AI_USAGE_PROMPT_TOKENS = "gen_ai.usage.prompt_tokens"
+GEN_AI_USAGE_COMPLETION_TOKENS = "gen_ai.usage.completion_tokens"
 
 # ── OpenInference ─────────────────────────────────────────────────────────
 
@@ -90,6 +94,20 @@ GEN_AI_PROVIDER_NAME = "gen_ai.provider.name"
 LLM_MODEL_NAME = "llm.model_name"
 LLM_TOKEN_COUNT_PROMPT = "llm.token_count.prompt"
 LLM_TOKEN_COUNT_COMPLETION = "llm.token_count.completion"
+LLM_TOKEN_COUNT_INPUT = "llm.token_count.input"
+LLM_TOKEN_COUNT_OUTPUT = "llm.token_count.output"
+INPUT_TOKEN_KEYS = (
+    GEN_AI_USAGE_INPUT_TOKENS,
+    GEN_AI_USAGE_PROMPT_TOKENS,
+    LLM_TOKEN_COUNT_PROMPT,
+    LLM_TOKEN_COUNT_INPUT,
+)
+OUTPUT_TOKEN_KEYS = (
+    GEN_AI_USAGE_OUTPUT_TOKENS,
+    GEN_AI_USAGE_COMPLETION_TOKENS,
+    LLM_TOKEN_COUNT_COMPLETION,
+    LLM_TOKEN_COUNT_OUTPUT,
+)
 
 # ── Hopsworks correlation ─────────────────────────────────────────────────
 

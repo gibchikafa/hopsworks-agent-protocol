@@ -156,10 +156,12 @@ class TestTraceFeatures:
         assert row["tool_error_count"] == 1
         assert json.loads(row["tool_names"]) == ["search", "refund"]
 
-    def test_sums_tokens_across_llm_spans_only(self):
+    def test_sums_tokens_across_model_and_token_bearing_agent_spans(self):
         spans = [span("root"), span("llm1", parent="root", start_ns=1),
                  span("llm2", parent="root", start_ns=2),
-                 span("tool", parent="root", start_ns=3)]
+                 span("agent", parent="root", start_ns=3),
+                 span("chat", parent="root", start_ns=4),
+                 span("tool", parent="root", start_ns=5)]
         attrs = [
             attr("llm1", "openinference.span.kind", "LLM"),
             attr("llm1", "gen_ai.usage.input_tokens", "10"),
@@ -167,12 +169,18 @@ class TestTraceFeatures:
             attr("llm2", "openinference.span.kind", "LLM"),
             attr("llm2", "llm.token_count.prompt", "7"),
             attr("llm2", "llm.token_count.completion", "3"),
+            attr("agent", "openinference.span.kind", "AGENT"),
+            attr("agent", "gen_ai.usage.prompt_tokens", "6"),
+            attr("agent", "gen_ai.usage.completion_tokens", "2"),
+            attr("chat", "gen_ai.operation.name", "chat"),
+            attr("chat", "llm.token_count.prompt", "5"),
+            attr("chat", "llm.token_count.completion", "1"),
             attr("tool", "openinference.span.kind", "TOOL"),
             attr("tool", "gen_ai.usage.input_tokens", "999"),
         ]
         row = trace_features(spans, attrs)
-        assert row["input_tokens"] == 17
-        assert row["output_tokens"] == 8
+        assert row["input_tokens"] == 28
+        assert row["output_tokens"] == 11
 
     def test_eval_traffic_is_marked(self):
         # the separation every downstream query depends on
