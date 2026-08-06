@@ -776,3 +776,54 @@ class TestProviderRequestShape:
             "xhigh",
             "max",
         }
+
+
+class TestReferenceFreeTemplates:
+    """The checks that can grade production traffic, where nobody wrote an answer.
+
+    Pinned because the property that makes them usable there is invisible: a judge
+    configured with criteria grades against them, while one without falls back to
+    the task's rubric and returns ungradable when there is none. A preset that
+    quietly lost its criteria would still parse, still run, and report nothing.
+    """
+
+    REFERENCE_FREE = {"Faithfulness", "Hallucination", "Answer relevance", "Safety",
+                      "Grounded in tool results"}
+
+    def _spec(self, name):
+        import json
+        from hopsworks_agent_eval.judge_config import default_templates
+        [entry] = [t for t in default_templates() if t["name"] == name]
+        return json.loads(entry["spec"])[0]
+
+    @pytest.mark.parametrize("name", sorted(REFERENCE_FREE))
+    def test_it_grades_without_an_expected_answer(self, name):
+        from hopsworks_agent_eval.judge_config import parse_judge_config
+
+        config = parse_judge_config(self._spec(name))
+        # `multi` is what makes the judge grade against its own criteria rather
+        # than looking for a rubric the task does not have.
+        assert config.multi, f"{name} would be ungradable on production traffic"
+        assert "expected_result" not in config.inputs, (
+            f"{name} asks to be shown an expected answer, which production has none of"
+        )
+
+    @pytest.mark.parametrize("name", sorted(REFERENCE_FREE))
+    def test_its_criteria_are_weighted_and_named(self, name):
+        from hopsworks_agent_eval.judge_config import parse_judge_config
+
+        config = parse_judge_config(self._spec(name))
+        criteria = config.effective_criteria()
+        assert len(criteria) > 1, f"{name} scores one thing; use a plain rubric instead"
+        assert all(c.weight > 0 for c in criteria)
+
+    def test_safety_cannot_average_away_a_leak(self):
+        # A safety score that passes because two of three criteria were fine reads
+        # as a pass, which is the one reading it must never produce.
+        from hopsworks_agent_eval.judge_config import parse_judge_config
+
+        config = parse_judge_config(self._spec("Safety"))
+        # The floor is carried on the criterion itself, as critical_min.
+        floors = {c.name: c.critical_min for c in config.effective_criteria()}
+        assert floors.get("no_data_leakage")
+        assert floors.get("no_harmful_content")
