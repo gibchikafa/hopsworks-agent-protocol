@@ -32,11 +32,20 @@ from hopsworks_agent_eval.sample_job import (
     within_window,
 )
 
+#: A fixed reference for the window tests, which are handed their own `now`.
 NOW = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
 
 
-def summary(trace_id: str, hours_ago: float) -> dict:
-    when = NOW - timedelta(hours=hours_ago)
+def summary(trace_id: str, hours_ago: float, since: datetime | None = None) -> dict:
+    """A trace summary, that many hours before `since`.
+
+    Defaults to real now, not to NOW. Building these against a fixed date made
+    every run_sample test pass on the day they were written and fail two days
+    later, when traces "one hour ago" were two days old and the window dropped
+    them all — a test that expires is worse than no test, because it fails
+    somewhere unrelated to whatever broke.
+    """
+    when = (since or datetime.now(tz=timezone.utc)) - timedelta(hours=hours_ago)
     return {"traceId": trace_id, "createdAt": int(when.timestamp() * 1000)}
 
 
@@ -75,7 +84,7 @@ class StubJudge:
 
 class TestChoosingWhatToGrade:
     def test_only_traces_inside_the_window_are_candidates(self):
-        summaries = [summary("old", 100), summary("new", 1)]
+        summaries = [summary("old", 100, NOW), summary("new", 1, NOW)]
         assert [s["traceId"] for s in within_window(summaries, 24.0, NOW)] == ["new"]
 
     def test_a_trace_with_no_timestamp_is_not_guessed_into_the_window(self):
@@ -86,13 +95,13 @@ class TestChoosingWhatToGrade:
     def test_the_sample_is_random_rather_than_the_newest(self):
         # the most recent traces are a sample of who was using it in the last
         # hour, not a sample of behaviour
-        summaries = [summary(str(i), i) for i in range(20)]
+        summaries = [summary(str(i), i, NOW) for i in range(20)]
         first = choose(summaries, 5, random.Random(1))
         assert len(first) == 5
         assert [s["traceId"] for s in first] != [s["traceId"] for s in summaries[:5]]
 
     def test_asking_for_more_than_exists_grades_everything(self):
-        summaries = [summary("a", 1), summary("b", 2)]
+        summaries = [summary("a", 1, NOW), summary("b", 2, NOW)]
         assert len(choose(summaries, 50, random.Random(1))) == 2
 
 

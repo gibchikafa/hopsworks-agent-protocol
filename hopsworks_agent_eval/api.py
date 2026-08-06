@@ -244,12 +244,31 @@ class EvalApi:
                      description: str = "", tags: list[str] | None = None,
                      execution_mode: str = "read_only", pass_policy: str = "all",
                      pass_threshold: float = 0.7,
-                     blocks_are_success: bool = False) -> dict[str, Any]:
+                     blocks_are_success: bool = False,
+                     run_on_update: bool = False,
+                     gate_metric: str = "", gate_threshold: float | None = None
+                     ) -> dict[str, Any]:
         """A suite and the checks every task in it is graded by.
 
         The checks come with it rather than after: a suite with none grades by
         nothing, and every trial in it comes back ungradable while looking like
         it ran.
+
+        `tags` are descriptive and nothing reads them. What a suite *does* is
+        the three arguments after them, named for what they do:
+
+        - `blocks_are_success` — a suite of attacks, where a guardrail block is
+          the desired outcome rather than a failure. Forces sandboxed execution.
+        - `run_on_update` — fire it automatically whenever the deployment it is
+          run against is updated.
+        - `gate_metric` / `gate_threshold` — which run metric gates a release
+          and the bar it must clear. Without them a suite gates nothing, whatever
+          it is tagged.
+
+        That last one is worth saying plainly, because tagging a suite `golden`
+        looks like it should be enough and is not: the tag replaced a category
+        that used to imply a gate, and the gate is now stated rather than
+        inferred from a name.
         """
         return self._call("POST", "/suites", {
             "name": name,
@@ -257,6 +276,9 @@ class EvalApi:
             "tags": json.dumps(tags or []),
             "executionMode": execution_mode,
             "blocksAreSuccess": blocks_are_success,
+            "runOnUpdate": run_on_update,
+            **({"gateMetric": gate_metric} if gate_metric else {}),
+            **({} if gate_threshold is None else {"gateThreshold": gate_threshold}),
             "passPolicy": pass_policy,
             "passThreshold": pass_threshold,
             "evaluators": evaluators,

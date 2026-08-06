@@ -129,6 +129,27 @@ class TestWhatItSends:
         # server has nothing to name the job after and nothing to attach the sizing to.
         assert params["deploymentId"] == 7
 
+    def test_a_suite_can_state_the_gate_it_is(self):
+        # tagging a suite `golden` looks like it should be enough and is not:
+        # the tag replaced a category that used to imply a gate, so the gate has
+        # to be stated or the suite blocks nothing while looking like it does
+        client = api([FakeResponse(body={"suiteId": "s1", "version": 1})])
+        client.create_suite("Orders are recorded", evaluators=[],
+                            tags=["golden"], gate_metric="pass_rate",
+                            gate_threshold=1.0)
+        body = client._session.sent[0][2]
+        assert body["gateMetric"] == "pass_rate"
+        assert body["gateThreshold"] == 1.0
+
+    def test_a_suite_that_gates_nothing_sends_no_gate(self):
+        # absent rather than an empty string, so nothing downstream has to
+        # decide whether "" means "no gate" or "a metric called nothing"
+        client = api([FakeResponse(body={"suiteId": "s1", "version": 1})])
+        client.create_suite("Catalogue answers", evaluators=[])
+        body = client._session.sent[0][2]
+        assert "gateMetric" not in body
+        assert "gateThreshold" not in body
+
     def test_production_can_be_sampled_without_a_suite(self):
         # online evaluation: the traffic already happened, so there is no suite
         # to name and no expected answer to compare against
