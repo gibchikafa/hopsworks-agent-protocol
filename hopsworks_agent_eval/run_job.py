@@ -36,7 +36,7 @@ from .judges import DEFAULT_MODEL, LlmJudgeEvaluator, anthropic_completer
 from .metrics import run_metrics
 from .models import ExecutionMode, PassPolicy, Suite, Task
 from .runner import RunnerConfig, SuiteRefused, run_suite
-from .sample_job import reference_free_evaluators, run_sample
+from .sample_job import evaluators_for, run_sample
 
 log = logging.getLogger(__name__)
 
@@ -328,9 +328,7 @@ def main() -> None:
         if run.get("runType") == "ONLINE_SAMPLE":
             result = run_sample(
                 client, session, host, project.id, run,
-                reference_free_evaluators(
-                    completer, judge.config if judge is not None else None
-                ),
+                evaluators_for(run, judge_completer=completer),
             )
             _write_results(project.get_feature_store(), result, run)
             report(result.status)

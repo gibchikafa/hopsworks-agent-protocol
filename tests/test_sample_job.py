@@ -21,16 +21,31 @@ from datetime import datetime, timedelta, timezone
 from hopsworks_agent_eval.evaluators import EvaluatorResult
 from hopsworks_agent_eval.models import TraceStatus, TrialStatus
 from hopsworks_agent_eval.sample_job import (
-    GENERIC_RUBRIC,
-    JUDGE_NAME,
     as_trial,
     choose,
+    evaluators_for,
     grade_trace,
     question_and_answer,
-    reference_free_evaluators,
     run_sample,
     within_window,
 )
+
+#: A judge that grades against its own criteria, which is what makes a check
+#: usable on production traffic — the server refuses one that cannot.
+JUDGE_SPEC = json.dumps([{
+    "type": "llm_judge",
+    "name": "faithfulness",
+    "criteria": {"supported": {"weight": 1}},
+}])
+TRACE_ONLY_SPEC = json.dumps([{"type": "no_tool_error", "name": "no_tool_errored"}])
+
+
+def with_judge(judge):
+    return evaluators_for({"sampleEvaluators": JUDGE_SPEC}, judge_completer=judge)
+
+
+def trace_only():
+    return evaluators_for({"sampleEvaluators": TRACE_ONLY_SPEC})
 
 #: A fixed reference for the window tests, which are handed their own `now`.
 NOW = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
@@ -39,14 +54,17 @@ NOW = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
 def summary(trace_id: str, hours_ago: float, since: datetime | None = None) -> dict:
     """A trace summary, that many hours before `since`.
 
-    Defaults to real now, not to NOW. Building these against a fixed date made
+    Defaults to real now rather than a fixed date: building these against one made
     every run_sample test pass on the day they were written and fail two days
-    later, when traces "one hour ago" were two days old and the window dropped
-    them all — a test that expires is worse than no test, because it fails
-    somewhere unrelated to whatever broke.
+    later. A test that expires is worse than no test, because it fails somewhere
+    unrelated to whatever broke.
     """
     when = (since or datetime.now(tz=timezone.utc)) - timedelta(hours=hours_ago)
     return {"traceId": trace_id, "createdAt": int(when.timestamp() * 1000)}
+
+
+def ms(hours_ago: float) -> float:
+    return (datetime.now(tz=timezone.utc) - timedelta(hours=hours_ago)).timestamp() * 1000
 
 
 def detail(question: str = "who sings this?", answer: str = "UB40") -> dict:
@@ -85,12 +103,24 @@ class StubJudge:
 class TestChoosingWhatToGrade:
     def test_only_traces_inside_the_window_are_candidates(self):
         summaries = [summary("old", 100, NOW), summary("new", 1, NOW)]
-        assert [s["traceId"] for s in within_window(summaries, 24.0, NOW)] == ["new"]
+        window = within_window(summaries, ms(24) - 0, ms(0))
+        assert [s["traceId"] for s in within_window(
+            summaries, (NOW - timedelta(hours=24)).timestamp() * 1000,
+            NOW.timestamp() * 1000)] == ["new"]
+        assert window is not None
+
+    def test_the_window_is_half_open_so_runs_do_not_overlap(self):
+        # a trace graded by the run that ended at T must not be graded again by
+        # the run that starts at T: monitoring counts each conversation once
+        boundary = NOW.timestamp() * 1000
+        at_boundary = {"traceId": "edge", "createdAt": int(boundary)}
+        assert within_window([at_boundary], boundary, boundary + 1000) == []
+        assert within_window([at_boundary], boundary - 1000, boundary) == [at_boundary]
 
     def test_a_trace_with_no_timestamp_is_not_guessed_into_the_window(self):
         # its age is unknown, and treating unknown as recent would quietly widen
         # whatever window someone asked for
-        assert within_window([{"traceId": "t"}], 24.0, NOW) == []
+        assert within_window([{"traceId": "t"}], ms(24), ms(0)) == []
 
     def test_the_sample_is_random_rather_than_the_newest(self):
         # the most recent traces are a sample of who was using it in the last
@@ -131,56 +161,47 @@ class TestReadingTheTranscript:
 
 
 class TestWhatCanGradeProductionTraffic:
-    def test_without_a_judge_only_the_trace_checks_run(self):
-        # nothing here can say whether an answer was good without a model, and
-        # inventing a verdict would be worse than reporting fewer checks
-        [only] = reference_free_evaluators()
+    def test_the_checks_come_from_the_run_rather_than_being_hardcoded(self):
+        # the same evaluators_from_spec a suite run uses: a check does not need to
+        # know whether the conversation it reads was authored or served
+        kinds = [e.type for e in with_judge(StubJudge())]
+        assert kinds == ["llm_judge"]
+
+    def test_a_trace_only_check_needs_no_judge_at_all(self):
+        [only] = trace_only()
         assert only.type == "no_tool_error"
 
-    def test_a_judge_is_included_when_one_is_configured(self):
-        kinds = [e.type for e in reference_free_evaluators(StubJudge())]
-        assert kinds == ["llm_judge", "no_tool_error"]
-
-    def test_no_reference_based_evaluator_is_offered(self):
-        # production declares no expected answer, and `contains` with nothing to
-        # contain passes everything rather than being lenient
-        kinds = {e.type for e in reference_free_evaluators(StubJudge())}
-        assert not kinds & {"contains", "exact_match", "regex", "tool_call",
-                            "tool_order", "json_schema"}
+    def test_an_empty_spec_grades_with_nothing(self):
+        # the server refuses this, so reaching it means something went wrong
+        # upstream -- reporting nothing beats inventing a default check
+        assert evaluators_for({"sampleEvaluators": "[]"}) == []
 
 
 class TestGradingOneTrace:
-    def test_the_rubric_reaches_the_judge(self):
-        # a judge reads its expectation by its own name -- the same mechanism a
-        # suite uses, which is what stops this needing a special case
-        judge = StubJudge()
-        trial = grade_trace(reference_free_evaluators(judge), "run1", 3, "t1",
-                            detail(), None, "must name the artist")
-        assert "must name the artist" in judge.prompts[0]
+    def test_the_judges_criteria_are_what_it_grades_against(self):
+        # a criteria-based judge needs nothing from the task, which is exactly
+        # what makes it usable where nobody wrote an expected answer
+        judge = StubJudge(criterion="supported")
+        trial = grade_trace(with_judge(judge), "run1", 3, "t1", detail(), None)
+        assert "supported" in judge.prompts[0]
         assert trial.trial_id == "run1/t1"
+        assert not any(r.ungradable for r in trial.evaluator_results)
 
-    def test_a_sample_with_no_rubric_still_grades_against_something(self):
-        judge = StubJudge()
-        grade_trace(reference_free_evaluators(judge), "run1", 3, "t1", detail(),
-                    None, "")
-        assert GENERIC_RUBRIC in judge.prompts[0]
-
-    def test_the_task_carries_the_rubric_under_the_judges_name(self):
-        # pinned because `Task` losing `rubric` for `expectations` is exactly the
-        # change that broke this module the first time
-        trial = grade_trace(reference_free_evaluators(StubJudge()), "r", 1, "t",
-                            detail(), None, "the rubric")
-        assert JUDGE_NAME == "online_judge"
-        assert trial.task_id == "t"
+    def test_the_task_carries_no_expectations_at_all(self):
+        # production has none, and inventing one would anchor the judge on an
+        # answer nobody wrote
+        judge = StubJudge(criterion="supported")
+        grade_trace(with_judge(judge), "r", 1, "t", detail(), None)
+        assert "expected" not in judge.prompts[0].lower().split("<user")[0]
 
     def test_the_verdict_settles_the_trial_status(self):
         # a fixed PASSED would make every sample report a pass rate of exactly
         # 1.0, which is a confidently wrong number rather than an absent one
         trace = {"trace_id": "t", "tool_calls": [], "tool_error_count": 0}
-        passing = grade_trace(reference_free_evaluators(StubJudge(5.0)), "r", 1,
-                              "t", detail(), trace, "rubric")
-        failing = grade_trace(reference_free_evaluators(StubJudge(1.0)), "r", 1,
-                              "t2", detail(), trace, "rubric")
+        passing = grade_trace(with_judge(StubJudge(5.0, "supported")), "r", 1,
+                              "t", detail(), trace)
+        failing = grade_trace(with_judge(StubJudge(1.0, "supported")), "r", 1,
+                              "t2", detail(), trace)
         assert passing.status is TrialStatus.PASSED
         assert failing.status is TrialStatus.FAILED
 
@@ -192,8 +213,7 @@ class TestGradingOneTrace:
             def __call__(self, prompt: str) -> str:
                 return json.dumps({"score": 5.0})
 
-        trial = grade_trace(reference_free_evaluators(Bare()), "r", 1, "t",
-                            detail(), None, "rubric")
+        trial = grade_trace(with_judge(Bare()), "r", 1, "t", detail(), None)
         assert all(r.ungradable for r in trial.evaluator_results)
 
     def test_nothing_gradable_is_not_counted_as_a_failure(self):
@@ -256,7 +276,7 @@ class TestARunOverProduction:
         session = FakeSession([summary("a", 1), summary("b", 2)],
                               {"a": detail(), "b": detail()})
         result = run_sample(FakeClient(), session, "https://h", 1, sample_run(),
-                            reference_free_evaluators(StubJudge()))
+                            with_judge(StubJudge()))
         assert {t.task_id for t in result.trials} == {"a", "b"}
         assert result.status == "SUCCEEDED"
 
@@ -265,7 +285,7 @@ class TestARunOverProduction:
         # id is the record of that rather than a missing value
         session = FakeSession([summary("a", 1)], {"a": detail()})
         result = run_sample(FakeClient(), session, "https://h", 1, sample_run(),
-                            reference_free_evaluators())
+                            trace_only())
         assert result.suite_id == ""
 
     def test_a_quiet_window_is_not_a_failed_run(self):
@@ -273,14 +293,14 @@ class TestARunOverProduction:
         # FAILED would page someone about it
         session = FakeSession([summary("old", 500)], {})
         result = run_sample(FakeClient(), session, "https://h", 1, sample_run(),
-                            reference_free_evaluators())
+                            trace_only())
         assert (result.status, result.trials) == ("SUCCEEDED", [])
 
     def test_one_unreadable_trace_does_not_end_the_run(self):
         session = FakeSession([summary("a", 1), summary("b", 1)],
                               {"a": detail(), "b": detail()})
         result = run_sample(FakeClient(fails={"a"}), session, "https://h", 1,
-                            sample_run(), reference_free_evaluators())
+                            sample_run(), trace_only())
         assert [t.task_id for t in result.trials] == ["b"]
 
     def test_the_sample_size_comes_off_the_run_row(self):
@@ -289,7 +309,7 @@ class TestARunOverProduction:
         session = FakeSession([summary(str(i), 1) for i in range(10)],
                               {str(i): detail() for i in range(10)})
         result = run_sample(FakeClient(), session, "https://h", 1,
-                            sample_run(nTrials=3), reference_free_evaluators(),
+                            sample_run(nTrials=3), trace_only(),
                             random.Random(1))
         assert len(result.trials) == 3
 
@@ -304,7 +324,7 @@ class TestResultsAreWritable:
         trial = as_trial("run1", 3, "t", "answer", None)
         trial.status = TrialStatus.PASSED
         trial.evaluator_results = [
-            EvaluatorResult(evaluator_name=JUDGE_NAME, evaluator_type="llm_judge",
+            EvaluatorResult(evaluator_name="faithfulness", evaluator_type="llm_judge",
                             score=1.0, passed=True)
         ]
         rows = run_metrics("run1", "", 3, [trial])

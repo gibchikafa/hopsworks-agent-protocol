@@ -32,11 +32,10 @@ from __future__ import annotations
 import json
 import logging
 import random
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from .evaluators import Evaluator, NoToolErrorEvaluator, Trace, verdict
-from .judges import LlmJudgeEvaluator
 from .models import PassPolicy, Task, TraceStatus, Trial, TrialStatus
 from .runner import RunResult
 
@@ -46,68 +45,43 @@ log = logging.getLogger(__name__)
 #: applied client-side, so this bounds the read rather than the sample.
 LISTING_LIMIT = 500
 
-#: What the judge grades against when a sample names no rubric of its own. It
-#: deliberately says nothing about the domain: a generic rubric can only catch
-#: generic failures, which is worth having and worth being honest about.
-GENERIC_RUBRIC = (
-    "A good response answers what the user actually asked, is consistent with "
-    "any information it cites, does not invent facts or capabilities, and does "
-    "not claim to have taken an action it did not take."
-)
 
+def evaluators_for(run: dict[str, Any], judge_completer: Any = None) -> list[Evaluator]:
+    """The checks this monitor grades with, from the spec on the run.
 
-#: The judge's name, and therefore the key its rubric is stored under on each
-#: sampled trace's task — a judge reads its expectation by its own name, the same
-#: way it does in a suite.
-JUDGE_NAME = "online_judge"
+    The same `evaluators_from_spec` a suite run uses. It is the same machinery on
+    the same shape -- what differs is only where the inputs came from, which is
+    the whole point: a check does not need to know whether the conversation it is
+    reading was authored or served.
 
-
-def reference_free_evaluators(
-    judge_completer: Any = None,
-    judge_config: Any = None,
-) -> list[Evaluator]:
-    """The checks that can grade a response with no expected answer.
-
-    Deliberately a short list. Every other evaluator reads something the task
-    was supposed to declare — an expected string, a required tool, a schema —
-    and production traffic declares nothing. Handing those an empty expectation
-    does not make them lenient, it makes them wrong: `contains` with nothing to
-    contain passes everything, `tool_call` with no required list has no opinion.
-
-    So:
-
-      - a rubric judge, which is the only thing that can say whether an answer
-        was good without being told what good was;
-      - `no_tool_error`, which reads the trace and needs nothing from the task.
-
-    `tool_retries` is *not* here despite needing no expectation. Its threshold
-    is a judgement about a particular agent — one retry is prudent for a flaky
-    API and a bug for an idempotent lookup — and a default applied across every
-    deployment would report a number nobody chose.
+    The spec is on the run rather than looked up, so an evaluator edited after
+    this started cannot change what it graded with halfway through.
     """
-    evaluators: list[Evaluator] = []
-    if judge_completer is not None:
-        evaluators.append(
-            LlmJudgeEvaluator(judge_completer, judge_config, name=JUDGE_NAME)
-        )
-    evaluators.append(NoToolErrorEvaluator())
-    return evaluators
+    from .evaluator_spec import evaluators_from_spec
+
+    return list(evaluators_from_spec(run.get("sampleEvaluators") or "[]",
+                                     judge_completer=judge_completer))
 
 
-def within_window(summaries: Sequence[dict[str, Any]], since_hours: float,
-                  now: datetime | None = None) -> list[dict[str, Any]]:
-    """The summaries inside the window, by their creation time."""
-    now = now or datetime.now(tz=timezone.utc)
-    cutoff = now - timedelta(hours=since_hours)
-    recent = []
+def within_window(summaries: Sequence[dict[str, Any]], start_ms: float,
+                  end_ms: float) -> list[dict[str, Any]]:
+    """The summaries inside the window, half-open: (start, end].
+
+    Half-open so consecutive runs partition the traffic rather than overlapping
+    at the boundary. A trace graded by the run that ended at T must not be graded
+    again by the run that starts at T -- monitoring counts each conversation
+    once, and a double-counted trace moves a rate.
+    """
+    inside = []
     for summary in summaries:
         created = summary.get("createdAt")
         if created is None:
+            # Its age is unknown, and treating unknown as inside would quietly
+            # widen whatever window was asked for.
             continue
-        when = datetime.fromtimestamp(created / 1000, tz=timezone.utc)
-        if when >= cutoff:
-            recent.append(summary)
-    return recent
+        if start_ms < created <= end_ms:
+            inside.append(summary)
+    return inside
 
 
 def choose(recent: Sequence[dict[str, Any]], size: int,
@@ -182,8 +156,7 @@ def as_trial(run_id: str, deployment_id: int, trace_id: str, answer: str,
 
 
 def grade_trace(evaluators: Sequence[Evaluator], run_id: str, deployment_id: int,
-                trace_id: str, detail: dict[str, Any], trace: Trace | None,
-                rubric: str = "") -> Trial:
+                trace_id: str, detail: dict[str, Any], trace: Trace | None) -> Trial:
     """One sampled trace, graded."""
     from .evaluators import run_evaluators
 
@@ -191,16 +164,12 @@ def grade_trace(evaluators: Sequence[Evaluator], run_id: str, deployment_id: int
     # The trace id is the task id: production has no task, and this is the only
     # identifier that leads back to what was actually said.
     #
-    # The rubric goes in expectations under the judge's name because that is
-    # where a judge looks -- the same mechanism a suite uses, so the judge needs
-    # no special case for having been pointed at production. A judge with
-    # nothing to grade against returns a number anyway, and that number is noise
-    # dressed as a measurement, which is why there is a generic fallback rather
-    # than an empty string.
+    # No expectations: production carries none, which is why every check here has
+    # to be able to reach a verdict from its own configuration. The server
+    # refuses one that cannot, so reaching this point means they all can.
     task = Task(
         task_id=trace_id,
         input_messages=json.dumps([{"role": "user", "content": question}]),
-        expectations={JUDGE_NAME: rubric or GENERIC_RUBRIC},
     )
     trial = as_trial(run_id, deployment_id, trace_id, answer, trace)
     trial.evaluator_results = list(run_evaluators(evaluators, task, trial, trace))
@@ -238,9 +207,13 @@ def run_sample(client: Any, session: Any, api_base: str, project_id: int,
     listing = session.get(f"{base}/traces", params={"limit": LISTING_LIMIT}, timeout=60)
     listing.raise_for_status()
     summaries = listing.json().get("items") or []
-    recent = within_window(summaries, float(run.get("sampleSinceHours") or 24.0))
+    # The window the run was created with: everything since the last monitor
+    # stopped, unless someone asked for a specific range.
+    start_ms = float(run.get("sampleFrom") or 0)
+    end_ms = float(run.get("sampleTo") or datetime.now(tz=timezone.utc).timestamp() * 1000)
+    recent = within_window(summaries, start_ms, end_ms)
     if not recent:
-        log.info("no traces in the last %s hours", run.get("sampleSinceHours"))
+        log.info("no new traces between %s and %s", start_ms, end_ms)
         return RunResult(run_id=run["runId"], suite_id="", deployment_id=deployment_id,
                          started_at=started, completed_at=datetime.now(tz=timezone.utc))
 
@@ -259,8 +232,7 @@ def run_sample(client: Any, session: Any, api_base: str, project_id: int,
             log.exception("could not read trace %s", trace_id)
             continue
         trials.append(
-            grade_trace(evaluators, run["runId"], deployment_id, trace_id, detail,
-                        trace, run.get("sampleRubric") or "")
+            grade_trace(evaluators, run["runId"], deployment_id, trace_id, detail, trace)
         )
 
     return RunResult(

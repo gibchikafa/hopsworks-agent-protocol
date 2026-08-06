@@ -398,31 +398,41 @@ class EvalApi:
             "start": "true",
         })
 
-    def sample_production(self, *, deployment_id: int, sample: int = 25,
-                          since_hours: float = 24.0, rubric: str = "",
-                          start: bool = True) -> dict[str, Any]:
-        """Grade a sample of this deployment's production traffic.
+    def monitor_production(self, *, deployment_id: int, evaluator: str = "",
+                           suite: dict[str, Any] | None = None, sample: int = 25,
+                           since: Any = None, until: Any = None,
+                           start: bool = True) -> dict[str, Any]:
+        """Grade a sample of the traces this deployment has served.
 
-        Online evaluation, as against a suite run's offline evaluation. The
-        traffic already happened, so there is no agent to call and no expected
-        answer — only the checks that judge a response on its own terms, which
-        is the rubric judge and the trajectory checks.
+        Monitoring rather than a versioned measurement: point a saved evaluator,
+        or a suite's checks, at live traffic. A suite's tasks are ignored --
+        production brings its own -- so a suite with no tasks is a perfectly good
+        thing to monitor with.
 
-        `rubric` is what the judge grades against; without one it falls back to
-        a generic one that can only catch generic failures. The score this
-        produces is **not** comparable with a suite's pass rate: one says how
-        the agent does on cases someone wrote down, the other how it does on the
-        cases users bring.
+        Every check must be able to reach a verdict without an expected answer,
+        since production carries none. A judge configured with `criteria` can; one
+        relying on a task's rubric cannot, and the server refuses it rather than
+        letting it return ungradable on every trace while the run reports a clean
+        sheet.
 
-        It runs in the deployment's own evaluation job, the same one a suite run
-        uses, so a schedule set on that job under Jobs is how this becomes
-        continuous rather than occasional.
+        With no range, it grades what has arrived since the last successful
+        monitor for this deployment -- which is what makes a schedule cover each
+        trace once instead of re-grading the same day every night. `since` and
+        `until` are datetimes, for a backfill or to re-read a window.
         """
+        def epoch(value: Any) -> int | None:
+            return None if value is None else int(value.timestamp() * 1000)
+
+        if not evaluator and not suite:
+            raise EvalApiError("name an evaluator or a suite to grade with")
         return self._call("POST", "/sample-runs", params={
             "deploymentId": deployment_id,
             "sample": sample,
-            "sinceHours": since_hours,
-            **({"rubric": rubric} if rubric else {}),
+            **({"templateId": evaluator} if evaluator else {}),
+            **({"suiteId": suite["suiteId"], "suiteVersion": suite["version"]}
+               if suite else {}),
+            **({"from": epoch(since)} if since is not None else {}),
+            **({"to": epoch(until)} if until is not None else {}),
             "start": "true" if start else "false",
         })
 

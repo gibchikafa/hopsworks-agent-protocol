@@ -150,26 +150,48 @@ class TestWhatItSends:
         assert "gateMetric" not in body
         assert "gateThreshold" not in body
 
-    def test_production_can_be_sampled_without_a_suite(self):
-        # online evaluation: the traffic already happened, so there is no suite
-        # to name and no expected answer to compare against
+    def test_production_is_monitored_with_a_named_evaluator(self):
+        # monitoring points a check at live traffic; it does not invent one
         client = api([FakeResponse(body={"runId": "r1", "runType": "ONLINE_SAMPLE"})])
-        client.sample_production(deployment_id=3, sample=50, since_hours=12.0,
-                                 rubric="be helpful")
+        client.monitor_production(deployment_id=3, evaluator="tpl-1", sample=50)
         [(method, url, body, params)] = client._session.sent
         assert (method, url.endswith("/sample-runs")) == ("POST", True)
         assert body is None
         assert params["deploymentId"] == 3
+        assert params["templateId"] == "tpl-1"
         assert params["sample"] == 50
-        assert params["sinceHours"] == 12.0
-        assert params["rubric"] == "be helpful"
 
-    def test_a_sample_with_no_rubric_sends_none(self):
-        # the server falls back to a generic rubric; sending an empty string
-        # would store one that reads as a rubric someone chose
+    def test_a_suites_checks_can_monitor_too(self):
+        # a suite without tasks is a set of checks, which is all a monitor needs
         client = api([FakeResponse(body={"runId": "r1"})])
-        client.sample_production(deployment_id=3)
-        assert "rubric" not in client._session.sent[0][3]
+        client.monitor_production(deployment_id=3,
+                                  suite={"suiteId": "s1", "version": 2})
+        params = client._session.sent[0][3]
+        assert (params["suiteId"], params["suiteVersion"]) == ("s1", 2)
+
+    def test_monitoring_with_nothing_is_refused_before_it_is_sent(self):
+        client = api()
+        with pytest.raises(EvalApiError, match="evaluator or a suite"):
+            client.monitor_production(deployment_id=3)
+        assert client._session.sent == []
+
+    def test_no_range_means_since_the_last_monitor(self):
+        # what makes a schedule cover each trace once rather than re-grading the
+        # same day every night; the server holds the watermark
+        client = api([FakeResponse(body={"runId": "r1"})])
+        client.monitor_production(deployment_id=3, evaluator="tpl-1")
+        params = client._session.sent[0][3]
+        assert "from" not in params and "to" not in params
+
+    def test_an_explicit_range_is_sent_as_epoch_millis(self):
+        # neither a browser nor a job should have to agree with the server about
+        # a date format or a time zone
+        from datetime import datetime, timezone
+
+        client = api([FakeResponse(body={"runId": "r1"})])
+        since = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        client.monitor_production(deployment_id=3, evaluator="tpl-1", since=since)
+        assert client._session.sent[0][3]["from"] == int(since.timestamp() * 1000)
 
     def test_the_runner_job_belongs_to_a_deployment(self):
         # the sizing, environment and alerts on it are that agent's, which is the whole
