@@ -22,7 +22,7 @@ from hopsworks_agent_eval.evaluators import EvaluatorResult
 from hopsworks_agent_eval.models import TraceStatus, TrialStatus
 from hopsworks_agent_eval.sample_job import (
     as_trial,
-    choose,
+    oldest_first,
     evaluators_for,
     grade_trace,
     question_and_answer,
@@ -122,17 +122,22 @@ class TestChoosingWhatToGrade:
         # whatever window someone asked for
         assert within_window([{"traceId": "t"}], ms(24), ms(0)) == []
 
-    def test_the_sample_is_random_rather_than_the_newest(self):
-        # the most recent traces are a sample of who was using it in the last
-        # hour, not a sample of behaviour
+    def test_everything_in_the_window_is_graded(self):
+        # the window already says what is new, so choosing a subset of it would
+        # decide on someone's behalf how much of their own traffic to look at
         summaries = [summary(str(i), i, NOW) for i in range(20)]
-        first = choose(summaries, 5, random.Random(1))
-        assert len(first) == 5
-        assert [s["traceId"] for s in first] != [s["traceId"] for s in summaries[:5]]
+        assert len(oldest_first(summaries, 0)) == 20
+
+    def test_a_ceiling_cuts_the_newest_not_the_middle(self):
+        # so what is left ungraded is contiguous and the watermark can stop in
+        # front of it -- a ceiling defers work rather than skipping it
+        summaries = [summary(str(i), i, NOW) for i in range(10)]
+        graded = oldest_first(summaries, 3)
+        assert [s["traceId"] for s in graded] == ["9", "8", "7"]
 
     def test_asking_for_more_than_exists_grades_everything(self):
         summaries = [summary("a", 1, NOW), summary("b", 2, NOW)]
-        assert len(choose(summaries, 50, random.Random(1))) == 2
+        assert len(oldest_first(summaries, 50)) == 2
 
 
 class TestReadingTheTranscript:
@@ -265,8 +270,9 @@ class FakeClient:
 
 
 def sample_run(**overrides):
-    run = {"runId": "run1", "deploymentId": 3, "nTrials": 10,
-           "sampleSinceHours": 24.0, "sampleRubric": "be helpful"}
+    run = {"runId": "run1", "deploymentId": 3, "nTrials": 500,
+           "sampleFrom": ms(48), "sampleTo": ms(0) + 60_000,
+           "sampleEvaluators": TRACE_ONLY_SPEC}
     run.update(overrides)
     return run
 
@@ -303,14 +309,13 @@ class TestARunOverProduction:
                             sample_run(), trace_only())
         assert [t.task_id for t in result.trials] == ["b"]
 
-    def test_the_sample_size_comes_off_the_run_row(self):
-        # the row is what the job is handed, so a scheduled sample and a
-        # hand-started one cannot ask for different things
-        session = FakeSession([summary(str(i), 1) for i in range(10)],
+    def test_the_ceiling_comes_off_the_run_row(self):
+        # the row is what the job is handed, so a scheduled monitor and a
+        # hand-started one cannot bound themselves differently
+        session = FakeSession([summary(str(i), i + 1) for i in range(10)],
                               {str(i): detail() for i in range(10)})
         result = run_sample(FakeClient(), session, "https://h", 1,
-                            sample_run(nTrials=3), trace_only(),
-                            random.Random(1))
+                            sample_run(nTrials=3), trace_only())
         assert len(result.trials) == 3
 
 
@@ -330,3 +335,31 @@ class TestResultsAreWritable:
         rows = run_metrics("run1", "", 3, [trial])
         assert any(r["metric_name"] == "pass_rate" for r in rows)
         assert all(r["suite_id"] == "" for r in rows)
+
+
+class TestWhereTheNextRunStarts:
+    """The watermark, which is what makes a schedule cover each trace once."""
+
+    def test_it_reaches_the_end_of_the_window_when_all_of_it_was_graded(self):
+        from hopsworks_agent_eval.sample_job import graded_through
+
+        end = ms(0)
+        graded = [summary("a", 3), summary("b", 1)]
+        assert graded_through(graded, end) <= end
+
+    def test_it_stops_at_the_last_graded_trace_when_the_ceiling_cut_in(self):
+        # advancing to the window's end regardless would step over traces nobody
+        # looked at, and nothing would ever report them
+        from hopsworks_agent_eval.sample_job import graded_through
+
+        end = ms(0)
+        graded = [summary("old", 10)]
+        assert graded_through(graded, end) < end - 3600_000
+
+    def test_an_empty_window_still_advances(self):
+        # nothing arrived, so there is nothing to come back for; holding the
+        # watermark still would re-scan the same empty range forever
+        from hopsworks_agent_eval.sample_job import graded_through
+
+        end = ms(0)
+        assert graded_through([], end) == end

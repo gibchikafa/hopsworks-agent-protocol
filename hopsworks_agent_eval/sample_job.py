@@ -84,18 +84,21 @@ def within_window(summaries: Sequence[dict[str, Any]], start_ms: float,
     return inside
 
 
-def choose(recent: Sequence[dict[str, Any]], size: int,
-           rng: random.Random | None = None) -> list[dict[str, Any]]:
-    """A random sample, not the newest.
+def oldest_first(inside: Sequence[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Everything in the window, oldest first, up to the ceiling.
 
-    The most recent traces are not a sample of behaviour, they are a sample of
-    whoever happened to be using it in the last hour. Sampling at all is because
-    grading everything costs a model call per request.
+    Not a random sample any more. The window already says what to grade — since
+    the last monitor, usually — so choosing a subset of it would mean deciding on
+    someone's behalf how much of their own traffic to look at, and leaving the
+    rest ungraded with nothing recording that.
+
+    Oldest first because the ceiling has to cut somewhere, and cutting the newest
+    leaves a contiguous ungraded block the watermark can be left in front of. The
+    run then stops at the last trace it graded and the next one continues from
+    there, so a ceiling defers work rather than skipping it.
     """
-    rng = rng or random.Random()
-    if size >= len(recent):
-        return list(recent)
-    return rng.sample(list(recent), size)
+    ordered = sorted(inside, key=lambda s: s.get("createdAt") or 0)
+    return ordered[:limit] if limit and limit > 0 else ordered
 
 
 def question_and_answer(detail: dict[str, Any]) -> tuple[str, str]:
@@ -190,6 +193,19 @@ def grade_trace(evaluators: Sequence[Evaluator], run_id: str, deployment_id: int
     return trial
 
 
+def graded_through(sampled: Sequence[dict[str, Any]], window_end_ms: float) -> float:
+    """Where this run actually got to, which is where the next one starts.
+
+    The end of the window when everything in it was graded, and the last graded
+    trace's own time when the ceiling cut it short. Advancing to the window's end
+    regardless would step over traces nobody looked at and nothing would ever
+    report them.
+    """
+    if not sampled:
+        return window_end_ms
+    return max(float(s.get("createdAt") or 0) for s in sampled)
+
+
 def run_sample(client: Any, session: Any, api_base: str, project_id: int,
                run: dict[str, Any], evaluators: Sequence[Evaluator],
                rng: random.Random | None = None) -> RunResult:
@@ -217,8 +233,18 @@ def run_sample(client: Any, session: Any, api_base: str, project_id: int,
         return RunResult(run_id=run["runId"], suite_id="", deployment_id=deployment_id,
                          started_at=started, completed_at=datetime.now(tz=timezone.utc))
 
-    sampled = choose(recent, int(run.get("nTrials") or 25), rng)
-    log.info("grading %d of %d traces in the window", len(sampled), len(recent))
+    graded_limit = int(run.get("nTrials") or 0)
+    sampled = oldest_first(recent, graded_limit)
+    if len(sampled) < len(recent):
+        # Said plainly, because the alternative reading -- that this is all the
+        # traffic there was -- is the one someone would otherwise take.
+        log.warning(
+            "%d traces in the window, grading the oldest %d; the rest stay for the "
+            "next run, which will start where this one stops",
+            len(recent), len(sampled),
+        )
+    else:
+        log.info("grading %d traces in the window", len(sampled))
 
     trials = []
     for summary in sampled:
