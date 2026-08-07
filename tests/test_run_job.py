@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from hopsworks_agent_eval.evaluator_spec import evaluators_for_suite
 from hopsworks_agent_eval.models import ExecutionMode, PassPolicy
 from hopsworks_agent_eval.run_job import _tags, _to_suite
@@ -207,3 +209,54 @@ class TestFindingTheDefaultJudgesKey:
             assert run_job._judge_for() is None
         assert "ANTHROPIC_API_KEY" in caplog.text
         assert "account's environment variables" in caplog.text
+
+
+class TestOneExecutionManyRuns:
+    """An evaluation job runs everything it is configured to run, in one execution.
+
+    The resources are paid for once rather than per target, so a nightly job with
+    three suites and a monitor is one pod, not four.
+    """
+
+    def test_run_id_is_repeatable(self):
+        import argparse
+
+        from hopsworks_agent_eval import run_job
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--run-id", required=True, action="append", dest="run_ids")
+        parsed = parser.parse_args(["--run-id", "a", "--run-id", "b"])
+        assert parsed.run_ids == ["a", "b"]
+        assert callable(run_job._execute)
+
+    def test_one_failure_does_not_take_the_others_down(self, monkeypatch):
+        # A suite that refuses must not stop the three beside it: each has its own
+        # row, and stopping early would leave them saying nothing at all.
+        from hopsworks_agent_eval import run_job
+
+        seen = []
+
+        def fake_execute(run_id, session, base, project, host, args):
+            seen.append(run_id)
+            return run_id != "bad"
+
+        monkeypatch.setattr(run_job, "_execute", fake_execute)
+        monkeypatch.setattr(run_job, "hopsworks_session", lambda: object())
+        monkeypatch.setattr(run_job, "_api", lambda host, pid: "base")
+
+        import sys
+        import types
+
+        fake_hopsworks = types.ModuleType("hopsworks")
+        fake_hopsworks.login = lambda: types.SimpleNamespace(id=1, name="p")
+        monkeypatch.setitem(sys.modules, "hopsworks", fake_hopsworks)
+        monkeypatch.setenv("HOPSWORKS_HOST", "https://h")
+        monkeypatch.setattr(
+            sys, "argv",
+            ["run_job", "--run-id", "good", "--run-id", "bad", "--run-id", "also-good"],
+        )
+
+        with pytest.raises(SystemExit):
+            run_job.main()
+        # Every run was attempted, and the job still exits non-zero so an alert fires.
+        assert seen == ["good", "bad", "also-good"]

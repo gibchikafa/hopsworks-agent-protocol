@@ -271,39 +271,25 @@ def _match_schema(group: Any, frame: Any) -> Any:
     return frame
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument("--readiness-timeout-s", type=float, default=120.0,
-                        help="derive from the Stage 1 probe's trajectory-stable "
-                             "p95 rather than accepting this default")
-    parser.add_argument("--max-concurrency", type=int, default=4)
-    args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO)
+def _execute(run_id: str, session, base: str, project, host: str, args) -> bool:
+    """One recorded run. True when it finished, false when it failed.
 
-    import hopsworks
-
-    project = hopsworks.login()
-    host = os.environ.get("HOPSWORKS_HOST") or os.environ["REST_ENDPOINT"]
-    # Auth and the cluster's CA chain, both as the hopsworks client already
-    # resolved them for the login above. Building either by hand failed twice:
-    # a job has no API key, and the internal endpoint is signed by a CA no
-    # system trust store carries.
-    session = hopsworks_session()
-    base = _api(host, project.id)
-
+    Returns rather than exits, because a job runs several: a suite that refuses
+    must not take the three beside it down, and each has its own row to say what
+    became of it.
+    """
     def report(status: str, error: str | None = None) -> None:
         # Reported even on the failure paths: a run left RUNNING because the job
         # died looks exactly like one still going, and nothing can tell you which.
         try:
-            session.put(f"{base}/runs/{args.run_id}/status",
+            session.put(f"{base}/runs/{run_id}/status",
                         params={"status": status, **({"errorMessage": error} if error else {})},
                         timeout=30)
         except Exception:  # noqa: BLE001 — never mask the real failure
             log.exception("could not report status %s", status)
 
     try:
-        run = session.get(f"{base}/runs/{args.run_id}", timeout=60).json()
+        run = session.get(f"{base}/runs/{run_id}", timeout=60).json()
 
         from .client import HopsworksAgentClient
 
@@ -323,8 +309,7 @@ def main() -> None:
 
         # Which question this run answers. Read off the row rather than taken as
         # an argument, so a scheduled execution and a hand-started one cannot
-        # differ, and so the deployment's one evaluation job serves both --
-        # which is what keeps its resources, environment and alerts in one place.
+        # differ.
         if run.get("runType") == "ONLINE_SAMPLE":
             result = run_sample(
                 client, session, host, project.id, run,
@@ -333,8 +318,8 @@ def main() -> None:
             _write_results(project.get_feature_store(), result, run)
             report(result.status)
             log.info("online sample %s finished: %d traces graded",
-                     args.run_id, len(result.trials))
-            return
+                     run_id, len(result.trials))
+            return True
 
         tasks = session.get(
             f"{base}/suites/{run['suiteId']}/tasks",
@@ -346,7 +331,7 @@ def main() -> None:
         result = run_suite(
             client,
             suite,
-            run_id=args.run_id,
+            run_id=run_id,
             deployment_id=run["deploymentId"],
             # One list for the whole suite: every task is measured the same
             # way, which is what makes the run's pass rate comparable to the
@@ -364,24 +349,59 @@ def main() -> None:
         )
         _write_results(project.get_feature_store(), result, run, tasks)
         report(result.status)
-        log.info("run %s finished: %s", args.run_id, result.status)
+        log.info("run %s finished: %s", run_id, result.status)
+        return result.status == "SUCCEEDED"
     except SpecError as err:
         # Authoring validates the spec, so reaching here means a task was written
         # before that check existed or around it. Named as a run failure rather
         # than an agent one.
         log.exception("a task has an unusable evaluator spec")
         report("FAILED", f"evaluator spec: {err}")
+        return False
     except SuiteRefused as err:
         # A refusal is a result, not a crash: the run would have produced
         # numbers that looked valid, and saying so is the point.
         log.error("run refused: %s", err)
         report("FAILED", str(err))
-        raise SystemExit(1)
+        return False
     except Exception as err:  # noqa: BLE001
-        log.exception("run %s failed", args.run_id)
+        log.exception("run %s failed", run_id)
         report("FAILED", str(err))
-        raise SystemExit(1)
+        return False
 
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    # Repeatable: one evaluation job runs everything it is configured to run --
+    # three suites and a monitor, say -- in a single execution, so its resources
+    # are paid for once rather than per target.
+    parser.add_argument("--run-id", required=True, action="append", dest="run_ids")
+    parser.add_argument("--readiness-timeout-s", type=float, default=120.0,
+                        help="derive from the Stage 1 probe's trajectory-stable "
+                             "p95 rather than accepting this default")
+    parser.add_argument("--max-concurrency", type=int, default=4)
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO)
+
+    import hopsworks
+
+    project = hopsworks.login()
+    host = os.environ.get("HOPSWORKS_HOST") or os.environ["REST_ENDPOINT"]
+    # Auth and the cluster's CA chain, both as the hopsworks client already
+    # resolved them for the login above. Building either by hand failed twice:
+    # a job has no API key, and the internal endpoint is signed by a CA no
+    # system trust store carries.
+    session = hopsworks_session()
+    base = _api(host, project.id)
+
+    outcomes = [_execute(run_id, session, base, project, host, args)
+                for run_id in args.run_ids]
+    failed = outcomes.count(False)
+    if failed:
+        # Non-zero so the job reads as failed and any alert on it fires, while
+        # every run that did finish keeps the status it reported for itself.
+        log.error("%d of %d runs failed", failed, len(outcomes))
+        raise SystemExit(1)
 
 if __name__ == "__main__":
     main()
