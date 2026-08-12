@@ -27,6 +27,25 @@ _NO_CONTEXT = (
     "Memory is unavailable in this call, so nothing was stored. Continue "
     "without it and do not retry."
 )
+_NO_IDENTITY_CONTEXT = (
+    "This conversation cannot be labelled right now, so nothing was recorded. "
+    "Continue without it and do not retry."
+)
+
+
+def _context():
+    """The active turn's context, or None.
+
+    Separate from :func:`_resolve` because not every tool needs memory:
+    ``identify`` labels a conversation and an agent may do that with no memory
+    store configured at all.
+    """
+    from .autoevents import current_context
+
+    ctx = current_context.get(None)
+    if ctx is None:
+        log.warning("Tool called with no active request context")
+    return ctx
 
 
 def _resolve():
@@ -229,6 +248,41 @@ def search(query: str) -> str:
 MEMORY_TOOLS = (remember, recall, forget, search)
 
 
+def identify(subject: str) -> str:
+    """Record who you are talking to, once they have identified themselves.
+
+    Call this when the user gives you the identifier your instructions say to
+    ask for — a customer key, an account number, a reference. It only labels
+    the conversation so a support engineer can find it later; it does not look
+    anything up and does not change what you can remember or recall.
+
+    Args:
+        subject: the identifier exactly as the user gave it.
+    """
+    ctx = _context()
+    if ctx is None:
+        return _NO_IDENTITY_CONTEXT
+    subject = (subject or "").strip()
+    if not subject:
+        return "No identifier was given, so nothing was recorded."
+    # deliberately record_subject and not rebind_subject: rebinding decides
+    # whose durable memory this conversation may read, and the caller here is a
+    # model acting on text a user typed. See context.record_subject.
+    if not ctx.record_subject(subject, source="model"):
+        return (
+            "The identifier could not be recorded. Continue with the "
+            "conversation and do not retry."
+        )
+    return f"Recorded this conversation as being with {subject}."
+
+
+#: Registered separately from the memory tools. Identity is the one thing in
+#: this module that a model asserting the wrong value could make an audit
+#: surface lie about, so an app has to ask for it rather than receive it with
+#: everything else.
+IDENTITY_TOOLS = (identify,)
+
+
 def _normalize_framework(framework: str | None) -> str:
     if framework is None:
         return "plain"
@@ -317,7 +371,25 @@ def memory_tools(framework: str = "plain", include=None):
     A system-prompt rule is not a substitute: the tool is callable whether or
     not the prompt mentions it.
     """
-    tools = _select(include)
+    return _wrap(_select(include), framework, "memory_tools")
+
+
+def identity_tools(framework: str = "plain"):
+    """``identify`` wrapped in a framework's tool type.
+
+    Register it when the agent is expected to ask who it is talking to::
+
+        agent = create_react_agent(llm, [*my_tools, *app.identity_tools("langgraph")])
+
+    Not part of :func:`memory_tools`, and not for lack of tidiness: a model
+    that calls this writes what an audit surface will show as the person on the
+    other end of the conversation, so an app opts in to that rather than
+    receiving it alongside four tools it asked for.
+    """
+    return _wrap(list(IDENTITY_TOOLS), framework, "identity_tools")
+
+
+def _wrap(tools, framework, caller):
     framework = _normalize_framework(framework)
     if framework in ("plain", "custom"):
         return tools
@@ -326,7 +398,7 @@ def memory_tools(framework: str = "plain", include=None):
             from langchain_core.tools import tool as lc_tool
         except ImportError as err:
             raise ImportError(
-                "memory_tools('langgraph') requires langchain-core: "
+                f"{caller}('langgraph') requires langchain-core: "
                 "pip install langchain-core"
             ) from err
         return [lc_tool(fn) for fn in tools]
@@ -335,7 +407,7 @@ def memory_tools(framework: str = "plain", include=None):
             from llama_index.core.tools import FunctionTool
         except ImportError as err:
             raise ImportError(
-                "memory_tools('llamaindex') requires llama-index-core: "
+                f"{caller}('llamaindex') requires llama-index-core: "
                 "pip install llama-index-core"
             ) from err
         return [FunctionTool.from_defaults(fn=fn) for fn in tools]
@@ -344,7 +416,7 @@ def memory_tools(framework: str = "plain", include=None):
             from agents import function_tool
         except ImportError as err:
             raise ImportError(
-                "memory_tools('openai_agents') requires openai-agents: "
+                f"{caller}('openai_agents') requires openai-agents: "
                 "pip install openai-agents"
             ) from err
         return [function_tool(fn) for fn in tools]
@@ -353,7 +425,7 @@ def memory_tools(framework: str = "plain", include=None):
             from claude_agent_sdk import tool as sdk_tool
         except ImportError as err:
             raise ImportError(
-                "memory_tools('claude_agents') requires claude-agent-sdk: "
+                f"{caller}('claude_agents') requires claude-agent-sdk: "
                 "pip install claude-agent-sdk"
             ) from err
         return [_as_claude_agent_tool(fn, sdk_tool) for fn in tools]

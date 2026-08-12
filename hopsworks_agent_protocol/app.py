@@ -94,6 +94,14 @@ class AgentApp(FastAPI):
         self._placeholder = placeholder
         self._input_modalities = input_modalities or ["text"]
         self._output_modalities = output_modalities or ["text"]
+        # Records which conversation was with whom, for anyone later holding a
+        # customer key and no way to find their conversations. Constructed
+        # unconditionally but connects nothing until something identifies a
+        # conversation, so an agent that never does pays for a field.
+        from .identity import ConversationSubjectIndex
+
+        self._subjects = ConversationSubjectIndex()
+
         # advertise tool_event SSE frames (emitted via ctx.emit_event); off by
         # default so existing manifests are unchanged
         self._tool_events = tool_events
@@ -185,6 +193,23 @@ class AgentApp(FastAPI):
         from .tools import memory_tools as _memory_tools
 
         return _memory_tools(framework or self.framework, include=include)
+
+    def identity_tools(self, framework: str | None = None) -> list[Any]:
+        """Framework-native ``identify`` tool, for agents that ask who they are with.
+
+        Registered separately from :meth:`memory_tools` on purpose::
+
+            agent = create_react_agent(llm, [*tools, *app.identity_tools()])
+
+        What it records is what a traces view will show as the person on the
+        other end of the conversation, and the caller is a model reading text a
+        user typed. It labels only: an agent that must act on a verified
+        identity should check the claim itself and call
+        ``ctx.rebind_subject()``.
+        """
+        from .tools import identity_tools as _identity_tools
+
+        return _identity_tools(framework or self.framework)
 
     # ── internals ─────────────────────────────────────────────────────────
 
@@ -288,6 +313,11 @@ class AgentApp(FastAPI):
             conventions.CONVERSATION_ID: ctx.conversation_id,
             conventions.FRAMEWORK: ctx.framework,
         }
+        if ctx.has_subject:
+            # only when the client asserted one. The per-conversation fallback
+            # is not an end user, and stamping it here would publish a
+            # conversation id as somebody's identity.
+            attributes[conventions.USER_ID] = ctx.subject
         if ctx.message_id:
             attributes[conventions.MESSAGE_ID] = ctx.message_id
         if ctx.deployment_id:
@@ -316,6 +346,7 @@ class AgentApp(FastAPI):
             response_id=new_response_id(),
             turn_id=new_turn_id(),
             subject=getattr(request, "subject", None),
+            subjects=self._subjects,
         )
 
     async def _open_turn(self, ctx: HandlerContext) -> None:

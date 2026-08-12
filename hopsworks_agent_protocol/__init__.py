@@ -13,7 +13,15 @@ from .vectorstore import (
     InMemoryVectorStore,
     VectorStore,
 )
-from .tools import forget, memory_tools, recall, remember, search
+from .tools import (
+    forget,
+    identify,
+    identity_tools,
+    memory_tools,
+    recall,
+    remember,
+    search,
+)
 from .models import (
     AgentError,
     AgentResponse,
@@ -46,6 +54,8 @@ __all__ = [
     "VectorStore",
     "anthropic_summarizer",
     "forget",
+    "identify",
+    "identity_tools",
     "memory_tools",
     "recall",
     "remember",

@@ -190,6 +190,30 @@ ManagedMemoryService(long_term=True, embedder=embedder,
                       vector_store=vector_store_for(embedder))
 ```
 
+### Telling the traces who a conversation was with
+
+An agent that asks for a customer key learns who it is talking to *during* the
+conversation — after the first turn's spans have been exported and can no
+longer be changed. `identify` records the answer against the conversation
+instead, so a developer holding that key can find every conversation it had:
+
+```python
+from hopsworks_agent_protocol import identity_tools
+
+agent = create_react_agent(llm, [*my_tools, *identity_tools("langgraph")])
+```
+
+Registered separately from `memory_tools`, and not for tidiness. What it writes
+is what the Traces view shows as the person on the other end, and the caller is
+a model reading text a user typed, so it **labels only** — it changes nothing
+about what the agent may remember or recall. An agent that must act on an
+identity should verify the claim itself and call `ctx.rebind_subject()`, which
+does both.
+
+When the client already knows who the user is and asserts `subject` on the
+request, nothing needs registering: the SDK stamps OpenInference `user.id` on
+the turn span and the traces pick it up from there.
+
 ### Backends and behaviour
 
 - `InMemoryAgentMemory()` — zero-config for development. Lost on restart and

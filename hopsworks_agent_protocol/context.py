@@ -33,6 +33,7 @@ class HandlerContext:
         response_id: str,
         turn_id: str = "",
         subject: str | None = None,
+        subjects: "Any | None" = None,
     ):
         self.request = request
         self.conversation_id = request.conversation_id or ""
@@ -59,6 +60,10 @@ class HandlerContext:
         # "conversation" (the fallback above), or "app" (the agent identified
         # the user mid-turn — see rebind_subject).
         self.subject_source = "client" if subject is not None else "conversation"
+        # writes the conversation-to-subject index, so a customer key can be
+        # traced back to that customer's conversations. None when the app did
+        # not configure one; every use tolerates that.
+        self._subjects = subjects
         # turn lifecycle bookkeeping, owned by AgentApp
         self._turn_open = False
         self._next_seq = 1
@@ -146,6 +151,26 @@ class HandlerContext:
             self.memory.rebind_turn_subject(
                 self.conversation_id, self.turn_id, subject
             )
+        # the same identification, recorded where a developer holding a
+        # customer key will look for it. One writer for both, so the index and
+        # the memory rows cannot end up disagreeing about who this is.
+        self.record_subject(subject, source="app")
+
+    def record_subject(self, subject: str, source: str = "app") -> bool:
+        """Say who this conversation is with, without changing what it can read.
+
+        This is the labelling half of :meth:`rebind_subject`, split out because
+        the two carry very different authority. ``subject`` keys durable memory,
+        so rebinding it decides which person's facts the agent may read;
+        recording it decides what a traces table displays. Only the second is
+        safe to expose to a model, which is why the ``identify`` tool calls this
+        and nothing else.
+
+        Best-effort: returns whether a row landed, and never raises.
+        """
+        if not subject or self._subjects is None:
+            return False
+        return self._subjects.record(self.conversation_id, subject, source)
 
     def _state_owner(self, scope: str) -> str:
         if scope == "session":

@@ -41,6 +41,13 @@ GEN_AI_OPERATION_NAME = "gen_ai.operation.name"
 GEN_AI_AGENT_NAME = "gen_ai.agent.name"
 GEN_AI_AGENT_VERSION = "gen_ai.agent.version"
 GEN_AI_CONVERSATION_ID = "gen_ai.conversation.id"
+# OpenInference's end-user attribute. The Hopsworks sidecar reads it into the
+# user_id column of otel_spans, and every OpenInference-aware viewer reads it
+# too, so a trace carrying it says who it was with without Hopsworks present.
+# Only ever set from a subject the client asserted: a subject learned mid-turn
+# cannot reach spans already exported, which is what the conversation-subject
+# index is for.
+USER_ID = "user.id"
 GEN_AI_USAGE_INPUT_TOKENS = "gen_ai.usage.input_tokens"
 GEN_AI_USAGE_OUTPUT_TOKENS = "gen_ai.usage.output_tokens"
 GEN_AI_USAGE_PROMPT_TOKENS = "gen_ai.usage.prompt_tokens"
