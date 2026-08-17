@@ -201,6 +201,43 @@ class TestPrompt:
         assert "status=open" in prompt
         assert "lookup()" not in prompt
 
+    def test_a_custom_template_can_ask_for_the_output_shape(self):
+        prompt = render_prompt(
+            parse_judge_config(entry(
+                prompt_template="{question}|{answer}|reply with {output_shape}"
+            )),
+            question="q", answer="a",
+        )
+
+        # Without this a custom prompt cannot say what to return, and the reply
+        # is unparseable -- reported as ungradable, which reads like a broken
+        # judge rather than a prompt missing one line.
+        assert '"scores"' in prompt
+        assert "task_completion" in prompt
+
+    def test_a_custom_template_gets_the_criteria_and_a_whole_number_range(self):
+        prompt = render_prompt(
+            parse_judge_config(entry(
+                prompt_template="{question}|{answer}|{criteria}|{score_min}-{score_max}"
+            )),
+            question="q", answer="a",
+        )
+
+        assert "task_completion" in prompt
+        # 1-5, not 1.0-5.0: the default path formats these and a custom one
+        # showing the model a different scale would be the same config read two
+        # ways.
+        assert "1-5" in prompt
+
+    def test_a_custom_template_replaces_the_built_in_one(self):
+        prompt = render_prompt(
+            parse_judge_config(entry(prompt_template="only this: {question} {answer}")),
+            question="q", answer="a",
+        )
+
+        assert prompt == "only this: q a"
+        assert "You are grading" not in prompt
+
     def test_the_failure_taxonomy_is_enumerated_in_the_prompt(self):
         prompt = render_prompt(parse_judge_config(entry()), question="q", answer="a")
         for category in FAILURE_CATEGORIES:

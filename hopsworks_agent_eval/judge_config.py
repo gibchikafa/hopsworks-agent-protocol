@@ -455,11 +455,17 @@ def render_prompt(config: JudgeConfig, *, question: str, answer: str,
     context = "".join(sections)
 
     if config.prompt_template:
+        # output_shape is offered to a custom template for the same reason the
+        # default uses it: the reply is parsed as JSON keyed by criterion, so a
+        # prompt that does not say so produces a judge whose every answer is
+        # unreadable -- which surfaces as an errored check, not as a bad prompt.
         return config.prompt_template.format(
             question=question, answer=answer, expected=expected, rubric=rubric,
             tool_calls=tool_calls, tool_results=tool_results, context=context,
-            criteria=_criteria_block(config), score_min=config.score_min,
-            score_max=config.score_max,
+            criteria=_criteria_block(config),
+            score_min=_number(config.score_min),
+            score_max=_number(config.score_max),
+            output_shape=_output_shape(config),
         )
 
     return DEFAULT_MULTI_PROMPT.format(
