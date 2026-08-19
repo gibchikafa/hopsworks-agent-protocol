@@ -327,7 +327,7 @@ class EvalApi:
 
     # ── tasks ───────────────────────────────────────────────────────────────
 
-    def add_task(self, suite: dict[str, Any], question: str,
+    def add_task(self, suite: dict[str, Any], question: str | list[str],
                  expectations: dict[str, str] | None = None) -> dict[str, Any]:
         """Author a task and join it to the suite, with what it expects of each check.
 
@@ -336,9 +336,16 @@ class EvalApi:
         separated here: an expectation is keyed by a check, and a task has no
         checks until it joins a suite.
         """
+        # A list is a conversation: the user's turns in order, each its own
+        # message. Passing it through as one message's content would send the
+        # whole script as a single question, which the server cannot tell from
+        # someone genuinely asking a list -- so it is expanded here.
+        turns = question if isinstance(question, list) else [question]
         task = self._call("POST", "/tasks", {
-            "inputMessages": json.dumps([{"role": "user", "content": question}]),
-            "taskType": "single_turn",
+            "inputMessages": json.dumps(
+                [{"role": "user", "content": str(turn)} for turn in turns]
+            ),
+            "taskType": "multi_turn" if len(turns) > 1 else "single_turn",
         })
         return self._call(
             "POST",
