@@ -182,7 +182,7 @@ class PairwiseEvaluator:
 
         outcome = pairwise_verdict(
             self._complete,
-            question=task.prompt,
+            question=task.asked,
             answer_a=reference,
             answer_b=trial.final_output,
             rubric=task.expects_text(self.name),
@@ -318,7 +318,7 @@ class ToolArgumentsJudge:
             f"- {c.get('name')}({_truncate(c.get('arguments', ''), 600)})" for c in calls
         )
         prompt = TOOL_ARGUMENTS_PROMPT.format(
-            question=task.prompt,
+            question=task.asked,
             calls=rendered,
             rubric_block=(
                 f"\n<criteria>\n{rubric}\n</criteria>\n" if (rubric := task.expects_text(self.name)) else ""
@@ -369,7 +369,7 @@ class ToolResultUsedJudge:
             f"- {c.get('name')} → {_truncate(c.get('result', ''), 800)}" for c in results
         )
         prompt = TOOL_RESULT_PROMPT.format(
-            question=task.prompt, results=rendered, answer=trial.final_output
+            question=task.asked, results=rendered, answer=trial.final_output
         )
         try:
             raw = self._complete(prompt)
@@ -438,12 +438,13 @@ class LlmJudgeEvaluator:
         calls, results = tool_calls_text(trace)
         prompt = render_prompt(
             self.config,
-            question=task.prompt,
+            question=task.asked,
             answer=trial.final_output,
             expected=task.expects_text(self.name),
             rubric=task.expects_text(self.name),
             tool_calls=calls,
             tool_results=results,
+            transcript=trial.transcript,
         )
 
         try:

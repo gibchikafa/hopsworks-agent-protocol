@@ -5,6 +5,8 @@ one comparison; the ways a run can produce results that *look* valid and are
 not are the reason this component exists.
 """
 
+import json
+
 import pytest
 
 from hopsworks_agent_eval.evaluators import (
@@ -181,10 +183,22 @@ class TestRefusals:
             )
 
     def test_refuses_task_types_it_cannot_run(self):
-        # rather than running the first turn of a multi-turn task and
-        # reporting a pass rate for it
-        with pytest.raises(SuiteRefused, match="multi_turn"):
-            go(FakeClient(), suite(tasks=[task(task_type="multi_turn")]))
+        with pytest.raises(SuiteRefused, match="handwritten"):
+            go(FakeClient(), suite(tasks=[task(task_type="handwritten")]))
+
+    def test_refuses_several_turns_typed_as_one(self):
+        # what this replaces: prompt returned the last user message, so a task
+        # like this ran its final turn alone and reported a pass rate for a
+        # conversation that never happened
+        script = json.dumps(
+            [{"role": "user", "content": "hello"},
+             {"role": "user", "content": "and again"}]
+        )
+        with pytest.raises(SuiteRefused, match="several user turns"):
+            go(
+                FakeClient(),
+                suite(tasks=[task(input_messages=script, task_type="single_turn")]),
+            )
 
 
 class TestCorrelation:

@@ -209,6 +209,21 @@ def _await_trace(
     return None, TraceStatus.MISSING
 
 
+#: Task shapes the runner can execute. A type outside this is refused rather
+#: than run as its nearest neighbour.
+TASK_TYPES = ("single_turn", "multi_turn")
+
+
+def _transcript(spoken: list[tuple[str, str]]) -> str:
+    """The exchange as text, for a judge to read.
+
+    Labelled by speaker and kept in order, because every conversation-level
+    question -- was this resolved, did it contradict itself, was it told this
+    already -- is a question about who said what and when.
+    """
+    return "\n\n".join(f"{who}: {text}" for who, text in spoken if text)
+
+
 def _run_trial(
     client: AgentClient,
     suite: Suite,
@@ -235,22 +250,61 @@ def _run_trial(
         trace_id=trace_id,
     )
 
-    try:
-        response = client.call(
-            task.prompt,
-            traceparent=_traceparent(trace_id, span_id),
-            baggage=_baggage(run_id, suite, task, trial_index, trial_id),
-            timeout_s=config.timeout_s,
-        )
-    except Exception as err:  # noqa: BLE001
-        trial.status = TrialStatus.INFRA_ERROR
-        trial.error_type = type(err).__name__
-        trial.error_message = str(err)
-        trial.completed_at = datetime.now(tz=timezone.utc)
-        return trial
+    turns = task.turns()
+    # One conversation for the whole script, so the agent's memory sees the
+    # turns as one exchange -- which is the thing a multi-turn suite is testing.
+    conversation_id = trial_id if len(turns) > 1 else None
+    if conversation_id:
+        trial.session_id = conversation_id
+    spoken: list[tuple[str, str]] = []
 
-    trial.final_output = response.text
-    trial.latency_ms = response.latency_ms
+    response = None
+    for turn_index, text in enumerate(turns):
+        # The trace of the last turn is the one the trajectory checks read: it
+        # is where the answer was produced. Earlier turns still emit their own,
+        # correlated by the conversation.
+        last = turn_index == len(turns) - 1
+        turn_trace, turn_span = (trace_id, span_id) if last else _new_ids()
+        # Only for a conversation. A single turn calls exactly as it always
+        # did, so an AgentClient written against the old signature -- the tests'
+        # stubs, and anyone else's -- keeps working.
+        threaded = {"conversation_id": conversation_id} if conversation_id else {}
+        try:
+            response = client.call(
+                text,
+                traceparent=_traceparent(turn_trace, turn_span),
+                baggage=_baggage(run_id, suite, task, trial_index, trial_id),
+                timeout_s=config.timeout_s,
+                **threaded,
+            )
+        except Exception as err:  # noqa: BLE001
+            trial.status = TrialStatus.INFRA_ERROR
+            trial.error_type = type(err).__name__
+            trial.error_message = str(err)
+            trial.transcript = _transcript(spoken)
+            trial.completed_at = datetime.now(tz=timezone.utc)
+            return trial
+
+        spoken.append(("user", text))
+        spoken.append(("agent", response.text))
+
+        # A turn that failed ends the conversation there. Sending the rest would
+        # be answering questions the agent never asked, and grading a transcript
+        # with a hole in it as though it were whole.
+        if not last and (response.error or not response.text):
+            trial.status = TrialStatus.FAILED
+            trial.error_message = (
+                response.error or f"no reply to turn {turn_index + 1} of {len(turns)}"
+            )
+            trial.transcript = _transcript(spoken)
+            trial.completed_at = datetime.now(tz=timezone.utc)
+            return trial
+
+    if len(turns) > 1:
+        trial.transcript = _transcript(spoken)
+
+    trial.final_output = response.text if response else ""
+    trial.latency_ms = response.latency_ms if response else 0.0
 
     failure = _classify(response, suite)
     if failure is TrialStatus.BLOCKED_BY_GUARDRAIL:
@@ -341,12 +395,22 @@ def run_suite(
     config = config or RunnerConfig()
     check_deployment_supports(suite, client.manifest())
 
-    unsupported = [t for t in suite.tasks if t.task_type != "single_turn"]
+    unsupported = [t for t in suite.tasks if t.task_type not in TASK_TYPES]
     if unsupported:
-        # v1 rejects what it cannot run rather than silently running the first
-        # turn of a multi-turn task and reporting a pass rate for it
         raise SuiteRefused(
             f"unsupported task types: {sorted({t.task_type for t in unsupported})}"
+        )
+    scripted = [
+        t for t in suite.tasks
+        if t.task_type == "single_turn" and len(t.turns()) > 1
+    ]
+    if scripted:
+        # The failure this replaces: prompt returned the last user message, so
+        # these ran their final turn alone and reported a pass rate for a
+        # conversation that never happened.
+        raise SuiteRefused(
+            "these tasks have several user turns but are typed single_turn: "
+            f"{sorted(t.task_id for t in scripted)}"
         )
 
     result = RunResult(run_id=run_id, suite_id=suite.suite_id, deployment_id=deployment_id)

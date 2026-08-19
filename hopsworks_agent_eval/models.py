@@ -111,21 +111,62 @@ class Task:
             )
         return self.expects_list(name), []
 
-    @property
-    def prompt(self) -> str:
-        """The user text to send. Tasks store a message array; the adapter
-        needs the text of the last user turn."""
+    def turns(self) -> list[str]:
+        """The user messages to send, in order.
+
+        A single-turn task has one. A multi-turn task is the same array with
+        several, sent one at a time with the agent's replies in between.
+
+        Assistant messages are not returned. A multi-turn task carries the
+        user's side only: interleaving replies would make [user, assistant,
+        user] ambiguous between a two-turn script and a one-turn script with
+        seeded history, and the two are graded differently. Seeding history is
+        a separate feature and gets its own field when it arrives.
+        """
         import json
 
         try:
             messages = json.loads(self.input_messages)
         except (ValueError, TypeError):
-            return self.input_messages
-        if isinstance(messages, list):
-            user = [m for m in messages if m.get("role") == "user"]
-            if user:
-                return str(user[-1].get("content", ""))
-        return ""
+            return [self.input_messages]
+        if not isinstance(messages, list):
+            return []
+        return [
+            str(m.get("content", ""))
+            for m in messages
+            if isinstance(m, dict) and m.get("role") == "user"
+        ]
+
+    @property
+    def asked(self) -> str:
+        """What the user said, for a judge to read as the question.
+
+        Every turn for a multi-turn task, because "the question" is the whole
+        script when there are several. Never raises: a judge reporting a
+        conversation ungradable because it has more than one turn would blame
+        the agent for the format.
+        """
+        turns = self.turns()
+        if len(turns) <= 1:
+            return turns[0] if turns else ""
+        return "\n".join(f"{i + 1}. {turn}" for i, turn in enumerate(turns))
+
+    @property
+    def prompt(self) -> str:
+        """The single user message to send.
+
+        Only meaningful for a single-turn task, and it says so: this used to
+        return the *last* user message of whatever it was given, so a task with
+        three turns sent the third, ran cleanly, and produced a pass rate for a
+        conversation that never happened.
+        """
+        turns = self.turns()
+        if len(turns) > 1:
+            raise ValueError(
+                f"task {self.task_id} has {len(turns)} user turns; use turns() "
+                "and run them in order"
+            )
+        return turns[0] if turns else ""
 
 
 class PassPolicy(str, Enum):
@@ -198,6 +239,13 @@ class Trial:
     trial_index: int
     deployment_id: int
     trace_id: str = ""
+    #: The conversation every turn of this trial shared, for a multi-turn task.
+    #: Empty for a single turn, which is a conversation of one and has nothing
+    #: the trace id does not already say.
+    session_id: str = ""
+    #: The exchange as text, when there was more than one turn. What a judge
+    #: reads to grade the conversation rather than its last answer.
+    transcript: str = ""
     trace_status: TraceStatus = TraceStatus.MISSING
     status: TrialStatus = TrialStatus.FAILED
     final_output: str = ""

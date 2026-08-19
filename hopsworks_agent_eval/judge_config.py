@@ -441,9 +441,15 @@ Reply with JSON only, no prose:
 
 def render_prompt(config: JudgeConfig, *, question: str, answer: str,
                   expected: str = "", rubric: str = "", tool_calls: str = "",
-                  tool_results: str = "") -> str:
+                  tool_results: str = "", transcript: str = "") -> str:
     """The prompt for one trial, showing only what `inputs` allows."""
     sections = []
+    if transcript:
+        # Not behind an `inputs` flag: a transcript exists only for a task that
+        # had several turns, and a judge grading one of those without seeing the
+        # conversation is grading the last answer and calling it the whole
+        # exchange. There is nothing to opt out of.
+        sections.append(f"\n<conversation>\n{transcript}\n</conversation>\n")
     if "expected_result" in config.inputs and expected:
         sections.append(f"\n<expected>\n{expected}\n</expected>\n")
     if "rubric" in config.inputs and rubric:
@@ -462,7 +468,7 @@ def render_prompt(config: JudgeConfig, *, question: str, answer: str,
         return config.prompt_template.format(
             question=question, answer=answer, expected=expected, rubric=rubric,
             tool_calls=tool_calls, tool_results=tool_results, context=context,
-            criteria=_criteria_block(config),
+            transcript=transcript, criteria=_criteria_block(config),
             score_min=_number(config.score_min),
             score_max=_number(config.score_max),
             output_shape=_output_shape(config),

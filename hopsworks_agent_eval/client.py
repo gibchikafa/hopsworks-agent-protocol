@@ -97,16 +97,22 @@ class HopsworksAgentClient:
         return self._manifest
 
     def call(
-        self, prompt: str, *, traceparent: str, baggage: str, timeout_s: float
+        self, prompt: str, *, traceparent: str, baggage: str, timeout_s: float,
+        conversation_id: str | None = None,
     ) -> AgentResponse:
         import time
 
         # The payload is the hopsworks-agent protocol's, taken from the manifest
         # rather than configured per deployment: the SDK exists precisely so
         # every agent speaks one wire format regardless of its framework.
-        payload = {
+        payload: dict = {
             "message": {"role": "user", "content": [{"type": "text", "text": prompt}]}
         }
+        # Threaded so the agent's own memory sees the turns as one conversation.
+        # Without it every turn is a first turn, and a suite testing whether the
+        # agent remembers what it was told would be testing nothing.
+        if conversation_id:
+            payload["conversation_id"] = conversation_id
         started = time.monotonic()
         try:
             response = self._session.post(
