@@ -11,7 +11,10 @@ from fastapi.testclient import TestClient
 from hopsworks_agent_protocol import AgentApp
 from hopsworks_agent_protocol import conventions
 from hopsworks_agent_protocol.context import HandlerContext
-from hopsworks_agent_protocol.identity import ConversationSubjectIndex
+from hopsworks_agent_protocol.identity import (
+    SUBJECTS_TABLE,
+    ConversationSubjectIndex,
+)
 from hopsworks_agent_protocol.models import ChatRequest
 
 
@@ -200,6 +203,26 @@ class TestUserIdSpanAttribute:
         assert conventions.USER_ID not in attributes
 
 
+class TestTheTableItAddresses:
+    def test_the_table_carries_the_feature_group_version(self):
+        # A feature group named X at version N is an online table named X_N.
+        # Writing to the bare name found nothing, and reported "does not exist
+        # in this project" while the feature group sat there in the UI.
+        from hopsworks_agent_protocol.identity import SUBJECTS_FG
+        from hopsworks_agent_protocol.memory import FEATURE_GROUP_VERSION
+
+        assert SUBJECTS_TABLE == f"{SUBJECTS_FG}_{FEATURE_GROUP_VERSION}"
+        assert SUBJECTS_TABLE != SUBJECTS_FG
+
+    def test_it_is_versioned_the_same_way_the_memory_tables_are(self):
+        # one convention, so a reader who has seen ITEMS_TABLE knows this one
+        from hopsworks_agent_protocol.memory import ITEMS_TABLE, MESSAGES_FG
+
+        assert ITEMS_TABLE.removeprefix(MESSAGES_FG) == SUBJECTS_TABLE.removeprefix(
+            "agent_conversation_subjects"
+        )
+
+
 class TestIndexIsBestEffort:
     def test_a_missing_table_is_not_asked_about_every_turn(self, caplog):
         index = ConversationSubjectIndex(
@@ -234,7 +257,7 @@ class TestIndexIsBestEffort:
 
         metadata = MetaData()
         Table(
-            "agent_conversation_subjects",
+            SUBJECTS_TABLE,
             metadata,
             Column("deployment_id", BigInteger, primary_key=True),
             Column("conversation_id", String(255), primary_key=True),
@@ -286,7 +309,7 @@ class TestTheRowItself:
         url = f"sqlite:///{tmp_path}/subjects.db"
         metadata = MetaData()
         Table(
-            "agent_conversation_subjects",
+            SUBJECTS_TABLE,
             metadata,
             Column("deployment_id", BigInteger, primary_key=True),
             Column("conversation_id", String(255), primary_key=True),
@@ -304,7 +327,7 @@ class TestTheRowItself:
             return conn.execute(
                 text(
                     "SELECT deployment_id, conversation_id, subject, "
-                    "subject_source FROM agent_conversation_subjects"
+                    f"subject_source FROM {SUBJECTS_TABLE}"
                 )
             ).fetchall()
 

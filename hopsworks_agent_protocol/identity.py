@@ -24,11 +24,19 @@ import threading
 import time
 from datetime import datetime, timezone
 
+from .memory import FEATURE_GROUP_VERSION
+
 log = logging.getLogger(__name__)
 
 #: The feature group the platform provisions. Name must match
 #: TracingStoreFacade.AGENT_CONVERSATION_SUBJECTS.
-SUBJECTS_TABLE = "agent_conversation_subjects"
+SUBJECTS_FG = "agent_conversation_subjects"
+
+#: The table that feature group becomes online, which carries its version. A
+#: feature group named X at version N is a table named X_N -- writing to the
+#: bare name finds nothing, which is what "does not exist in this project" meant
+#: while the feature group was sitting there in the UI.
+SUBJECTS_TABLE = f"{SUBJECTS_FG}_{FEATURE_GROUP_VERSION}"
 
 #: Where a subject came from. Stored beside it because a subject is a claim,
 #: not a verified identity, and a reader shown one without the other is being
