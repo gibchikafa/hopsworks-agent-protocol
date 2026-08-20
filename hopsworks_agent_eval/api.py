@@ -304,6 +304,35 @@ class EvalApi:
 
     # ── the evaluator library ───────────────────────────────────────────────
 
+    def install_default_evaluators(self, overwrite: bool = False) -> list[str]:
+        """Put the built-in evaluators in this project's library.
+
+        Hallucination, user frustration, toxicity, profanity, bias -- the checks
+        every agent wants and nobody enjoys writing twice. They are saved as
+        ordinary library entries rather than kept as a special kind, so a project
+        can rename them, retune their weights, or delete the ones it does not
+        want, and a suite copies them in exactly as it copies anything else.
+
+        Existing entries are left alone unless ``overwrite``: re-running this
+        must not quietly undo a project's tuning.
+
+        Returns the names it wrote.
+        """
+        from .judge_config import default_templates
+
+        existing = {entry["name"] for entry in self.evaluators()}
+        written = []
+        for template in default_templates():
+            if template["name"] in existing and not overwrite:
+                continue
+            self.save_evaluator(
+                template["name"],
+                json.loads(template["spec"]),
+                template.get("description", ""),
+            )
+            written.append(template["name"])
+        return written
+
     def save_evaluator(self, name: str, checks: list[dict[str, Any]],
                        description: str = "") -> dict[str, Any]:
         """Save a named set of checks for reuse across suites.
