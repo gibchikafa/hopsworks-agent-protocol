@@ -201,7 +201,7 @@ class TestUserIdSpanAttribute:
 
 
 class TestIndexIsBestEffort:
-    def test_a_missing_table_is_logged_once_and_never_raises(self, caplog):
+    def test_a_missing_table_is_not_asked_about_every_turn(self, caplog):
         index = ConversationSubjectIndex(
             url="sqlite:///:memory:", deployment_id="1"
         )
@@ -209,10 +209,48 @@ class TestIndexIsBestEffort:
         assert index.record("c1", "cust-1", "model") is False
         assert index.record("c2", "cust-2", "model") is False
 
-        # a missing table is permanent; warning per conversation would bury the
+        # backed off rather than asked per conversation, which would bury the
         # warning it is trying to raise
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 1
+
+    def test_a_table_created_after_the_process_started_is_picked_up(self, tmp_path):
+        # what actually happened: the platform creates the table during the same
+        # deployment start that brings the pod up, so the first turn can arrive
+        # before it exists. Latching meant the process never looked again.
+        from sqlalchemy import (
+            BigInteger,
+            Column,
+            DateTime,
+            MetaData,
+            String,
+            Table,
+            create_engine,
+        )
+
+        url = f"sqlite:///{tmp_path}/late.db"
+        index = ConversationSubjectIndex(url=url, deployment_id="1")
+        assert index.record("c1", "cust-1", "model") is False
+
+        metadata = MetaData()
+        Table(
+            "agent_conversation_subjects",
+            metadata,
+            Column("deployment_id", BigInteger, primary_key=True),
+            Column("conversation_id", String(255), primary_key=True),
+            Column("subject", String(255)),
+            Column("subject_source", String(16)),
+            Column("updated_at", DateTime, nullable=False),
+        )
+        metadata.create_all(create_engine(url))
+
+        # The wait has to be a wait, not a latch: this is what the failure was.
+        import time as _time
+
+        assert index._retry_after - _time.monotonic() <= 60
+
+        index._retry_after = 0.0  # that wait, elapsed
+        assert index.record("c1", "cust-1", "model") is True
 
     def test_a_non_numeric_deployment_id_is_refused_not_coerced(self):
         index = ConversationSubjectIndex(

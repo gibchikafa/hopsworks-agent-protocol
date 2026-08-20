@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
@@ -54,10 +55,14 @@ class ConversationSubjectIndex:
         self._engine = None
         self._table = None
         self._lock = threading.Lock()
-        # one warning per process, not one per turn: a missing table is a
-        # permanent condition and logging it per conversation would bury the
-        # log it is trying to draw attention to
-        self._unavailable = False
+        # Retryable, not sticky. The table is created by the platform during the
+        # same deployment start that brings this pod up, so a first turn can
+        # genuinely arrive before it exists -- and latching meant the process
+        # never looked again, leaving traces unattributed until someone
+        # restarted it for reasons they could not have guessed. Backoff so a
+        # table that really is absent is not asked about once per turn.
+        self._retry_after = 0.0
+        self._backoff = 1.0
 
     def record(self, conversation_id: str, subject: str, source: str) -> bool:
         """Attribute a conversation to a subject. Returns whether a row landed.
@@ -107,13 +112,15 @@ class ConversationSubjectIndex:
             return False
 
     def _ensure_table(self):
-        if self._unavailable:
-            return None
         if self._table is not None:
             return self._table
+        if time.monotonic() < self._retry_after:
+            return None
         with self._lock:
             if self._table is not None:
                 return self._table
+            if time.monotonic() < self._retry_after:
+                return None
             try:
                 from sqlalchemy import (
                     Column,
@@ -161,11 +168,15 @@ class ConversationSubjectIndex:
                 )
                 return self._table
             except Exception:  # noqa: BLE001
-                self._unavailable = True
+                self._engine = None
+                self._retry_after = time.monotonic() + self._backoff
+                self._backoff = min(self._backoff * 2, 300.0)
                 log.warning(
                     "Conversation subjects are not being recorded (%s is "
-                    "unavailable); traces will show no subject",
+                    "unavailable); retrying in %.0fs, traces show no subject "
+                    "until then",
                     SUBJECTS_TABLE,
+                    self._backoff,
                     exc_info=True,
                 )
                 return None
