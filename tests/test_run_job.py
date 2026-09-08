@@ -147,15 +147,37 @@ class TestWritingResultsMatchesTheSchema:
         )
         assert str(frame["deployment_id"].dtype) == "int64"
 
-    def test_a_column_with_nulls_is_left_alone(self):
-        # pandas cannot hold a null in a plain integer type, and refusing the whole
-        # write over one absent value would be worse
+    def test_a_column_with_nulls_gets_the_nullable_form_of_its_type(self):
+        # pandas cannot hold a null in a plain integer type; the nullable one
+        # keeps the declared width and the hole
         from hopsworks_agent_eval.run_job import _match_schema
 
         frame = _match_schema(
             self.group(input_tokens="bigint"), self.frame(input_tokens=[1, None])
         )
-        assert frame["input_tokens"].isna().any()
+        assert str(frame["input_tokens"].dtype) == "Int64"
+        assert frame["input_tokens"].isna().sum() == 1
+
+    def test_an_all_null_column_is_typed_rather_than_left_as_null(self):
+        # The case that lost a failed run's record: no trial got a trace, so
+        # trace_id was None in every row, Arrow inferred `null`, and Delta refused
+        # the write with "Invalid data type for Delta Lake: Null".
+        import pytest
+
+        pa = pytest.importorskip("pyarrow")  # what hsfs hands the frame to
+        from hopsworks_agent_eval.run_job import _match_schema
+
+        frame = _match_schema(
+            self.group(trace_id="string", latency_ms="double", passed="boolean"),
+            self.frame(trace_id=[None, None], latency_ms=[None, None], passed=[None, None]),
+        )
+        table = pa.Table.from_pandas(frame, preserve_index=False)
+        assert not any(pa.types.is_null(field.type) for field in table.schema)
+        assert pa.types.is_string(table.schema.field("trace_id").type) or pa.types.is_large_string(
+            table.schema.field("trace_id").type
+        )
+        assert pa.types.is_float64(table.schema.field("latency_ms").type)
+        assert pa.types.is_boolean(table.schema.field("passed").type)
 
     def test_a_column_the_frame_does_not_have_is_not_invented(self):
         from hopsworks_agent_eval.run_job import _match_schema

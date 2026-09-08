@@ -228,45 +228,53 @@ def _write_results(feature_store: Any, result: Any, run: dict[str, Any],
         log.info("wrote %d rows to %s", len(rows), name)
 
 
-# What pandas infers, against what a feature group declares.
+# What pandas infers, against what a feature group declares. Two dtypes per
+# type: the plain one, and the nullable one for a column with a hole in it.
 _FEATURE_TYPES = {
-    "int": "int32",
-    "bigint": "int64",
-    "smallint": "int16",
-    "tinyint": "int8",
-    "float": "float32",
-    "double": "float64",
+    "int": ("int32", "Int32"),
+    "bigint": ("int64", "Int64"),
+    "smallint": ("int16", "Int16"),
+    "tinyint": ("int8", "Int8"),
+    "float": ("float32", "Float32"),
+    "double": ("float64", "Float64"),
+    "boolean": ("bool", "boolean"),
+    "string": ("string", "string"),
 }
 
 
 def _match_schema(group: Any, frame: Any) -> Any:
-    """Widths as the feature group declares them, not as pandas guessed.
+    """Types as the feature group declares them, not as pandas guessed.
 
-    Python has one integer type and pandas reads it as int64, so a column the
-    feature group declares `int` arrives as `bigint` and the insert is refused
-    before a single row is written — after the whole suite has run, which is the
-    most expensive moment to discover it.
+    Two guesses go wrong. Python has one integer type and pandas reads it as
+    int64, so a column the feature group declares `int` arrives as `bigint` and
+    the insert is refused. And a column that is None in every row — trace_id
+    when no trial got a trace, error_message when none failed — has no type at
+    all: pandas keeps it as object, Arrow infers `null`, and Delta refuses a
+    null-typed column outright. Both refusals come after the whole suite has
+    run, which is the most expensive moment to discover them; the second also
+    arrives exactly when a run has already failed, and takes the record of
+    that failure with it.
 
     Read off the group rather than a list of column names here: the schema is
     defined in the backend, and a list kept in this file would be a copy that
     drifts the first time a column is added there.
 
-    A column carrying nulls is left alone: pandas cannot hold those in a plain
-    integer type, and refusing the whole write over one absent value would be
-    worse than letting the feature store say what it makes of it.
+    A column with nulls gets the nullable form of its type — pandas' `Int32`
+    rather than `int32` — which Arrow carries as the declared type with nulls
+    instead of as `null`.
     """
     for feature in getattr(group, "features", None) or []:
-        target = _FEATURE_TYPES.get((getattr(feature, "type", "") or "").lower())
+        dtypes = _FEATURE_TYPES.get((getattr(feature, "type", "") or "").lower())
         name = getattr(feature, "name", None)
-        if not target or name not in frame.columns:
+        if not dtypes or name not in frame.columns:
             continue
-        if frame[name].isna().any():
-            continue
+        plain, nullable = dtypes
+        target = nullable if frame[name].isna().any() else plain
         try:
             frame[name] = frame[name].astype(target)
         except (TypeError, ValueError):
-            # Not a number at all; the feature store's own error will be clearer
-            # than one invented here.
+            # Not what the schema says at all; the feature store's own error
+            # will be clearer than one invented here.
             log.debug("left %s as %s", name, frame[name].dtype)
     return frame
 
