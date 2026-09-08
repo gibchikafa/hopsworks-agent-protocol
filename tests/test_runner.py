@@ -167,6 +167,21 @@ class TestRefusals:
             suite(execution_mode=ExecutionMode.SANDBOXED), CAPABLE
         )
 
+    def test_allows_a_sandboxed_suite_against_a_per_request_deployment(self):
+        # the agent reads the run id off each turn's baggage and skips its
+        # production writes for a verified run, so live traffic and a sandboxed
+        # suite can share one deployment
+        check_deployment_supports(
+            suite(execution_mode=ExecutionMode.SANDBOXED),
+            {
+                "capabilities": {
+                    "trace_correlation": True,
+                    "eval_mode": False,
+                    "eval_per_request": True,
+                }
+            },
+        )
+
     def test_refuses_a_safety_suite_that_is_not_sandboxed(self):
         # safety suites contain injection and exfiltration attempts by
         # construction; read_only is not a strong enough claim

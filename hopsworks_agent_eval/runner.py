@@ -121,10 +121,16 @@ def check_deployment_supports(suite: Suite, manifest: dict[str, Any]) -> None:
             "correlated to a trace"
         )
 
-    if suite.execution_mode is ExecutionMode.SANDBOXED and not capabilities.get("eval_mode"):
+    # Either declaration will do. eval_mode is the whole deployment; eval_per_request
+    # is the agent promising to read the hopsworks.eval.* baggage on each turn and
+    # skip its production side effects for a verified run. Both are the author's
+    # word — the runner can verify neither — so they are trusted alike.
+    sandboxed_ok = capabilities.get("eval_mode") or capabilities.get("eval_per_request")
+    if suite.execution_mode is ExecutionMode.SANDBOXED and not sandboxed_ok:
         raise SuiteRefused(
-            f"suite {suite.suite_id} is sandboxed but the deployment does not "
-            "report eval_mode: its tools may still reach production systems"
+            f"suite {suite.suite_id} is sandboxed but the deployment reports neither "
+            "eval_mode nor eval_per_request: its tools may still reach production "
+            "systems"
         )
     if suite.blocks_are_success and suite.execution_mode is not ExecutionMode.SANDBOXED:
         raise SuiteRefused(

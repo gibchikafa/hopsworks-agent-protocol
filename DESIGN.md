@@ -77,6 +77,8 @@ Three things follow, and none of them work without it:
 
 The manifest reports `capabilities.trace_correlation` and `capabilities.eval_mode` so a runner can check a deployment *before* firing a suite at it instead of inferring from broken results — absent means an SDK too old to correlate at all.
 
+`capabilities.eval_per_request` is the finer-grained alternative to `eval_mode`: the agent declares (`AgentApp(eval_per_request=True)`) that its tools consult `evaluation.in_evaluation()` before a production side effect, and the SDK turns that on for a turn whose `hopsworks.eval.run_id` baggage names a run Hopsworks confirms exists and targets this deployment. The verification is the point — the baggage is caller-controlled, and an unverified header could make the agent tell a customer their order is recorded while recording nothing. A trial that cannot be verified is refused (403 `eval_unverified`) rather than run as production traffic. `EVAL_MODE` still wins: under it every turn is an evaluation and nothing is verified. The runner accepts a sandboxed suite against either declaration; it can verify neither, so both are the author's word.
+
 Attribute names live in `conventions.py`, which is deliberately dependency-free so the sidecar and the eval runner can import it. Three components agreeing on string literals by copy-paste is how they stop agreeing.
 
 This makes it *possible* for a separate evaluation system to join chat turns, feedback, and traces — but feedback/ratings/scores are deliberately **not** in the SDK (see non-goals). The SDK's job ends at emitting correlatable ids.

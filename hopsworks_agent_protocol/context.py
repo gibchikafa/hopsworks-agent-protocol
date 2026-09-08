@@ -20,6 +20,7 @@ from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .evaluation import EvalTrial
     from .memory import ChatMemory, Turn
     from .models import ChatRequest
 
@@ -64,6 +65,13 @@ class HandlerContext:
         # traced back to that customer's conversations. None when the app did
         # not configure one; every use tolerates that.
         self._subjects = subjects
+        # The evaluation trial this turn belongs to, when it is one: set by
+        # AgentApp from the request's baggage, after verifying the run with
+        # Hopsworks (or without verifying, under EVAL_MODE, where the whole
+        # deployment is an evaluation). None means this is a customer's turn,
+        # or a deployment that did not declare eval_per_request. Tools, which
+        # get no context, ask hopsworks_agent_protocol.evaluation.in_evaluation().
+        self.evaluation: "EvalTrial | None" = None
         # turn lifecycle bookkeeping, owned by AgentApp
         self._turn_open = False
         self._next_seq = 1

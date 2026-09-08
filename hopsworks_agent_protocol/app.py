@@ -23,12 +23,14 @@ import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import conventions
 from .context import HandlerContext
+from .evaluation import RunVerifier, env_eval_mode, parse_baggage
+from .evaluation import active as eval_active
 from .models import (
     PROTOCOL,
     PROTOCOL_VERSION,
@@ -83,6 +85,7 @@ class AgentApp(FastAPI):
         tool_events: bool = False,
         graph: Any = None,
         allow_cors: bool = True,
+        eval_per_request: bool = False,
         **fastapi_kwargs: Any,
     ):
         super().__init__(title=name, description=description, **fastapi_kwargs)
@@ -119,9 +122,16 @@ class AgentApp(FastAPI):
         # platform-injected when the deployment runs with tools mocked or
         # pointed at scratch resources; reported in the manifest so an eval
         # runner can verify it rather than trust a naming convention
-        self._eval_mode = os.environ.get(
-            conventions.EVAL_MODE_ENV, ""
-        ).strip().lower() in ("1", "true", "yes")
+        self._eval_mode = env_eval_mode()
+        # The agent's declaration that its tools consult
+        # evaluation.in_evaluation() per turn, so one deployment can serve
+        # customers and be evaluated at once. Only the author can make that
+        # promise, hence an argument and not a default. Irrelevant under
+        # EVAL_MODE, which makes every turn an evaluation regardless.
+        self._eval_per_request = eval_per_request
+        # Verifies a claimed run with Hopsworks before a turn is treated as an
+        # evaluation; see evaluation.py for why a bare header is not enough.
+        self._eval_verifier = RunVerifier()
         # tracing: None auto-detects from the platform-injected OTLP endpoint
         # env var (set iff tracing is enabled on the deployment)
         self.tracer_provider = setup_tracing(self.framework, enabled=tracing)
@@ -283,6 +293,12 @@ class AgentApp(FastAPI):
                 # of injection and exfiltration attempts — at a deployment
                 # whose tools can still mutate production systems.
                 "eval_mode": self._eval_mode,
+                # This agent reads hopsworks.eval.* baggage and skips its
+                # production side effects for a turn that belongs to a
+                # verified run — so a sandboxed suite may be fired at it even
+                # while it serves real traffic. The runner accepts either this
+                # or eval_mode.
+                "eval_per_request": self._eval_per_request,
             },
             "ui": {
                 "welcome_message": self._welcome_message,
@@ -348,6 +364,40 @@ class AgentApp(FastAPI):
             subject=getattr(request, "subject", None),
             subjects=self._subjects,
         )
+
+    async def _attach_evaluation(
+        self, ctx: HandlerContext, headers: Any
+    ) -> AgentError | None:
+        """Decide whether this turn is an evaluation, from the request's baggage.
+
+        Returns the refusal to send, or None to proceed. Called before the turn
+        opens, so a refused trial records nothing — not even the question.
+
+        The environment wins: under EVAL_MODE every turn is already an
+        evaluation and the ids are kept only so ctx.evaluation can say which.
+        Otherwise the baggage counts only if the app declared eval_per_request
+        (an agent that never said its tools check would run them for real) and
+        the run checks out with Hopsworks (a header anyone can send must not
+        be enough to make the agent claim success while doing nothing).
+        """
+        trial = parse_baggage(headers)
+        if trial is None:
+            return None
+        if self._eval_mode:
+            ctx.evaluation = trial
+            return None
+        if not self._eval_per_request:
+            return None
+        if not await asyncio.to_thread(self._eval_verifier.verify, trial):
+            return AgentError(
+                f"Evaluation run {trial.run_id} could not be verified with "
+                "Hopsworks, so this turn was not run: an unverified trial would "
+                "either reach production systems or misreport what it did.",
+                "eval_unverified",
+                403,
+            )
+        ctx.evaluation = trial
+        return None
 
     async def _open_turn(self, ctx: HandlerContext) -> None:
         """Record the user message and open the turn, before the handler runs.
@@ -562,9 +612,12 @@ class AgentApp(FastAPI):
                     AgentError("No chat handler registered.", "not_implemented", 501)
                 )
             ctx = self._prepare(request)
+            refused = await self._attach_evaluation(ctx, raw.headers)
+            if refused is not None:
+                return _error_response(refused)
             await self._open_turn(ctx)
             response: ChatResponse | None = None
-            with turn_span(
+            with eval_active(ctx.evaluation), turn_span(
                 self.tracer_provider,
                 name=self._turn_span_name(),
                 headers=raw.headers,
@@ -583,8 +636,11 @@ class AgentApp(FastAPI):
             return JSONResponse(response.model_dump())
 
         @self.post("/v1/chat/stream")
-        async def stream_route(request: ChatRequest, raw: Request) -> StreamingResponse:
+        async def stream_route(request: ChatRequest, raw: Request) -> Response:
             ctx = self._prepare(request)
+            refused = await self._attach_evaluation(ctx, raw.headers)
+            if refused is not None:
+                return _error_response(refused)
             await self._open_turn(ctx)
             return StreamingResponse(
                 self._stream_events(ctx, raw), media_type="text/event-stream"
@@ -722,7 +778,11 @@ class AgentApp(FastAPI):
         # mirror-image reason: the route returns as soon as the
         # StreamingResponse is constructed, so a span opened there would
         # close before the first token.
-        with turn_span(
+        #
+        # The evaluation flag is activated here too, and for the same reason:
+        # the pump task below is created inside this frame and inherits the
+        # context, so tools running under the handler see in_evaluation().
+        with eval_active(ctx.evaluation), turn_span(
             self.tracer_provider,
             name=self._turn_span_name(),
             headers=raw.headers,
