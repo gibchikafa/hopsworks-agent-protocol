@@ -248,13 +248,19 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self, summaries, details):
+    def __init__(self, summaries, details, sessions=None):
         self._summaries = summaries
         self._details = details
+        # session id -> the traces the session endpoint would list, any order
+        self._sessions = sessions or {}
+        self.session_fetches = 0
 
     def get(self, url, params=None, timeout=None):
         if url.endswith("/traces"):
             return FakeResponse({"items": self._summaries})
+        if "/traces/sessions/" in url:
+            self.session_fetches += 1
+            return FakeResponse({"items": self._sessions.get(url.rsplit("/", 1)[-1], [])})
         return FakeResponse(self._details[url.rsplit("/", 1)[-1]])
 
 
@@ -363,3 +369,105 @@ class TestWhereTheNextRunStarts:
 
         end = ms(0)
         assert graded_through([], end) == end
+
+
+def turn(trace_id: str, start_ns: int, question: str, answer: str, session_id: str = "s1") -> dict:
+    """A trace as the session endpoint lists it: the root span with its messages."""
+    return {
+        "traceId": trace_id,
+        "sessionId": session_id,
+        "startTimeNs": start_ns,
+        "messages": json.dumps([
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": answer},
+        ]),
+    }
+
+
+class TestTheConversationSoFar:
+    """A judge asked about hallucination, relevance or frustration cannot answer
+    from one turn: "as I said, you own it" is a fact or an invention depending on
+    the turn before. Live traffic has no task to carry that, but every trace
+    names its session."""
+
+    def graded(self, graded_start_ns: int, session_turns: list[dict], judge=None,
+               session_id: str = "s1"):
+        judge = judge or StubJudge()
+        summary_row = {**summary("g", 1), "sessionId": session_id, "startTimeNs": graded_start_ns}
+        session = FakeSession([summary_row], {"g": detail("Do I own any of them?", "Yes, two.")},
+                              {session_id: session_turns})
+        result = run_sample(FakeClient(), session, "https://h", 1, sample_run(), with_judge(judge))
+        return result, judge, session
+
+    def test_earlier_turns_reach_the_judge_in_order(self):
+        result, judge, _ = self.graded(300, [
+            turn("t2", 200, "Aaron Mitchell, +1 (204) 452-6452", "Thanks, Aaron."),
+            turn("t1", 100, "What albums do you have by Queen?", "Three: ..."),
+        ])
+        prompt = judge.prompts[0]
+        assert "<conversation>" in prompt
+        # the block holds the whole exchange, oldest first, ending with the graded
+        # turn; the prompt's own <question> and <agent_answer> repeat that turn
+        block = prompt[prompt.index("<conversation>"):prompt.index("</conversation>")]
+        assert block.index("What albums do you have by Queen?") < block.index("Aaron Mitchell")
+        assert block.index("Aaron Mitchell") < block.index("Do I own any of them?")
+        assert block.index("Do I own any of them?") < block.index("Yes, two.")
+        assert result.trials[0].transcript.startswith("user: What albums")
+
+    def test_the_future_is_not_shown(self):
+        # a turn that came after the graded one is part of the same session, and
+        # a judge shown it would be grading with knowledge the agent did not have
+        _, judge, _ = self.graded(300, [
+            turn("t1", 100, "Which AC/DC albums?", "Let There Be Rock, ..."),
+            turn("t4", 400, "Order it then", "Recorded."),
+        ])
+        assert "Which AC/DC albums?" in judge.prompts[0]
+        assert "Order it then" not in judge.prompts[0]
+
+    def test_a_first_turn_has_no_conversation_block(self):
+        result, judge, _ = self.graded(100, [turn("later", 200, "x", "y")])
+        assert "<conversation>" not in judge.prompts[0]
+        assert result.trials[0].transcript == ""
+
+    def test_a_trace_with_no_session_grades_alone(self):
+        result, judge, session = self.graded(300, [turn("t1", 100, "x", "y")], session_id="")
+        assert "<conversation>" not in judge.prompts[0]
+        assert session.session_fetches == 0
+
+    def test_only_the_last_turns_of_a_long_conversation_are_shown(self):
+        from hopsworks_agent_eval.sample_job import CONTEXT_TURNS
+
+        turns = [turn(f"t{i}", i * 10, f"question {i}", f"answer {i}")
+                 for i in range(1, CONTEXT_TURNS + 6)]
+        _, judge, _ = self.graded(10_000, turns)
+        assert "question 1 " not in judge.prompts[0] and "question 1\n" not in judge.prompts[0]
+        assert f"question {CONTEXT_TURNS + 5}" in judge.prompts[0]
+        assert f"question {6}" in judge.prompts[0]
+
+    def test_a_session_is_fetched_once_per_run(self):
+        judge = StubJudge()
+        rows = [{**summary(f"g{i}", 1), "sessionId": "s1", "startTimeNs": 300 + i}
+                for i in range(3)]
+        session = FakeSession(rows, {f"g{i}": detail() for i in range(3)},
+                              {"s1": [turn("t1", 100, "x", "y")]})
+        run_sample(FakeClient(), session, "https://h", 1, sample_run(), with_judge(judge))
+        assert session.session_fetches == 1
+        assert len(judge.prompts) == 3
+
+    def test_an_unreadable_session_grades_without_context_rather_than_not_at_all(self):
+        class Broken(FakeSession):
+            def get(self, url, params=None, timeout=None):
+                if "/traces/sessions/" in url:
+                    raise RuntimeError("down")
+                return super().get(url, params, timeout)
+
+        judge = StubJudge()
+        row = {**summary("g", 1), "sessionId": "s1", "startTimeNs": 300}
+        session = Broken([row], {"g": detail()}, {})
+        result = run_sample(FakeClient(), session, "https://h", 1, sample_run(), with_judge(judge))
+        assert len(result.trials) == 1
+        assert "<conversation>" not in judge.prompts[0]
+
+    def test_the_trial_records_its_session(self):
+        result, _, _ = self.graded(300, [])
+        assert result.trials[0].session_id == "s1"

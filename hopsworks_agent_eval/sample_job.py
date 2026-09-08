@@ -37,13 +37,21 @@ from typing import Any, Sequence
 
 from .evaluators import Evaluator, NoToolErrorEvaluator, Trace, verdict
 from .models import PassPolicy, Task, TraceStatus, Trial, TrialStatus
-from .runner import RunResult
+from .runner import RunResult, _transcript
 
 log = logging.getLogger(__name__)
 
 #: How many trace summaries to pull before sampling. The window filter is
 #: applied client-side, so this bounds the read rather than the sample.
 LISTING_LIMIT = 500
+#: How many earlier turns of the same conversation a judge is shown. Enough
+#: that "you already told me" is checkable; bounded so a support chat that has
+#: run all afternoon does not arrive as the whole afternoon.
+CONTEXT_TURNS = 20
+#: How many of a session's traces to ask for when reconstructing the turns before
+#: the graded one. Newest first from the server, so the page has to cover the
+#: turns after the graded one too before it reaches the ones before it.
+SESSION_PAGE = 100
 
 
 def evaluators_for(run: dict[str, Any], judge_completer: Any = None) -> list[Evaluator]:
@@ -110,25 +118,77 @@ def question_and_answer(detail: dict[str, Any]) -> tuple[str, str]:
     """
     for span in sorted(detail.get("spans") or [],
                        key=lambda s: s.get("startTimeNs") or 0):
-        raw = span.get("messages")
-        if not raw:
+        if not span.get("messages"):
             continue
-        try:
-            messages = json.loads(raw) if isinstance(raw, str) else raw
-        except (ValueError, TypeError):
-            continue
-        if not isinstance(messages, list):
-            continue
-        question = next(
-            (m.get("content", "") for m in messages if m.get("role") == "user"), ""
-        )
-        answer = ""
-        for message in messages:
-            if message.get("role") == "assistant" and message.get("content"):
-                answer = message["content"]
+        question, answer = turn_of(span.get("messages"))
         if question or answer:
-            return str(question), str(answer)
+            return question, answer
     return "", ""
+
+
+def turn_of(messages_raw: Any) -> tuple[str, str]:
+    """One trace's user question and final agent answer, from its messages."""
+    try:
+        messages = json.loads(messages_raw) if isinstance(messages_raw, str) else messages_raw
+    except (ValueError, TypeError):
+        return "", ""
+    if not isinstance(messages, list):
+        return "", ""
+    question = next(
+        (str(m.get("content", "")) for m in messages if m.get("role") == "user"), ""
+    )
+    answer = ""
+    for message in messages:
+        if message.get("role") == "assistant" and message.get("content"):
+            answer = str(message["content"])
+    return question, answer
+
+
+def started_ns(summary: dict[str, Any], detail: dict[str, Any]) -> int:
+    """When the graded turn began, for telling earlier turns from later ones."""
+    if summary.get("startTimeNs"):
+        return int(summary["startTimeNs"])
+    starts = [int(s.get("startTimeNs") or 0) for s in detail.get("spans") or []]
+    return min((t for t in starts if t), default=0)
+
+
+def conversation_before(session: Any, base: str, session_id: str, before_ns: int,
+                        cache: dict[str, list[dict[str, Any]]]) -> list[tuple[str, str]]:
+    """The turns of this conversation that came before the graded one, oldest first.
+
+    A judge asked whether an answer is hallucinated, relevant, or the third time
+    the user has said their name cannot tell from the turn alone; the earlier
+    turns are the reference. Live traffic has no task to carry them, but every
+    trace names its session, and the session's traces are one request away.
+
+    Only what came before: a judge shown a later turn would be grading with the
+    future. Fetched once per session per run, since a conversation with five
+    turns in the window would otherwise be fetched five times. A session that
+    cannot be read grades without context rather than not at all -- the log says
+    so, and the verdict is the one a single-turn judge would have given anyway.
+    """
+    if not session_id or not before_ns:
+        return []
+    if session_id not in cache:
+        try:
+            response = session.get(f"{base}/traces/sessions/{session_id}",
+                                   params={"limit": SESSION_PAGE}, timeout=60)
+            response.raise_for_status()
+            cache[session_id] = list(response.json().get("items") or [])
+        except Exception:  # noqa: BLE001 -- context is a help, not a requirement
+            log.exception("could not read session %s; grading its turns without "
+                          "the conversation", session_id)
+            cache[session_id] = []
+    earlier = sorted(
+        (t for t in cache[session_id]
+         if 0 < int(t.get("startTimeNs") or 0) < before_ns),
+        key=lambda t: int(t.get("startTimeNs") or 0),
+    )[-CONTEXT_TURNS:]
+    spoken: list[tuple[str, str]] = []
+    for turn in earlier:
+        question, answer = turn_of(turn.get("messages"))
+        spoken.extend((("user", question), ("agent", answer)))
+    return spoken
 
 
 def as_trial(run_id: str, deployment_id: int, trace_id: str, answer: str,
@@ -159,8 +219,16 @@ def as_trial(run_id: str, deployment_id: int, trace_id: str, answer: str,
 
 
 def grade_trace(evaluators: Sequence[Evaluator], run_id: str, deployment_id: int,
-                trace_id: str, detail: dict[str, Any], trace: Trace | None) -> Trial:
-    """One sampled trace, graded."""
+                trace_id: str, detail: dict[str, Any], trace: Trace | None,
+                earlier_turns: Sequence[tuple[str, str]] = (),
+                session_id: str = "") -> Trial:
+    """One sampled trace, graded.
+
+    `earlier_turns` is the conversation so far, oldest first; with it the judge
+    is shown the whole exchange up to and including this turn, the same way a
+    conversation task in a suite is graded. Without it -- a first turn, or a
+    trace with no session -- the judge sees the turn alone, which is all there is.
+    """
     from .evaluators import run_evaluators
 
     question, answer = question_and_answer(detail)
@@ -175,6 +243,11 @@ def grade_trace(evaluators: Sequence[Evaluator], run_id: str, deployment_id: int
         input_messages=json.dumps([{"role": "user", "content": question}]),
     )
     trial = as_trial(run_id, deployment_id, trace_id, answer, trace)
+    trial.session_id = session_id
+    if earlier_turns:
+        trial.transcript = _transcript(
+            [*earlier_turns, ("user", question), ("agent", answer)]
+        )
     trial.evaluator_results = list(run_evaluators(evaluators, task, trial, trace))
 
     # `all`, and not configurable: a sample has no suite to carry a pass policy,
@@ -247,6 +320,7 @@ def run_sample(client: Any, session: Any, api_base: str, project_id: int,
         log.info("grading %d traces in the window", len(sampled))
 
     trials = []
+    sessions: dict[str, list[dict[str, Any]]] = {}
     for summary in sampled:
         trace_id = summary.get("traceId")
         if not trace_id:
@@ -257,8 +331,13 @@ def run_sample(client: Any, session: Any, api_base: str, project_id: int,
         except Exception:  # noqa: BLE001 — one unreadable trace is not the run failing
             log.exception("could not read trace %s", trace_id)
             continue
+        session_id = str(summary.get("sessionId") or "")
+        earlier = conversation_before(
+            session, base, session_id, started_ns(summary, detail), sessions
+        )
         trials.append(
-            grade_trace(evaluators, run["runId"], deployment_id, trace_id, detail, trace)
+            grade_trace(evaluators, run["runId"], deployment_id, trace_id, detail, trace,
+                        earlier_turns=earlier, session_id=session_id)
         )
 
     return RunResult(
