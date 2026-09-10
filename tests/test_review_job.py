@@ -219,6 +219,25 @@ class TestWriting:
         with pytest.raises(RuntimeError, match="agent_feedback_triage v1 does not exist"):
             rj.write_triage(NoGroup(), [rj.triage_row(feedback(0), None, run_id="r", provider="p", model="m")])
 
+    def test_an_undecided_timestamp_column_is_typed_not_null(self):
+        # decided_at is None on every fresh row; left as object it reaches Delta as a Null type
+        # and the whole insert is refused after the model calls were paid for
+        pd = pytest.importorskip("pandas")
+        from hopsworks_agent_eval.run_job import _match_schema
+
+        class Feature:
+            def __init__(self, name, type_):
+                self.name, self.type = name, type_
+
+        group = FakeGroup()
+        group.features = [Feature("decided_at", "timestamp"), Feature("created_at", "timestamp")]
+        rows = [rj.triage_row(feedback(i), None, run_id="r", provider="p", model="m") for i in range(2)]
+        frame = _match_schema(group, pd.DataFrame(rows))
+        assert str(frame["decided_at"].dtype) == "datetime64[us, UTC]"
+        assert frame["decided_at"].isna().all()
+        assert str(frame["created_at"].dtype) == "datetime64[us, UTC]"
+        assert frame["created_at"].notna().all()
+
     def test_nothing_is_written_for_an_empty_run(self):
         store = FakeFeatureStore()
         rj.write_triage(store, [])

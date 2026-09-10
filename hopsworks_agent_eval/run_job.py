@@ -264,9 +264,19 @@ def _match_schema(group: Any, frame: Any) -> Any:
     instead of as `null`.
     """
     for feature in getattr(group, "features", None) or []:
-        dtypes = _FEATURE_TYPES.get((getattr(feature, "type", "") or "").lower())
+        declared = (getattr(feature, "type", "") or "").lower()
         name = getattr(feature, "name", None)
-        if not dtypes or name not in frame.columns:
+        if name not in frame.columns:
+            continue
+        if declared == "timestamp":
+            # A timestamp column that is None in every row -- decided_at before anyone has
+            # decided -- is the null-typed case above in another type. Parsed as UTC datetimes so
+            # Arrow carries a timestamp with nulls, at microseconds because that is what Delta
+            # stores and what pandas would otherwise warn about casting to.
+            frame[name] = _as_timestamps(frame[name])
+            continue
+        dtypes = _FEATURE_TYPES.get(declared)
+        if not dtypes:
             continue
         plain, nullable = dtypes
         target = nullable if frame[name].isna().any() else plain
@@ -277,6 +287,20 @@ def _match_schema(group: Any, frame: Any) -> Any:
             # will be clearer than one invented here.
             log.debug("left %s as %s", name, frame[name].dtype)
     return frame
+
+
+def _as_timestamps(column: Any) -> Any:
+    import pandas as pd  # noqa: PLC0415 -- only reached with a frame in hand
+
+    try:
+        parsed = pd.to_datetime(column, utc=True)
+    except (TypeError, ValueError):
+        log.debug("left a timestamp column as %s", column.dtype)
+        return column
+    try:
+        return parsed.astype("datetime64[us, UTC]")
+    except (TypeError, ValueError):
+        return parsed
 
 
 def _execute(run_id: str, session, base: str, project, host: str, args) -> bool:
