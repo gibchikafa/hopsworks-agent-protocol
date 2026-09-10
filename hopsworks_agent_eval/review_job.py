@@ -26,11 +26,13 @@ from .client import HopsworksAgentClient
 from .judge_config import JudgeConfig, api_key_for, api_key_source, completer_for, tool_calls_text
 from .run_job import _api, _match_schema
 from .sample_job import conversation_before, question_and_answer, started_ns
+from .clusters import Cluster, assign_clusters, from_api, known_signatures
 from .triage import TriageInput, triage, triage_row
 
 log = logging.getLogger(__name__)
 
 TRIAGE_FG = "agent_feedback_triage"
+CLUSTERS_FG = "agent_feedback_clusters"
 #: How many feedback rows one listing request asks for.
 PAGE = 100
 #: A ceiling on one execution whatever the job says, so a mistyped budget cannot run up a bill.
@@ -113,9 +115,24 @@ def feedback_in_window(session: Any, otel_base: str, from_ms: float, to_ms: floa
     return rows
 
 
+def existing_clusters(session: Any, otel_base: str) -> list[Cluster]:
+    """The deployment's clusters as the backend has them; none when they cannot be read,
+    because a review that cannot see its clusters still reviews, it just files under new ones."""
+    try:
+        response = session.get(f"{otel_base}/feedback/clusters", timeout=60)
+        response.raise_for_status()
+        body = response.json() or []
+        items = body if isinstance(body, list) else body.get("items") or []
+        return [from_api(item) for item in items]
+    except Exception:  # noqa: BLE001 -- clustering is a help, not a requirement
+        log.exception("could not read existing clusters; new ones will be made where needed")
+        return []
+
+
 def review_feedback(session: Any, client: Any, otel_base: str, run: dict[str, Any],
                     settings: dict[str, Any], complete: Callable[[str], str] | None,
-                    no_model_reason: str = "") -> tuple[list[dict[str, Any]], float | None]:
+                    no_model_reason: str = "",
+                    clusters: Sequence[Cluster] = ()) -> tuple[list[dict[str, Any]], float | None]:
     """Triage the run's window. Returns the rows to write and, when the budget cut the
     window short, the timestamp the next run should start from."""
     deployment_id = int(run["deploymentId"])
@@ -136,9 +153,10 @@ def review_feedback(session: Any, client: Any, otel_base: str, run: dict[str, An
 
     rows: list[dict[str, Any]] = []
     sessions: dict[str, list[dict[str, Any]]] = {}
+    signatures = known_signatures(clusters)
     for feedback in chosen:
         rows.append(_review_one(session, client, otel_base, run, settings, complete,
-                                no_model_reason, feedback, sessions))
+                                no_model_reason, feedback, sessions, signatures))
 
     processed_through = _ms(chosen[-1].get("createdAt")) if len(chosen) < len(pending) else None
     return rows, processed_through
@@ -147,7 +165,8 @@ def review_feedback(session: Any, client: Any, otel_base: str, run: dict[str, An
 def _review_one(session: Any, client: Any, otel_base: str, run: dict[str, Any],
                 settings: dict[str, Any], complete: Callable[[str], str] | None,
                 no_model_reason: str, feedback: dict[str, Any],
-                sessions: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+                sessions: dict[str, list[dict[str, Any]]],
+                signatures: Sequence[str] = ()) -> dict[str, Any]:
     provenance = {"run_id": str(run["runId"]), "provider": settings["provider"], "model": settings["model"]}
     if complete is None:
         return triage_row(feedback, None, error=no_model_reason, **provenance)
@@ -164,9 +183,29 @@ def _review_one(session: Any, client: Any, otel_base: str, run: dict[str, Any],
     tool_calls, tool_results = tool_calls_text(trace)
     result, why = triage(complete, TriageInput(
         feedback=feedback, question=question, answer=answer, earlier_turns=earlier,
-        tool_calls=tool_calls, tool_results=tool_results,
+        tool_calls=tool_calls, tool_results=tool_results, known_signatures=signatures,
     ), context_turns=settings["context_turns"])
     return triage_row(feedback, result, error=why, **provenance)
+
+
+def write_clusters(feature_store: Any, clusters: Sequence[Cluster]) -> None:
+    """Upsert the clusters that changed. The online table keys on cluster_id, so a
+    cluster written again replaces its row; offline history keeps every version."""
+    if not clusters:
+        return
+    import pandas as pd  # noqa: PLC0415
+
+    now = datetime.now(tz=timezone.utc)
+    group = feature_store.get_feature_group(CLUSTERS_FG, 1)
+    if group is None:
+        raise RuntimeError(
+            f"feature group {CLUSTERS_FG} v1 does not exist in this project's feature store; "
+            "Hopsworks provisions it when a review job is started -- check the server log for why "
+            "that failed, then run the review again"
+        )
+    frame = pd.DataFrame([c.to_row(now) for c in clusters])
+    group.insert(_match_schema(group, frame), write_options={"mode": "append"})
+    log.info("wrote %d clusters to %s", len(clusters), CLUSTERS_FG)
 
 
 def write_triage(feature_store: Any, rows: Sequence[dict[str, Any]]) -> None:
@@ -219,9 +258,14 @@ def _execute(run_id: str, session: Any, base: str, project: Any, host: str) -> b
         deployment_id = int(run["deploymentId"])
         client = HopsworksAgentClient(session=session, api_base=host, project_id=project.id,
                                       project_name=project.name, deployment_id=deployment_id)
+        otel_base = _otel(host, project.id, deployment_id)
+        clusters = existing_clusters(session, otel_base)
         rows, processed_through = review_feedback(
-            session, client, _otel(host, project.id, deployment_id), run, settings, complete, reason)
-        write_triage(project.get_feature_store(), rows)
+            session, client, otel_base, run, settings, complete, reason, clusters)
+        changed = assign_clusters(rows, clusters)
+        feature_store = project.get_feature_store()
+        write_triage(feature_store, rows)
+        write_clusters(feature_store, changed)
         report("SUCCEEDED", processed_through=processed_through)
         return True
     except Exception as err:  # noqa: BLE001 -- the row must say what happened

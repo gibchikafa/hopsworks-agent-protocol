@@ -9,6 +9,8 @@ class FakeResponse:
     def __init__(self, body, status=200):
         self._body = body
         self.status = status
+        # the real client reads requests' attribute name
+        self.status_code = status
 
     def raise_for_status(self):
         if self.status >= 400:
@@ -31,6 +33,8 @@ class FakeSession:
         self.feedback_requests = []
 
     def get(self, url, params=None, timeout=None):
+        if url.endswith("/feedback/clusters"):
+            return FakeResponse(getattr(self, "clusters", []))
         if url.endswith("/feedback"):
             self.feedback_requests.append(dict(params or {}))
             offset = int(params.get("offset", 0))
@@ -74,11 +78,12 @@ class FakeGroup:
 class FakeFeatureStore:
     def __init__(self):
         self.group = FakeGroup()
+        self.clusters = FakeGroup()
         self.asked = []
 
     def get_feature_group(self, name, version):
         self.asked.append((name, version))
-        return self.group
+        return self.clusters if name == rj.CLUSTERS_FG else self.group
 
 
 def feedback(i, *, created="2026-09-10T08:00:0{}Z", verdict="negative", trace="trace-{}"):
@@ -153,6 +158,21 @@ class TestTheWindow:
 
 
 class TestReviewing:
+    def test_existing_signatures_are_offered_to_the_model(self):
+        from hopsworks_agent_eval.clusters import Cluster
+
+        prompts = []
+
+        def complete(prompt):
+            prompts.append(prompt)
+            return good_reply(prompt)
+
+        session = FakeSession([feedback(0)], details={"trace-0": detail()})
+        rj.review_feedback(session, FakeClient(), "http://h/otel", run_row(), SETTINGS, complete,
+                           clusters=[Cluster(cluster_id="c", deployment_id=3, signature="customer key not used", size=9)])
+        assert "Existing failure signatures for this agent" in prompts[0]
+        assert "- customer key not used" in prompts[0]
+
     def test_each_verdict_becomes_a_row_with_the_conversation_and_tools_in_view(self):
         prompts = []
 
@@ -208,6 +228,17 @@ class TestWriting:
         rj.write_triage(store, [rj.triage_row(feedback(0), None, run_id="r", provider="p", model="m", error="x")])
         assert store.asked == [(rj.TRIAGE_FG, 1)]
         assert len(store.group.frames) == 1 and list(store.group.frames[0]["feedback_id"]) == ["fb-0"]
+
+    def test_clusters_are_written_beside_the_triage(self):
+        pytest.importorskip("pandas")
+        from hopsworks_agent_eval.clusters import Cluster
+
+        store = FakeFeatureStore()
+        rj.write_clusters(store, [Cluster(cluster_id="c1", deployment_id=3, signature="s", size=2)])
+        assert (rj.CLUSTERS_FG, 1) in store.asked
+        frame = store.clusters.frames[0]
+        assert list(frame["cluster_id"]) == ["c1"] and list(frame["size"]) == [2]
+        assert frame["first_seen"].notna().all() and frame["decided_at"].iloc[0] == ""
 
     def test_a_missing_group_is_named_not_an_attribute_error(self):
         pytest.importorskip("pandas")
@@ -270,6 +301,11 @@ class TestOneExecution:
         assert url.endswith("/runs/run-1/status") and params["status"] == "SUCCEEDED"
         assert params["processedThrough"] == str(int(rj._ms("2026-09-10T08:00:01Z")))
         assert len(store.group.frames) == 1
+        # both verdicts shared a signature, so one cluster of two, and the rows point at it
+        assert len(store.clusters.frames) == 1
+        clusters = store.clusters.frames[0]
+        assert list(clusters["size"]) == [2] and list(clusters["signature"]) == ["discount not applied"]
+        assert set(store.group.frames[0]["cluster_id"]) == {clusters["cluster_id"].iloc[0]}
 
     def test_a_run_of_the_wrong_type_is_refused_and_reported(self):
         session = FakeSession([], run=run_row(runType="SUITE"))

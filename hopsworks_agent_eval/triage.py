@@ -112,6 +112,9 @@ class TriageInput:
     earlier_turns: Sequence[tuple[str, str]] = ()
     tool_calls: str = ""
     tool_results: str = ""
+    #: Failure signatures this agent's earlier feedback was filed under, so the same kind of
+    #: failure lands in the same cluster rather than under a fresh paraphrase.
+    known_signatures: Sequence[str] = ()
 
 
 PROMPT = """You are an experienced reviewer of a customer-facing AI agent, helping a colleague \
@@ -134,7 +137,8 @@ deny it, say "unverifiable".
 - Use only the categories, severities and statuses listed. Do not invent new ones.
 - failure_summary is one sentence in the present tense, with no personal names.
 - failure_signature is a short normalised phrase naming the kind of failure, for grouping \
-similar feedback; the same kind of failure must get the same phrase.
+similar feedback; the same kind of failure must get the same phrase. If one of the existing \
+signatures below describes this failure, reuse it exactly; invent a new one only when none fits.
 - List any personal names, addresses, account references, phone numbers or emails that \
 appear in the conversation under redaction_findings, quoting the exact text.
 - Set needs_human when you cannot tell what the reviewer meant, when the correction \
@@ -145,7 +149,7 @@ Categories:
 
 Severities: low, medium, high, critical. Reserve critical for unsafe content, leaked data, \
 or an irreversible wrong action such as a purchase or a deletion.
-
+{known}
 <conversation>
 {transcript}
 </conversation>
@@ -197,7 +201,12 @@ def render_triage_prompt(inp: TriageInput, *, context_turns: int = 20) -> str:
             "<tool_results>\n" + (inp.tool_results or "(none)") + "\n</tool_results>\n"
         )
     categories = "\n".join(f"- {name}: {definition}" for name, definition in CATEGORY_DEFINITIONS.items())
+    known = ""
+    if inp.known_signatures:
+        known = "\nExisting failure signatures for this agent:\n" + "\n".join(
+            f"- {signature}" for signature in inp.known_signatures) + "\n"
     return PROMPT.format(
+        known=known,
         verdict=str(feedback.get("verdict") or "negative"),
         categories=categories,
         transcript=transcript,
