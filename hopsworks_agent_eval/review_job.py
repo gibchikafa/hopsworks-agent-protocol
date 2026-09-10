@@ -175,6 +175,15 @@ def write_triage(feature_store: Any, rows: Sequence[dict[str, Any]]) -> None:
     import pandas as pd  # noqa: PLC0415 -- only a job that has rows pays for pandas
 
     group = feature_store.get_feature_group(TRIAGE_FG, 1)
+    if group is None:
+        # The backend creates this when a review is started; a missing group means that step
+        # failed, and its reason is in the server log, not here. Said plainly rather than left
+        # as an attribute error on None.
+        raise RuntimeError(
+            f"feature group {TRIAGE_FG} v1 does not exist in this project's feature store; "
+            "Hopsworks provisions it when a review job is started -- check the server log for "
+            "why that failed, then run the review again"
+        )
     group.insert(_match_schema(group, pd.DataFrame(list(rows))), write_options={"mode": "append"})
     log.info("wrote %d rows to %s", len(rows), TRIAGE_FG)
 

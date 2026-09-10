@@ -209,6 +209,16 @@ class TestWriting:
         assert store.asked == [(rj.TRIAGE_FG, 1)]
         assert len(store.group.frames) == 1 and list(store.group.frames[0]["feedback_id"]) == ["fb-0"]
 
+    def test_a_missing_group_is_named_not_an_attribute_error(self):
+        pytest.importorskip("pandas")
+
+        class NoGroup(FakeFeatureStore):
+            def get_feature_group(self, name, version):
+                return None
+
+        with pytest.raises(RuntimeError, match="agent_feedback_triage v1 does not exist"):
+            rj.write_triage(NoGroup(), [rj.triage_row(feedback(0), None, run_id="r", provider="p", model="m")])
+
     def test_nothing_is_written_for_an_empty_run(self):
         store = FakeFeatureStore()
         rj.write_triage(store, [])
