@@ -1,0 +1,244 @@
+"""The feedback review job: triage the verdicts people gave, with a model's help.
+
+One job per agent, run by hand from the Feedback tab or on a schedule. Each
+execution is a recorded run of type FEEDBACK_REVIEW whose window is on when the
+feedback was given; the backend holds the watermark, so this reads the window off
+the run row and only reports back.
+
+The shape is the evaluation runner's: ``--run-id`` is repeatable, one failed run
+does not take its siblings down, and rows are written through ``_match_schema`` so
+a column that happens to be all-null does not trip the Delta writer.
+
+What it does per verdict is in :mod:`triage`; what it decides is nothing. Every
+row it writes is a proposal a person will look at.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+from datetime import datetime, timezone
+from typing import Any, Callable, Sequence
+
+from .api import hopsworks_session
+from .client import HopsworksAgentClient
+from .judge_config import JudgeConfig, api_key_for, api_key_source, completer_for, tool_calls_text
+from .run_job import _api, _match_schema
+from .sample_job import conversation_before, question_and_answer, started_ns
+from .triage import TriageInput, triage, triage_row
+
+log = logging.getLogger(__name__)
+
+TRIAGE_FG = "agent_feedback_triage"
+#: How many feedback rows one listing request asks for.
+PAGE = 100
+#: A ceiling on one execution whatever the job says, so a mistyped budget cannot run up a bill.
+MAX_BUDGET = 5000
+
+
+def _otel(host: str, project_id: int, deployment_id: int) -> str:
+    return (f"{host.rstrip('/')}/hopsworks-api/api/project/{project_id}"
+            f"/otel/servings/{deployment_id}")
+
+
+def _jobs(host: str, project_id: int) -> str:
+    return f"{host.rstrip('/')}/hopsworks-api/api/project/{project_id}/jobs"
+
+
+def review_settings(job: dict[str, Any] | None) -> dict[str, Any]:
+    """The model settings off the job's configuration, with the defaults the backend uses."""
+    config = (job or {}).get("config") or {}
+    return {
+        "provider": str(config.get("provider") or "anthropic"),
+        "model": str(config.get("model") or ""),
+        "reasoning_effort": str(config.get("reasoningEffort") or ""),
+        "api_key_env": str(config.get("apiKeyEnv") or ""),
+        "context_turns": int(config.get("contextTurns") or 20),
+    }
+
+
+def completer_from(settings: dict[str, Any]) -> tuple[Callable[[str], str] | None, str]:
+    """The model call, or why there is none. A missing key is a reason, not an exception."""
+    config = JudgeConfig(
+        provider=settings["provider"],
+        model=settings["model"],
+        reasoning_effort=settings["reasoning_effort"],
+        api_key_env=settings["api_key_env"],
+    )
+    key = api_key_for(config)
+    if not key:
+        return None, f"no API key: set {api_key_source(config)} on the job's environment"
+    return completer_for(config, key), ""
+
+
+def _ms(value: Any) -> float:
+    """An epoch-millisecond reading of whatever the API sent for a timestamp."""
+    if value is None or value == "":
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp() * 1000
+
+
+def feedback_in_window(session: Any, otel_base: str, from_ms: float, to_ms: float) -> list[dict[str, Any]]:
+    """Every verdict that needs attention in (from, to], oldest first.
+
+    "negative" to the server means everything that is not an endorsement, so a
+    false alarm is included: those are often a mislabelled negative, and the
+    model's reading of them is worth having.
+    """
+    rows: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        response = session.get(f"{otel_base}/feedback", params={
+            "verdict": "negative", "from": str(int(from_ms)), "to": str(int(to_ms)),
+            "limit": PAGE, "offset": offset,
+        }, timeout=60)
+        response.raise_for_status()
+        page = response.json() or {}
+        items = page.get("items") or []
+        rows.extend(items)
+        offset += len(items)
+        if not items or offset >= int(page.get("count") or 0):
+            break
+    rows.sort(key=lambda r: (_ms(r.get("createdAt")), str(r.get("feedbackId") or "")))
+    return rows
+
+
+def review_feedback(session: Any, client: Any, otel_base: str, run: dict[str, Any],
+                    settings: dict[str, Any], complete: Callable[[str], str] | None,
+                    no_model_reason: str = "") -> tuple[list[dict[str, Any]], float | None]:
+    """Triage the run's window. Returns the rows to write and, when the budget cut the
+    window short, the timestamp the next run should start from."""
+    deployment_id = int(run["deploymentId"])
+    from_ms = _ms(run.get("sampleFrom"))
+    to_ms = _ms(run.get("sampleTo")) or datetime.now(tz=timezone.utc).timestamp() * 1000
+    budget = min(int(run.get("nTrials") or 0) or MAX_BUDGET, MAX_BUDGET)
+
+    pending = feedback_in_window(session, otel_base, from_ms, to_ms)
+    if not pending:
+        log.info("no feedback to review between %s and %s", from_ms, to_ms)
+        return [], None
+    chosen = pending[:budget]
+    if len(chosen) < len(pending):
+        log.warning("%d verdicts in the window, reviewing the oldest %d; the rest wait for the next run",
+                    len(pending), len(chosen))
+    else:
+        log.info("reviewing %d verdicts", len(chosen))
+
+    rows: list[dict[str, Any]] = []
+    sessions: dict[str, list[dict[str, Any]]] = {}
+    for feedback in chosen:
+        rows.append(_review_one(session, client, otel_base, run, settings, complete,
+                                no_model_reason, feedback, sessions))
+
+    processed_through = _ms(chosen[-1].get("createdAt")) if len(chosen) < len(pending) else None
+    return rows, processed_through
+
+
+def _review_one(session: Any, client: Any, otel_base: str, run: dict[str, Any],
+                settings: dict[str, Any], complete: Callable[[str], str] | None,
+                no_model_reason: str, feedback: dict[str, Any],
+                sessions: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    provenance = {"run_id": str(run["runId"]), "provider": settings["provider"], "model": settings["model"]}
+    if complete is None:
+        return triage_row(feedback, None, error=no_model_reason, **provenance)
+    trace_id = str(feedback.get("traceId") or "")
+    try:
+        detail = session.get(f"{otel_base}/traces/{trace_id}", timeout=60).json()
+        trace = client.fetch_trace(trace_id)
+    except Exception as err:  # noqa: BLE001 -- one unreadable trace is one row that says so
+        log.exception("could not read trace %s", trace_id)
+        return triage_row(feedback, None, error=f"could not read trace: {err}", **provenance)
+    question, answer = question_and_answer(detail)
+    earlier = conversation_before(session, otel_base, str(feedback.get("sessionId") or ""),
+                                  started_ns({}, detail), sessions)
+    tool_calls, tool_results = tool_calls_text(trace)
+    result, why = triage(complete, TriageInput(
+        feedback=feedback, question=question, answer=answer, earlier_turns=earlier,
+        tool_calls=tool_calls, tool_results=tool_results,
+    ), context_turns=settings["context_turns"])
+    return triage_row(feedback, result, error=why, **provenance)
+
+
+def write_triage(feature_store: Any, rows: Sequence[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    import pandas as pd  # noqa: PLC0415 -- only a job that has rows pays for pandas
+
+    group = feature_store.get_feature_group(TRIAGE_FG, 1)
+    group.insert(_match_schema(group, pd.DataFrame(list(rows))), write_options={"mode": "append"})
+    log.info("wrote %d rows to %s", len(rows), TRIAGE_FG)
+
+
+def _execute(run_id: str, session: Any, base: str, project: Any, host: str) -> bool:
+    def report(status: str, error: str | None = None, processed_through: float | None = None) -> None:
+        params: dict[str, Any] = {"status": status}
+        if error:
+            params["errorMessage"] = error
+        if processed_through is not None:
+            # the window closes where the budget ran out, so the next run picks up the rest
+            params["processedThrough"] = str(int(processed_through))
+        try:
+            session.put(f"{base}/runs/{run_id}/status", params=params, timeout=30)
+        except Exception:  # noqa: BLE001 -- never mask the real failure
+            log.exception("could not report status %s", status)
+
+    try:
+        run = session.get(f"{base}/runs/{run_id}", timeout=60).json()
+        if run.get("runType") != "FEEDBACK_REVIEW":
+            report("FAILED", f"run {run_id} is a {run.get('runType')} run, not a feedback review")
+            return False
+        job = {}
+        if run.get("jobName"):
+            try:
+                job = session.get(f"{_jobs(host, project.id)}/{run['jobName']}", timeout=60).json()
+            except Exception:  # noqa: BLE001 -- defaults are a worse answer than the job's, never a wrong one
+                log.exception("could not read job %s; reviewing with default settings", run["jobName"])
+        settings = review_settings(job)
+        complete, reason = completer_from(settings)
+        if complete is None:
+            log.error("%s -- every row of this run will be recorded as ungradable", reason)
+        deployment_id = int(run["deploymentId"])
+        client = HopsworksAgentClient(session=session, api_base=host, project_id=project.id,
+                                      project_name=project.name, deployment_id=deployment_id)
+        rows, processed_through = review_feedback(
+            session, client, _otel(host, project.id, deployment_id), run, settings, complete, reason)
+        write_triage(project.get_feature_store(), rows)
+        report("SUCCEEDED", processed_through=processed_through)
+        return True
+    except Exception as err:  # noqa: BLE001 -- the row must say what happened
+        log.exception("review run %s failed", run_id)
+        report("FAILED", str(err))
+        return False
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-id", required=True, action="append", dest="run_ids")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO)
+
+    import hopsworks  # noqa: PLC0415 -- only inside a job
+
+    project = hopsworks.login()
+    host = os.environ.get("HOPSWORKS_HOST") or os.environ["REST_ENDPOINT"]
+    session = hopsworks_session()
+    base = _api(host, project.id)
+    outcomes = [_execute(run_id, session, base, project, host) for run_id in args.run_ids]
+    failed = outcomes.count(False)
+    if failed:
+        log.error("%d of %d review runs failed", failed, len(outcomes))
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
