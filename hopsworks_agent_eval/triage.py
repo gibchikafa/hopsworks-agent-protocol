@@ -359,7 +359,10 @@ def triage_row(feedback: dict[str, Any], result: TriageResult | None, *, run_id:
         "human_decision": "pending",
         "human_category": "",
         "decided_by": "",
-        "decided_at": None,
+        # Text, not a timestamp: a column that is None on every row cannot be inserted through
+        # hsfs -- Delta refuses the Null type and the online Avro writer cannot encode NaT -- and
+        # this one is empty until a person decides.
+        "decided_at": "",
         "created_at": now,
     }
     if result is not None:

@@ -152,6 +152,7 @@ class TestTheRow:
         assert json.loads(row["proposed_assertions"]) == [{"kind": "contains", "value": "44.10"}]
         assert json.loads(row["redaction_findings"])[0]["text"] == "Aaron Mitchell"
         assert row["human_decision"] == "pending"
+        assert row["decided_at"] == ""
 
     def test_a_failure_is_a_row_that_needs_a_person(self):
         row = t.triage_row(feedback(), None, run_id="run-1", provider="anthropic",

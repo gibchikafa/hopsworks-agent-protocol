@@ -230,13 +230,17 @@ class TestWriting:
                 self.name, self.type = name, type_
 
         group = FakeGroup()
-        group.features = [Feature("decided_at", "timestamp"), Feature("created_at", "timestamp")]
+        group.features = [Feature("created_at", "timestamp"), Feature("other_at", "timestamp")]
         rows = [rj.triage_row(feedback(i), None, run_id="r", provider="p", model="m") for i in range(2)]
-        frame = _match_schema(group, pd.DataFrame(rows))
-        assert str(frame["decided_at"].dtype) == "datetime64[us, UTC]"
-        assert frame["decided_at"].isna().all()
+        frame = pd.DataFrame(rows)
+        frame["other_at"] = None
+        frame = _match_schema(group, frame)
+        assert str(frame["other_at"].dtype) == "datetime64[us, UTC]"
+        assert frame["other_at"].isna().all()
         assert str(frame["created_at"].dtype) == "datetime64[us, UTC]"
         assert frame["created_at"].notna().all()
+        # and the one column that is empty until a person acts is text, never a null timestamp
+        assert list(frame["decided_at"]) == ["", ""]
 
     def test_nothing_is_written_for_an_empty_run(self):
         store = FakeFeatureStore()
