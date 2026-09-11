@@ -90,8 +90,19 @@ def _ms(value: Any) -> float:
     return parsed.timestamp() * 1000
 
 
-def feedback_in_window(session: Any, otel_base: str, from_ms: float, to_ms: float) -> list[dict[str, Any]]:
-    """Every verdict that needs attention in (from, to], oldest first.
+TRACE_SOURCE_PREFIX = "feedback:trace:"
+
+
+def trace_of(run: dict[str, Any]) -> str:
+    """The one trace a run was asked to review, or empty for a window."""
+    source = str(run.get("sampleSource") or "")
+    return source[len(TRACE_SOURCE_PREFIX):] if source.startswith(TRACE_SOURCE_PREFIX) else ""
+
+
+def feedback_in_window(session: Any, otel_base: str, from_ms: float, to_ms: float,
+                       trace_id: str = "") -> list[dict[str, Any]]:
+    """Every verdict that needs attention in (from, to], oldest first -- or every verdict
+    on one trace, whenever given, when a reviewer asked for that trace again.
 
     "negative" to the server means everything that is not an endorsement, so a
     false alarm is included: those are often a mislabelled negative, and the
@@ -100,10 +111,13 @@ def feedback_in_window(session: Any, otel_base: str, from_ms: float, to_ms: floa
     rows: list[dict[str, Any]] = []
     offset = 0
     while True:
-        response = session.get(f"{otel_base}/feedback", params={
-            "verdict": "negative", "from": str(int(from_ms)), "to": str(int(to_ms)),
-            "limit": PAGE, "offset": offset,
-        }, timeout=60)
+        params: dict[str, Any] = {"verdict": "negative", "limit": PAGE, "offset": offset}
+        if trace_id:
+            params["traceId"] = trace_id
+        else:
+            params["from"] = str(int(from_ms))
+            params["to"] = str(int(to_ms))
+        response = session.get(f"{otel_base}/feedback", params=params, timeout=60)
         response.raise_for_status()
         page = response.json() or {}
         items = page.get("items") or []
@@ -140,9 +154,13 @@ def review_feedback(session: Any, client: Any, otel_base: str, run: dict[str, An
     to_ms = _ms(run.get("sampleTo")) or datetime.now(tz=timezone.utc).timestamp() * 1000
     budget = min(int(run.get("nTrials") or 0) or MAX_BUDGET, MAX_BUDGET)
 
-    pending = feedback_in_window(session, otel_base, from_ms, to_ms)
+    trace_id = trace_of(run)
+    pending = feedback_in_window(session, otel_base, from_ms, to_ms, trace_id)
     if not pending:
-        log.info("no feedback to review between %s and %s", from_ms, to_ms)
+        if trace_id:
+            log.info("no feedback needing attention on trace %s", trace_id)
+        else:
+            log.info("no feedback to review between %s and %s", from_ms, to_ms)
         return [], None
     chosen = pending[:budget]
     if len(chosen) < len(pending):

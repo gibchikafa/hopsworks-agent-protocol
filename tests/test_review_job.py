@@ -39,7 +39,10 @@ class FakeSession:
             self.feedback_requests.append(dict(params or {}))
             offset = int(params.get("offset", 0))
             limit = int(params.get("limit", 100))
-            return FakeResponse({"count": len(self.feedback), "items": self.feedback[offset:offset + limit]})
+            rows = self.feedback
+            if params.get("traceId"):
+                rows = [r for r in rows if r["traceId"] == params["traceId"]]
+            return FakeResponse({"count": len(rows), "items": rows[offset:offset + limit]})
         if "/traces/sessions/" in url:
             return FakeResponse({"items": self.sessions.get(url.rsplit("/", 1)[-1], [])})
         if "/traces/" in url:
@@ -150,6 +153,20 @@ class TestTheWindow:
         first = session.feedback_requests[0]
         # everything that is not an endorsement, bounded by when it was said
         assert first["verdict"] == "negative" and first["from"] == "1000" and first["to"] == "2000"
+
+    def test_one_trace_is_asked_for_by_id_whenever_it_was_given(self):
+        session = FakeSession([feedback(0), feedback(1)])
+        rows = rj.feedback_in_window(session, "http://h/otel", 1_000.0, 2_000.0, trace_id="trace-1")
+        assert [r["feedbackId"] for r in rows] == ["fb-1"]
+        request = session.feedback_requests[0]
+        assert request["traceId"] == "trace-1"
+        assert "from" not in request and "to" not in request
+
+    def test_the_run_row_says_which_trace_it_is_about(self):
+        assert rj.trace_of({"sampleSource": "feedback:trace:305b97bb"}) == "305b97bb"
+        assert rj.trace_of({"sampleSource": "feedback:window"}) == ""
+        assert rj.trace_of({"sampleSource": "feedback"}) == ""
+        assert rj.trace_of({}) == ""
 
     def test_oldest_first_whatever_order_the_server_used(self):
         session = FakeSession([feedback(2), feedback(0), feedback(1)])
