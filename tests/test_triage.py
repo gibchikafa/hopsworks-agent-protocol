@@ -161,3 +161,75 @@ class TestTheRow:
         assert row["needs_human"] is True
         assert row["category"] == "" and row["proposed_assertions"] == "[]"
         assert row["error"] == "reply was not a JSON object"
+
+
+class TestAutomatedSignals:
+    def test_a_detectors_verdict_is_introduced_as_a_signal_not_a_reviewer(self):
+        prompt = t.render_triage_prompt(t.TriageInput(
+            feedback=feedback(reviewer="detector:tool_error", correctedAnswer="",
+                              note="tool recall_interests failed: KeyError: 'customer_key'"),
+            question="q", answer="a",
+        ))
+        assert "The platform flagged one of the agent's turns" in prompt
+        assert "a tool the agent called returned an error" in prompt
+        assert '<signal source="detector:tool_error">' in prompt
+        assert "KeyError: 'customer_key'" in prompt
+        assert "The reviewer's feedback:" not in prompt
+        assert 'correction_status is "missing"' in prompt
+
+    def test_a_judges_failure_names_the_evaluator(self):
+        prompt = t.render_triage_prompt(t.TriageInput(
+            feedback=feedback(reviewer="judge:matches_policy", note="Quoted a price without checking stock."),
+            question="q", answer="a"))
+        assert "an online evaluator (matches_policy) failed this turn" in prompt
+
+    def test_origin_is_read_off_the_reviewer(self):
+        assert t.origin_of(feedback()) == "human"
+        assert t.origin_of(feedback(reviewer="alice@x")) == "human"
+        assert t.origin_of(feedback(reviewer="detector:timeout")) == "detector"
+        assert t.origin_of(feedback(reviewer="judge:rubric")) == "judge"
+
+
+class TestSourceCode:
+    def test_the_files_are_shown_with_line_numbers_and_the_code_rules(self):
+        prompt = t.render_triage_prompt(t.TriageInput(
+            feedback=feedback(), question="q", answer="a",
+            source_files=[("agent/tools.py", "def lookup(key):\n    return db.find(name=key)\n")],
+            source_origin="git https://x/y@abc",
+        ))
+        assert '<agent_source origin="git https://x/y@abc">' in prompt
+        assert '<file path="agent/tools.py">' in prompt
+        assert "   2      return db.find(name=key)" in prompt
+        assert "Cite only lines you were shown" in prompt
+        assert "The agent's source code is not shown" not in prompt
+
+    def test_without_code_the_model_is_told_not_to_invent_a_bug(self):
+        prompt = t.render_triage_prompt(t.TriageInput(feedback=feedback(), question="q", answer="a"))
+        assert "The agent's source code is not shown" in prompt
+        assert "<agent_source" not in prompt
+
+    def test_code_findings_are_kept_with_file_and_line(self):
+        result = t.parse_triage(reply(suspected_code_bug=True, code_findings=[
+            {"file": "agent/tools.py", "line": 2, "finding": "Looks the customer up by name, not by key.",
+             "fix": "Pass key to db.find(key=...)."},
+            {"file": "", "line": 1, "finding": "no file, dropped"},
+            {"file": "agent/x.py", "line": "n/a", "finding": "line unknown is fine"},
+        ]))
+        assert result.suspected_code_bug is True
+        assert [f.file for f in result.code_findings] == ["agent/tools.py", "agent/x.py"]
+        assert result.code_findings[0].line == 2 and result.code_findings[0].fix.startswith("Pass key")
+        assert result.code_findings[1].line is None
+
+    def test_a_bug_nobody_can_point_at_is_not_a_finding(self):
+        result = t.parse_triage(reply(suspected_code_bug=True, code_findings=[]))
+        assert result.suspected_code_bug is False
+
+    def test_the_row_carries_the_findings_as_json(self):
+        result = t.parse_triage(reply(suspected_code_bug=True, code_findings=[
+            {"file": "a.py", "line": 3, "finding": "f", "fix": "g"}]))
+        row = t.triage_row(feedback(), result, run_id="r", provider="p", model="m")
+        assert row["suspected_code_bug"] is True
+        assert json.loads(row["code_findings"]) == [{"file": "a.py", "finding": "f", "line": 3, "fix": "g"}]
+        assert row["prompt_version"] == "2"
+        empty = t.triage_row(feedback(), None, run_id="r", provider="p", model="m", error="x")
+        assert empty["suspected_code_bug"] is False and empty["code_findings"] == "[]"

@@ -54,6 +54,10 @@ class FakeSession:
             return FakeResponse(self.run)
         if "/jobs/" in url:
             return FakeResponse(self.job)
+        if "/serving/" in url:
+            if getattr(self, "serving", None) is None:
+                return FakeResponse({"errorMsg": "no"}, status=500)
+            return FakeResponse(self.serving)
         raise AssertionError(url)
 
     def put(self, url, params=None, timeout=None):
@@ -126,12 +130,38 @@ SETTINGS = {"provider": "anthropic", "model": "claude-sonnet-5", "reasoning_effo
 
 class TestSettings:
     def test_come_off_the_jobs_configuration_with_the_backends_defaults(self):
-        assert rj.review_settings({"config": {"provider": "openai", "model": "gpt-5", "reasoningEffort": "low",
-                                              "apiKeyEnv": "MY_KEY", "contextTurns": 6}}) == {
+        settings = rj.review_settings({"config": {"provider": "openai", "model": "gpt-5", "reasoningEffort": "low",
+                                                  "apiKeyEnv": "MY_KEY", "contextTurns": 6}})
+        assert {k: settings[k] for k in ("provider", "model", "reasoning_effort", "api_key_env", "context_turns")} == {
             "provider": "openai", "model": "gpt-5", "reasoning_effort": "low", "api_key_env": "MY_KEY",
             "context_turns": 6}
         assert rj.review_settings(None)["provider"] == "anthropic"
         assert rj.review_settings({})["context_turns"] == 20
+
+    def test_sources_and_code_reading_have_defaults_and_can_be_set(self):
+        defaults = rj.review_settings({})
+        assert defaults["sources"] == ("feedback", "errors", "judge")
+        assert defaults["read_source_code"] is True and defaults["source_location"] == ""
+        custom = rj.review_settings({"config": {"sources": "feedback, anomalies", "readSourceCode": False,
+                                                "sourceLocation": "https://github.com/o/r#main"}})
+        assert custom["sources"] == ("feedback", "anomalies")
+        assert custom["read_source_code"] is False
+        assert custom["source_location"] == "https://github.com/o/r#main"
+
+    def test_the_code_location_is_the_deployments_unless_the_job_overrides_it(self):
+        session = FakeSession([])
+        session.serving = {"gitUrl": "https://github.com/o/r", "gitBranch": "main", "gitCurrentCommit": "abc",
+                           "predictor": "chinook/agent.py"}
+        described = rj.code_location(session, "http://h", 1, 3, rj.review_settings({}))
+        assert described.git_url == "https://github.com/o/r" and described.git_commit == "abc"
+        assert described.script_file == "chinook/agent.py"
+        overridden = rj.code_location(session, "http://h", 1, 3, rj.review_settings(
+            {"config": {"sourceLocation": "/Projects/p/Models/agent/2"}}))
+        assert overridden.model_path == "/Projects/p/Models/agent/2"
+        # the entry script is still the deployment's
+        assert overridden.script_file == "chinook/agent.py"
+        unreadable = rj.code_location(FakeSession([]), "http://h", 1, 3, rj.review_settings({}))
+        assert not unreadable.known()
 
     def test_a_missing_key_is_a_reason_not_an_exception(self, monkeypatch):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -209,6 +239,30 @@ class TestReviewing:
         assert rows[0]["provider"] == "anthropic" and rows[0]["model"] == "claude-sonnet-5"
         assert "I have a discount code" in prompts[0]
         assert "get_cart_total" in prompts[0] and "44.10" in prompts[0]
+
+    def test_the_agents_code_is_shown_for_the_tools_the_trace_called(self):
+        from hopsworks_agent_eval.agent_source import SourceBundle
+
+        prompts = []
+
+        def complete(prompt):
+            prompts.append(prompt)
+            return good_reply(prompt)
+
+        source = SourceBundle(files={
+            "agent.py": "from tools import get_cart_total\n",
+            "tools.py": "def get_cart_total():\n    return 49\n",
+            "billing.py": "def discount(): ...\n",
+        }, entry="agent.py", origin="git https://x/y@abc")
+        session = FakeSession([feedback(0)], details={"trace-0": detail()})
+        client = FakeClient({"trace-0": {"tool_calls": [{"name": "get_cart_total", "arguments": "{}",
+                                                          "result": "49", "status": "OK"}],
+                                          "tool_names": ["get_cart_total"]}})
+        rj.review_feedback(session, client, "http://h/otel", run_row(), SETTINGS, complete, source=source)
+        assert '<file path="agent.py">' in prompts[0]
+        assert '<file path="tools.py">' in prompts[0]
+        assert "billing.py" not in prompts[0]
+        assert 'origin="git https://x/y@abc"' in prompts[0]
 
     def test_the_budget_cuts_the_window_and_says_where_it_stopped(self):
         session = FakeSession([feedback(i) for i in range(5)], details={f"trace-{i}": detail() for i in range(5)})

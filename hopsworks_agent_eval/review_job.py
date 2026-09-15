@@ -21,6 +21,9 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Callable, Sequence
 
+from .agent_source import (
+    DEFAULT_SOURCE_CHARS, CodeLocation, SourceBundle, load_agent_source, relevant_files,
+)
 from .api import hopsworks_session
 from .client import HopsworksAgentClient
 from .judge_config import JudgeConfig, api_key_for, api_key_source, completer_for, tool_calls_text
@@ -48,16 +51,55 @@ def _jobs(host: str, project_id: int) -> str:
     return f"{host.rstrip('/')}/hopsworks-api/api/project/{project_id}/jobs"
 
 
+def _serving(host: str, project_id: int, deployment_id: int) -> str:
+    return f"{host.rstrip('/')}/hopsworks-api/api/project/{project_id}/serving/{deployment_id}"
+
+
+#: What a review reads by default: people's verdicts, the errors the platform found in traces,
+#: and the traces an online judge failed. Anomalies (latency, tool loops) are opt-in: they are
+#: thresholds, and a threshold is an opinion. The backend applies these when it starts a run;
+#: the job carries them so its log says what the run was fed.
+DEFAULT_SOURCES = ("feedback", "errors", "judge")
+
+
 def review_settings(job: dict[str, Any] | None) -> dict[str, Any]:
     """The model settings off the job's configuration, with the defaults the backend uses."""
     config = (job or {}).get("config") or {}
+    raw_sources = str(config.get("sources") or "")
+    sources = tuple(s.strip() for s in raw_sources.split(",") if s.strip()) or DEFAULT_SOURCES
+    read_code = config.get("readSourceCode")
     return {
         "provider": str(config.get("provider") or "anthropic"),
         "model": str(config.get("model") or ""),
         "reasoning_effort": str(config.get("reasoningEffort") or ""),
         "api_key_env": str(config.get("apiKeyEnv") or ""),
         "context_turns": int(config.get("contextTurns") or 20),
+        "sources": sources,
+        # on unless the job says otherwise: a review that cannot see the code cannot tell a bug
+        # from a bad answer, and telling them apart is the point
+        "read_source_code": True if read_code is None else bool(read_code),
+        "source_location": str(config.get("sourceLocation") or ""),
+        "source_chars": int(config.get("sourceChars") or DEFAULT_SOURCE_CHARS),
     }
+
+
+def code_location(session: Any, host: str, project_id: int, deployment_id: int,
+                  settings: dict[str, Any]) -> CodeLocation:
+    """Where the agent's code is: the job's override when set, else what the deployment says."""
+    override = CodeLocation.from_override(settings.get("source_location") or "")
+    view: dict[str, Any] = {}
+    try:
+        response = session.get(_serving(host, project_id, deployment_id), timeout=60)
+        response.raise_for_status()
+        view = response.json() or {}
+    except Exception:  # noqa: BLE001 -- the code is a help; a review without it still reviews
+        log.exception("could not read deployment %s; its code location is unknown", deployment_id)
+    described = CodeLocation.from_serving(view)
+    if override.known():
+        # the entry script is still the deployment's, unless the override names a file itself
+        override.script_file = override.script_file or described.script_file
+        return override
+    return described
 
 
 def completer_from(settings: dict[str, Any]) -> tuple[Callable[[str], str] | None, str]:
@@ -146,10 +188,10 @@ def existing_clusters(session: Any, otel_base: str) -> list[Cluster]:
 def review_feedback(session: Any, client: Any, otel_base: str, run: dict[str, Any],
                     settings: dict[str, Any], complete: Callable[[str], str] | None,
                     no_model_reason: str = "",
-                    clusters: Sequence[Cluster] = ()) -> tuple[list[dict[str, Any]], float | None]:
+                    clusters: Sequence[Cluster] = (),
+                    source: SourceBundle | None = None) -> tuple[list[dict[str, Any]], float | None]:
     """Triage the run's window. Returns the rows to write and, when the budget cut the
     window short, the timestamp the next run should start from."""
-    deployment_id = int(run["deploymentId"])
     from_ms = _ms(run.get("sampleFrom"))
     to_ms = _ms(run.get("sampleTo")) or datetime.now(tz=timezone.utc).timestamp() * 1000
     budget = min(int(run.get("nTrials") or 0) or MAX_BUDGET, MAX_BUDGET)
@@ -174,7 +216,7 @@ def review_feedback(session: Any, client: Any, otel_base: str, run: dict[str, An
     signatures = known_signatures(clusters)
     for feedback in chosen:
         rows.append(_review_one(session, client, otel_base, run, settings, complete,
-                                no_model_reason, feedback, sessions, signatures))
+                                no_model_reason, feedback, sessions, signatures, source))
 
     processed_through = _ms(chosen[-1].get("createdAt")) if len(chosen) < len(pending) else None
     return rows, processed_through
@@ -184,7 +226,7 @@ def _review_one(session: Any, client: Any, otel_base: str, run: dict[str, Any],
                 settings: dict[str, Any], complete: Callable[[str], str] | None,
                 no_model_reason: str, feedback: dict[str, Any],
                 sessions: dict[str, list[dict[str, Any]]],
-                signatures: Sequence[str] = ()) -> dict[str, Any]:
+                signatures: Sequence[str] = (), source: SourceBundle | None = None) -> dict[str, Any]:
     provenance = {"run_id": str(run["runId"]), "provider": settings["provider"], "model": settings["model"]}
     if complete is None:
         return triage_row(feedback, None, error=no_model_reason, **provenance)
@@ -199,9 +241,20 @@ def _review_one(session: Any, client: Any, otel_base: str, run: dict[str, Any],
     earlier = conversation_before(session, otel_base, str(feedback.get("sessionId") or ""),
                                   started_ns({}, detail), sessions)
     tool_calls, tool_results = tool_calls_text(trace)
+    source_files: list[tuple[str, str]] = []
+    if source:
+        # the files this trace has a reason to be read against: what it called, and the words
+        # of the failure (a detector's error message, a reviewer's note)
+        source_files = relevant_files(
+            source,
+            tool_names=list((trace or {}).get("tool_names") or []),
+            clues=[str(feedback.get("note") or ""), str(feedback.get("expectedToolBehavior") or "")],
+            budget_chars=int(settings.get("source_chars") or DEFAULT_SOURCE_CHARS),
+        )
     result, why = triage(complete, TriageInput(
         feedback=feedback, question=question, answer=answer, earlier_turns=earlier,
         tool_calls=tool_calls, tool_results=tool_results, known_signatures=signatures,
+        source_files=source_files, source_origin=source.origin if source else "",
     ), context_turns=settings["context_turns"])
     return triage_row(feedback, result, error=why, **provenance)
 
@@ -278,8 +331,15 @@ def _execute(run_id: str, session: Any, base: str, project: Any, host: str) -> b
                                       project_name=project.name, deployment_id=deployment_id)
         otel_base = _otel(host, project.id, deployment_id)
         clusters = existing_clusters(session, otel_base)
+        log.info("sources for this run: %s", ", ".join(settings["sources"]))
+        source: SourceBundle | None = None
+        if settings["read_source_code"]:
+            location = code_location(session, host, project.id, deployment_id, settings)
+            source = load_agent_source(location, dataset_api=_dataset_api(project))
+            if not source:
+                log.warning("reviewing without the agent's source code (%s)", source.origin or "location unknown")
         rows, processed_through = review_feedback(
-            session, client, otel_base, run, settings, complete, reason, clusters)
+            session, client, otel_base, run, settings, complete, reason, clusters, source)
         changed = assign_clusters(rows, clusters)
         feature_store = project.get_feature_store()
         write_triage(feature_store, rows)
@@ -290,6 +350,13 @@ def _execute(run_id: str, session: Any, base: str, project: Any, host: str) -> b
         log.exception("review run %s failed", run_id)
         report("FAILED", str(err))
         return False
+
+
+def _dataset_api(project: Any) -> Any:
+    try:
+        return project.get_dataset_api()
+    except Exception:  # noqa: BLE001 -- only needed for a HopsFS code path
+        return None
 
 
 def main() -> None:
