@@ -229,7 +229,76 @@ class TestSourceCode:
             {"file": "a.py", "line": 3, "finding": "f", "fix": "g"}]))
         row = t.triage_row(feedback(), result, run_id="r", provider="p", model="m")
         assert row["suspected_code_bug"] is True
-        assert json.loads(row["code_findings"]) == [{"file": "a.py", "finding": "f", "line": 3, "fix": "g"}]
+        [stored] = json.loads(row["code_findings"])
+        assert {k: stored[k] for k in ("file", "finding", "line", "fix")} == {
+            "file": "a.py", "finding": "f", "line": 3, "fix": "g"}
         assert row["prompt_version"] == "2"
         empty = t.triage_row(feedback(), None, run_id="r", provider="p", model="m", error="x")
         assert empty["suspected_code_bug"] is False and empty["code_findings"] == "[]"
+
+
+class TestPatches:
+    def _reply(self, **finding):
+        entry = {"file": "agent/tools.py", "line": 2, "finding": "Looks the customer up by name.",
+                 "fix": "Look up by key."}
+        entry.update(finding)
+        return reply(suspected_code_bug=True, code_findings=[entry])
+
+    SOURCE = [("agent/tools.py", "def lookup(key):\n    return db.find(name=key)\n\n\ndef other():\n    pass\n")]
+
+    def test_the_prompt_asks_for_the_change_as_code(self):
+        prompt = t.render_triage_prompt(t.TriageInput(feedback=feedback(), question="q", answer="a",
+                                                      source_files=self.SOURCE))
+        assert '"original": "<the lines to change, copied verbatim' in prompt
+        assert "copied verbatim from the file (same" in prompt
+
+    def test_a_patch_whose_original_is_in_the_file_shown_is_verified(self):
+        result, why = t.triage(lambda _p: self._reply(original="    return db.find(name=key)",
+                                                        replacement="    return db.find(key=key)"),
+                               t.TriageInput(feedback=feedback(), question="q", answer="a",
+                                             source_files=self.SOURCE))
+        assert why == ""
+        [finding] = result.code_findings
+        assert finding.original == "    return db.find(name=key)"
+        assert finding.replacement == "    return db.find(key=key)"
+        assert finding.verified is True
+
+    def test_a_patch_that_does_not_match_the_file_is_kept_but_not_verified(self):
+        result, _ = t.triage(lambda _p: self._reply(original="    return db.find(customer=key)",
+                                                      replacement="x"),
+                             t.TriageInput(feedback=feedback(), question="q", answer="a",
+                                           source_files=self.SOURCE))
+        assert result.code_findings[0].verified is False
+
+    def test_an_original_that_occurs_twice_is_ambiguous_and_not_verified(self):
+        source = [("agent/tools.py", "    pass\n    pass\n")]
+        result, _ = t.triage(lambda _p: self._reply(original="    pass", replacement="    return 1"),
+                             t.TriageInput(feedback=feedback(), question="q", answer="a", source_files=source))
+        assert result.code_findings[0].verified is False
+
+    def test_the_file_may_be_named_by_its_tail(self):
+        result, _ = t.triage(lambda _p: self._reply(file="tools.py", original="def other():",
+                                                      replacement="def other(key):"),
+                             t.TriageInput(feedback=feedback(), question="q", answer="a",
+                                           source_files=self.SOURCE))
+        assert result.code_findings[0].verified is True
+
+    def test_a_replacement_without_an_original_is_dropped_as_prose(self):
+        result = t.parse_triage(self._reply(original="", replacement="do it better"))
+        assert result.code_findings[0].original == "" and result.code_findings[0].replacement == ""
+
+    def test_nothing_is_verified_when_no_source_was_shown(self):
+        result, _ = t.triage(lambda _p: self._reply(original="    return db.find(name=key)", replacement="y"),
+                             t.TriageInput(feedback=feedback(), question="q", answer="a"))
+        assert result.code_findings[0].verified is False
+
+    def test_the_row_carries_the_patch_and_its_verification(self):
+        result, _ = t.triage(lambda _p: self._reply(original="    return db.find(name=key)",
+                                                      replacement="    return db.find(key=key)"),
+                             t.TriageInput(feedback=feedback(), question="q", answer="a",
+                                           source_files=self.SOURCE))
+        row = t.triage_row(feedback(), result, run_id="r", provider="p", model="m")
+        [stored] = json.loads(row["code_findings"])
+        assert stored["original"] == "    return db.find(name=key)"
+        assert stored["replacement"] == "    return db.find(key=key)"
+        assert stored["verified"] is True

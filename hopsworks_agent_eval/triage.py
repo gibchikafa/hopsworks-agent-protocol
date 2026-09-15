@@ -85,6 +85,7 @@ _MAX_RUBRIC = 1000
 _MAX_ASSERTIONS = 8
 _MAX_FINDINGS = 20
 _MAX_CODE_FINDINGS = 6
+_MAX_PATCH = 4000
 
 
 @dataclass
@@ -103,12 +104,18 @@ class RedactionFinding:
 @dataclass
 class CodeFinding:
     """A place in the agent's code the model believes caused the failure. A claim to check,
-    with the line so checking is quick; never a patch applied to anything."""
+    with the line so checking is quick, and the change as code: the exact lines as they are
+    and as they should read. Shown as a diff; never applied to anything by this pipeline.
+    ``verified`` says the original lines really occur in the file the model was shown, so a
+    later "open a pull request" can apply the change by exact replacement."""
 
     file: str
     finding: str
     line: int | None = None
     fix: str = ""
+    original: str = ""
+    replacement: str = ""
+    verified: bool = False
 
 
 @dataclass
@@ -215,7 +222,9 @@ Reply with JSON only, no prose:
   "confidence": <0.0-1.0>,
   "suspected_code_bug": <true|false>,
   "code_findings": [{{"file": "<path as shown>", "line": <number or null>, \
-"finding": "<what the code does wrong, one sentence>", "fix": "<what to change, one sentence>"}}]
+"finding": "<what the code does wrong, one sentence>", "fix": "<what to change, one sentence>", \
+"original": "<the lines to change, copied verbatim from the file shown, without line numbers>", \
+"replacement": "<those lines as they should read>"}}]
 }}"""
 
 HUMAN_INTRO = """A reviewer has marked one of the agent's answers as {verdict}. Your job is to turn their \
@@ -244,9 +253,12 @@ CODE_RULES = """- The agent's source code is shown under <agent_source>, with li
 a bug in the agent from a weak answer: a tool called with the wrong argument, a lookup that ignores \
 what the user supplied, a retry with no exit, an exception swallowed into a polite reply. When the \
 code explains the failure, set suspected_code_bug and list each place under code_findings with the \
-file and line as shown, what it does wrong, and what to change. Cite only lines you were shown; if \
-the cause is not in the files shown, say so in failure_summary and leave code_findings empty. A \
-bug you cannot point at is not a finding.
+file and line as shown, what it does wrong, and what to change. Give the change as code: \
+"original" is the smallest run of whole lines to change, copied verbatim from the file (same \
+indentation, no line-number prefix), and "replacement" is those lines as they should read; leave \
+both empty when the fix is not a code change. Cite only lines you were shown; if the cause is not \
+in the files shown, say so in failure_summary and leave code_findings empty. A bug you cannot point \
+at is not a finding.
 """
 
 NO_CODE_RULES = """- The agent's source code is not shown. Leave suspected_code_bug false and code_findings \
@@ -393,8 +405,14 @@ def parse_triage(text: str) -> TriageResult:
             line = int(entry.get("line")) if entry.get("line") not in (None, "") else None
         except (TypeError, ValueError):
             line = None
+        original = str(entry.get("original") or "").rstrip("\n")[:_MAX_PATCH]
+        replacement = str(entry.get("replacement") or "").rstrip("\n")[:_MAX_PATCH]
+        if not original.strip():
+            # a replacement with nothing to replace is prose, not a patch
+            original, replacement = "", ""
         code_findings.append(CodeFinding(file=file_[:300], finding=finding[:_MAX_SUMMARY], line=line,
-                                         fix=str(entry.get("fix") or "").strip()[:_MAX_SUMMARY]))
+                                         fix=str(entry.get("fix") or "").strip()[:_MAX_SUMMARY],
+                                         original=original, replacement=replacement))
     # a bug nobody can point at is not a finding: the flag stands only with at least one place
     suspected_code_bug = bool(parsed.get("suspected_code_bug", False)) and bool(code_findings)
 
@@ -439,9 +457,33 @@ def triage(complete: Callable[[str], str], inp: TriageInput, *,
     except Exception as err:  # noqa: BLE001 — one failed call is one ungradable row, not a failed run
         return None, f"model call failed: {err}"
     try:
-        return parse_triage(raw), ""
+        result = parse_triage(raw)
     except TriageParseError as err:
         return None, str(err)
+    verify_patches(result, inp.source_files)
+    return result, ""
+
+
+def verify_patches(result: TriageResult, source_files: Sequence[tuple[str, str]]) -> None:
+    """Mark each finding's patch verified when its original lines occur, exactly once, in the
+    file the model was shown. A patch that does not match is kept as the model's claim but a
+    later "open a pull request" must not apply it; one that matches twice is ambiguous, which
+    for applying by replacement is the same as not matching."""
+    files = dict(source_files)
+    for finding in result.code_findings:
+        text = files.get(finding.file)
+        if text is None:
+            for path, content in files.items():
+                if path.endswith("/" + finding.file) or finding.file.endswith("/" + path):
+                    text = content
+                    break
+        if text is None or not finding.original:
+            finding.verified = False
+            continue
+        # the file was shown clipped when it did not fit; matching against what was shown is
+        # the honest check, and a clipped file cannot contain lines the model never saw
+        shown = text.split("\n… [clipped: file continues]", 1)[0]
+        finding.verified = shown.count(finding.original) == 1
 
 
 def triage_row(feedback: dict[str, Any], result: TriageResult | None, *, run_id: str,
