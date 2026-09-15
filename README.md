@@ -344,6 +344,71 @@ def custom():
     ...
 ```
 
+## Client: evaluation and tracing from Python
+
+Everything the Hopsworks UI does for agent evaluation and tracing is reachable
+from `hopsworks_agent_eval.sdk`. Standalone for now; shaped to slot into the
+`hopsworks` library later, which is why the entry point mirrors `hopsworks.login()`.
+
+```python
+from hopsworks_agent_eval.sdk import login, check
+
+evals = login()  # inside Hopsworks; outside: login(host=..., project_id=..., api_key=...)
+
+# suites, tasks, the evaluator library
+suite = evals.suites.create(
+    "Refunds",
+    checks=[check("llm_judge", "quality", provider="anthropic",
+                  criteria=["Answers the question", "Uses the customer key"]),
+            check("no_tool_error")],
+    tags=["regression"],
+)
+suite.add_task("Refund order 42", expectations={"quality": "Confirms the refund and its amount."})
+suite.import_tasks([{"question": "Where is my order?"}, {"question": "Cancel it"}])
+suite = suite.publish()          # frozen; runs can say what they executed
+suite.update(description="Refund flows")   # name, tags, description at any time
+
+# runs against a deployment
+deployment = evals.deployment(7)
+run = deployment.run(suite, n_trials=3).wait()
+for trial in run.trials():
+    print(trial.task_id, trial.status, trial.latency_ms)
+for result in run.results():
+    print(result.evaluator_name, result.passed, result.reason)
+print(deployment.gates().passed)
+
+# production: traces, sessions, feedback
+for trace in deployment.traces(search="customer key", search_field="messages"):
+    print(trace.trace_id, trace.session_id, trace.latency_ms, trace.failed)
+for turn in deployment.conversation("conv_123"):
+    print(turn["user"], "->", turn["assistant"])
+deployment.give_feedback("305b97bb...", "negative", issue_category="wrong_tool",
+                         corrected_answer="Look the customer up by the key they gave.")
+page = deployment.feedback(verdict="negative")
+print(page.count, [f.reviewer for f in page.feedback])
+
+# failure analysis: the job, the proposals, the clusters
+job = evals.jobs.ensure_review_job(7, provider="anthropic", model="claude-sonnet-5",
+                                   sources=["feedback", "errors", "judge"], read_source_code=True)
+run = job.analyse().wait()                       # or job.analyse(since=..., until=...) / trace_id=...
+for triage in deployment.triage(page.feedback):
+    print(triage.category, triage.failure_summary, triage.suspected_code_bug, triage.findings)
+    deployment.decide_triage(triage, "accepted")
+for cluster in deployment.clusters():
+    print(cluster.label, cluster.size)
+task = deployment.promote_cluster(deployment.clusters()[0])   # PENDING_REDACTION
+task.confirm_redaction().add_to_regressions()
+evals.jobs.run_regressions(7)
+
+# monitoring
+deployment.sample(evaluator=evals.evaluators.find("Hallucination"))
+deployment.trace_metrics(since=..., until=...); deployment.llm_metrics(); deployment.tool_metrics()
+```
+
+Every model keeps `raw`, the API's dict, so a field the model does not name is
+still there. A refusal raises `AgentEvalsError` with the API's own message and
+the status.
+
 ## Development
 
 ```bash
