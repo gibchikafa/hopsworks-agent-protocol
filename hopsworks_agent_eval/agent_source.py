@@ -43,8 +43,13 @@ MAX_FILE_BYTES = 200 * 1024
 MAX_BUNDLE_BYTES = 5 * 1024 * 1024
 #: Characters of source shown per triage call by default. Roughly 6k tokens.
 DEFAULT_SOURCE_CHARS = 24_000
-#: Environment variables a token for a private repository may be found in, in order.
-TOKEN_ENVS = ("HOPSWORKS_GIT_TOKEN", "GIT_TOKEN", "GITHUB_TOKEN")
+#: How Hopsworks hands a pod the git providers a user configured: the same variable Jupyter,
+#: the terminal and git-backed agent deployments read, holding "https://user:token@host" entries
+#: separated by spaces. A private repository needs nothing more than a git provider set up in
+#: the user's account settings; there is no token to type into a job.
+GIT_CREDENTIALS_ENV = "GIT_CREDENTIALS"
+GIT_NAME_ENV = "GIT_NAME"
+GIT_EMAIL_ENV = "GIT_EMAIL"
 
 
 @dataclass
@@ -150,36 +155,73 @@ def _resolve_entry(files: dict[str, str], entry: str) -> str:
     return ""
 
 
-def _with_token(url: str, token: str) -> str:
-    if not token or "@" in url.split("//", 1)[-1].split("/", 1)[0]:
-        return url
-    scheme, _, rest = url.partition("://")
-    return f"{scheme}://x-access-token:{token}@{rest}"
+def git_credentials(environ: dict[str, str] | None = None) -> list[str]:
+    """The "https://user:token@host" entries Hopsworks put in the environment, if any."""
+    raw = (environ if environ is not None else os.environ).get(GIT_CREDENTIALS_ENV, "")
+    return [entry for entry in raw.split() if entry.startswith("http")]
 
 
-def _git_token() -> str:
-    for name in TOKEN_ENVS:
-        value = os.environ.get(name, "")
-        if value:
-            return value
-    return ""
+def configure_git_credentials(*, home: str | None = None, environ: dict[str, str] | None = None,
+                              run: Callable[..., Any] = subprocess.run) -> int:
+    """Put the user's git providers where git will find them, as Jupyter's launcher does.
+
+    Writes ``~/.git-credentials`` and points git's store helper at it, so a clone of a private
+    repository authenticates with the provider the user configured in Hopsworks rather than
+    with a token typed into this job. Returns how many credentials were written; zero leaves
+    git as it was, and a public repository clones as before.
+    """
+    env = environ if environ is not None else os.environ
+    entries = git_credentials(env)
+    if not entries:
+        return 0
+    home_dir = home or os.path.expanduser("~")
+    os.makedirs(home_dir, exist_ok=True)
+    path = os.path.join(home_dir, ".git-credentials")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(entries) + "\n")
+    os.chmod(path, 0o600)
+    if shutil.which("git"):
+        git_env = {**os.environ, "HOME": home_dir}
+        run(["git", "config", "--global", "credential.helper", "store"], check=False, capture_output=True,
+            env=git_env)
+        if env.get(GIT_EMAIL_ENV):
+            run(["git", "config", "--global", "user.email", env[GIT_EMAIL_ENV]], check=False,
+                capture_output=True, env=git_env)
+        if env.get(GIT_NAME_ENV):
+            run(["git", "config", "--global", "user.name", env[GIT_NAME_ENV]], check=False,
+                capture_output=True, env=git_env)
+    return len(entries)
+
+
+def _credential_for(url: str, entries: Sequence[str]) -> tuple[str, str]:
+    """The (user, token) configured for the repository's host, or empty strings."""
+    host = url.split("//", 1)[-1].split("/", 1)[0].lower()
+    for entry in entries:
+        rest = entry.split("//", 1)[-1]
+        if "@" not in rest:
+            continue
+        auth, entry_host = rest.rsplit("@", 1)
+        if entry_host.split("/", 1)[0].lower() == host:
+            user, _, token = auth.partition(":")
+            return user, token
+    return "", ""
 
 
 def clone_repository(url: str, ref: str, commit: str, into: str, *, run: Callable[..., Any] = subprocess.run) -> str:
     """A shallow checkout of the repository at the commit that is running, or the branch's tip.
 
-    ``git`` when there is one; otherwise, for GitHub, the archive tarball. Returns the
-    directory holding the checkout. Raises on failure: no code is a reason in the log,
-    not a triage row that silently lacked it.
+    ``git`` when there is one, authenticating through the credential store the user's git
+    providers were written to; otherwise, for GitHub, the archive tarball. Returns the
+    directory holding the checkout. Raises on failure: no code is a reason in the log, not
+    a triage row that silently lacked it.
     """
-    token = _git_token()
-    authed = _with_token(url, token)
     if shutil.which("git"):
+        configure_git_credentials(run=run)
         target = os.path.join(into, "repo")
         base = ["git", "-c", "advice.detachedHead=false"]
         if commit:
             run([*base, "init", "-q", target], check=True, capture_output=True)
-            run([*base, "-C", target, "remote", "add", "origin", authed], check=True, capture_output=True)
+            run([*base, "-C", target, "remote", "add", "origin", url], check=True, capture_output=True)
             run([*base, "-C", target, "fetch", "-q", "--depth", "1", "origin", commit], check=True,
                 capture_output=True)
             run([*base, "-C", target, "checkout", "-q", "FETCH_HEAD"], check=True, capture_output=True)
@@ -187,11 +229,12 @@ def clone_repository(url: str, ref: str, commit: str, into: str, *, run: Callabl
             command = [*base, "clone", "-q", "--depth", "1"]
             if ref:
                 command += ["--branch", ref]
-            command += [authed, target]
+            command += [url, target]
             run(command, check=True, capture_output=True)
         return target
     if "github.com" not in url:
         raise RuntimeError("git is not installed and only GitHub repositories can be fetched without it")
+    _, token = _credential_for(url, git_credentials())
     return _github_tarball(url, commit or ref or "HEAD", token, into)
 
 
