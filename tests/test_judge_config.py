@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 
+from hopsworks_agent_eval import judge_config as jc
+
 import pytest
 
 from hopsworks_agent_eval.evaluator_spec import SpecError, evaluators_from_spec
@@ -864,3 +866,71 @@ class TestReferenceFreeTemplates:
         floors = {c.name: c.critical_min for c in config.effective_criteria()}
         assert floors.get("no_data_leakage")
         assert floors.get("no_harmful_content")
+
+
+class TestExtraHeaders:
+    def test_headers_come_off_the_entry_as_an_object_or_json_text(self):
+        config = jc.parse_judge_config({"provider": "openai", "headers": {"X-Tenant": "acme"}})
+        assert config.headers == {"X-Tenant": "acme"}
+        config = jc.parse_judge_config({"provider": "openai", "headers": '{"X-Route": "eu"}'})
+        assert config.headers == {"X-Route": "eu"}
+        assert jc.parse_judge_config({"provider": "openai"}).headers == {}
+
+    def test_malformed_headers_are_refused_with_the_reason(self):
+        import pytest
+        with pytest.raises(jc.JudgeConfigError, match="headers must be"):
+            jc.parse_judge_config({"provider": "openai", "headers": ["X-Tenant"]})
+        with pytest.raises(jc.JudgeConfigError, match="headers must be"):
+            jc.parse_judge_config({"provider": "openai", "headers": {"X-Tenant": 3}})
+        with pytest.raises(jc.JudgeConfigError, match="JSON object"):
+            jc.parse_judge_config({"provider": "openai", "headers": "not json"})
+
+    def test_a_dollar_value_is_read_from_the_environment_and_a_missing_one_is_not_sent(self):
+        config = jc.JudgeConfig(headers={"Authorization": "$GATEWAY_TOKEN", "X-Tenant": "acme",
+                                         "X-Missing": "$NOT_SET"})
+        resolved = jc.resolve_headers(config, environ={"GATEWAY_TOKEN": "tok"})
+        assert resolved == {"Authorization": "tok", "X-Tenant": "acme"}
+
+    def test_the_openai_client_gets_the_headers_and_base_url(self, monkeypatch):
+        import sys
+        import types
+
+        seen = {}
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                message = types.SimpleNamespace(content='{"score": 5}')
+                return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)])
+
+        class FakeOpenAI:
+            def __init__(self, **options):
+                seen.update(options)
+                self.chat = types.SimpleNamespace(completions=FakeCompletions())
+
+        monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
+        monkeypatch.setenv("GATEWAY_TOKEN", "tok")
+        config = jc.parse_judge_config({"provider": "custom", "model": "local-llm",
+                                        "base_url": "https://gw.internal/v1",
+                                        "headers": {"Authorization": "$GATEWAY_TOKEN", "X-Tenant": "acme"}})
+        complete = jc.completer_for(config, "key")
+        assert complete("hello") == '{"score": 5}'
+        assert seen["base_url"] == "https://gw.internal/v1"
+        assert seen["default_headers"] == {"Authorization": "tok", "X-Tenant": "acme"}
+        assert seen["api_key"] == "key"
+
+    def test_no_headers_means_no_default_headers_option(self, monkeypatch):
+        import sys
+        import types
+
+        seen = {}
+
+        class FakeOpenAI:
+            def __init__(self, **options):
+                seen.update(options)
+                self.chat = types.SimpleNamespace(completions=types.SimpleNamespace(
+                    create=lambda **kw: types.SimpleNamespace(choices=[types.SimpleNamespace(
+                        message=types.SimpleNamespace(content="x"))])))
+
+        monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
+        jc.completer_for(jc.parse_judge_config({"provider": "openai"}), "key")("p")
+        assert "default_headers" not in seen and "base_url" not in seen

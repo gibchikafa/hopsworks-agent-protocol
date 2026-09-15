@@ -163,6 +163,18 @@ class TestSettings:
         unreadable = rj.code_location(FakeSession([]), "http://h", 1, 3, rj.review_settings({}))
         assert not unreadable.known()
 
+    def test_a_custom_endpoint_carries_its_base_url_and_headers(self, monkeypatch):
+        settings = rj.review_settings({"config": {"provider": "custom", "model": "local",
+                                                  "baseUrl": "https://gw.internal/v1",
+                                                  "headers": '{"X-Tenant": "acme"}'}})
+        assert settings["base_url"] == "https://gw.internal/v1"
+        assert settings["headers"] == {"X-Tenant": "acme"}
+        assert rj.review_settings({"config": {"headers": "not json"}})["headers"] == {}
+        # an OpenAI-compatible provider without a base url is a reason, not a crash
+        monkeypatch.setenv("MY_KEY", "k")
+        complete, why = rj.completer_from({**settings, "base_url": "", "api_key_env": "MY_KEY"})
+        assert complete is None and "base URL" in why
+
     def test_a_missing_key_is_a_reason_not_an_exception(self, monkeypatch):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         complete, why = rj.completer_from(SETTINGS)

@@ -16,6 +16,7 @@ row it writes is a proposal a person will look at.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -73,6 +74,9 @@ def review_settings(job: dict[str, Any] | None) -> dict[str, Any]:
         "model": str(config.get("model") or ""),
         "reasoning_effort": str(config.get("reasoningEffort") or ""),
         "api_key_env": str(config.get("apiKeyEnv") or ""),
+        # where the model is when not the provider's own, and what a gateway in front of it wants
+        "base_url": str(config.get("baseUrl") or ""),
+        "headers": _headers_setting(config.get("headers")),
         "context_turns": int(config.get("contextTurns") or 20),
         "sources": sources,
         # on unless the job says otherwise: a review that cannot see the code cannot tell a bug
@@ -81,6 +85,21 @@ def review_settings(job: dict[str, Any] | None) -> dict[str, Any]:
         "source_location": str(config.get("sourceLocation") or ""),
         "source_chars": int(config.get("sourceChars") or DEFAULT_SOURCE_CHARS),
     }
+
+
+def _headers_setting(raw: Any) -> dict[str, str]:
+    """The job's extra headers: a JSON object as text, or already an object; anything else is none."""
+    if isinstance(raw, str):
+        if not raw.strip():
+            return {}
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            log.warning("the job's headers are not a JSON object; sending none")
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if str(k).strip()}
 
 
 def code_location(session: Any, host: str, project_id: int, deployment_id: int,
@@ -109,7 +128,11 @@ def completer_from(settings: dict[str, Any]) -> tuple[Callable[[str], str] | Non
         model=settings["model"],
         reasoning_effort=settings["reasoning_effort"],
         api_key_env=settings["api_key_env"],
+        base_url=settings.get("base_url", ""),
+        headers=dict(settings.get("headers") or {}),
     )
+    if config.provider == "custom" and not config.base_url:
+        return None, "an OpenAI-compatible provider needs a base URL; set one on the job"
     key = api_key_for(config)
     if not key:
         return None, f"no API key: set {api_key_source(config)} on the job's environment"

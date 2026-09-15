@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import json
+import os
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Callable
@@ -198,6 +199,11 @@ class JudgeConfig:
     #: already has set. Naming one is for a judge that needs a different key from
     #: everything else — a release gate on its own quota.
     api_key_env: str = ""
+    #: Extra HTTP headers on every request to the provider: what a gateway in
+    #: front of a model wants (a tenant, a route, a second credential). A value
+    #: of the form "$NAME" is read from the environment at call time, so a secret
+    #: header lives where the key does and never in a stored configuration.
+    headers: dict[str, str] = field(default_factory=dict)
     inputs: tuple[str, ...] = DEFAULT_INPUTS
     criteria: list[Criterion] = field(default_factory=list)
     score_min: float = 1.0
@@ -272,6 +278,18 @@ def parse_judge_config(entry: dict[str, Any]) -> JudgeConfig:
     config.api_key_env = str(
         entry.get("api_key_env") or entry.get("apiKeyEnv") or config.api_key_env
     )
+    raw_headers = entry.get("headers", entry.get("extra_headers"))
+    if raw_headers not in (None, "", {}):
+        if isinstance(raw_headers, str):
+            try:
+                raw_headers = json.loads(raw_headers)
+            except ValueError:
+                raise JudgeConfigError("headers must be a JSON object of header name to value") from None
+        if not isinstance(raw_headers, dict) or not all(
+            isinstance(k, str) and k.strip() and isinstance(v, str) for k, v in raw_headers.items()
+        ):
+            raise JudgeConfigError("headers must be an object of header name to string value")
+        config.headers = {k.strip(): v for k, v in raw_headers.items()}
 
     if "temperature" in entry:
         config.temperature = _as_float(entry["temperature"], "temperature")
@@ -510,6 +528,37 @@ def _output_shape(config: JudgeConfig) -> str:
 
 # ── providers ─────────────────────────────────────────────────────────────
 
+def resolve_headers(config: JudgeConfig, environ: dict[str, str] | None = None) -> dict[str, str]:
+    """The extra headers with "$NAME" values read from the environment.
+
+    A header whose variable is not set is left out and said in the log rather
+    than sent empty: an empty tenant header is a request the gateway rejects
+    with a message about the tenant, not about the variable.
+    """
+    env = environ if environ is not None else os.environ
+    resolved: dict[str, str] = {}
+    for name, value in config.headers.items():
+        if value.startswith("$") and len(value) > 1:
+            variable = value[1:]
+            if variable in env and env[variable] != "":
+                resolved[name] = env[variable]
+            else:
+                log.warning("header %s names %s, which is not set in the environment; not sent",
+                               name, variable)
+        else:
+            resolved[name] = value
+    return resolved
+
+
+def _client_options(api_key: str, base_url: str, headers: dict[str, str]) -> dict[str, Any]:
+    options: dict[str, Any] = {"api_key": api_key}
+    if base_url:
+        options["base_url"] = base_url
+    if headers:
+        options["default_headers"] = headers
+    return options
+
+
 def completer_for(
     config: JudgeConfig, api_key: str
 ) -> Callable[[str], str]:
@@ -523,6 +572,7 @@ def completer_for(
     # a known provider at a proxy without inventing a new provider name.
     base_url = config.base_url or registry["base_url"]
     model = config.model or registry["default_model"]
+    headers = resolve_headers(config)
     if registry["adapter"] == "openai":
         parameters = _ChatCompletionParameters(
             config.provider,
@@ -535,9 +585,7 @@ def completer_for(
         def complete_openai(prompt: str) -> str:
             import openai
 
-            client = openai.OpenAI(
-                api_key=api_key, **({"base_url": base_url} if base_url else {})
-            )
+            client = openai.OpenAI(**_client_options(api_key, base_url, headers))
 
             def call(**extra: Any) -> str:
                 response = client.chat.completions.create(
@@ -558,9 +606,7 @@ def completer_for(
     def complete_anthropic(prompt: str) -> str:
         import anthropic
 
-        client = anthropic.Anthropic(
-            api_key=api_key, **({"base_url": base_url} if base_url else {})
-        )
+        client = anthropic.Anthropic(**_client_options(api_key, base_url, headers))
 
         def call(**extra: Any) -> str:
             response = client.messages.create(
