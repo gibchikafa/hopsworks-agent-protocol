@@ -385,7 +385,12 @@ def _dataset_api(project: Any) -> Any:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-id", required=True, action="append", dest="run_ids")
-    args = parser.parse_args()
+    # The scheduler appends "-start_time <fire time>" to every scheduled execution's arguments.
+    # This job reads its window off its run rows, not that flag, so it is tolerated and ignored
+    # rather than refused -- a refusal here is a scheduled job that never runs.
+    args, ignored = parser.parse_known_args()
+    if ignored:
+        logging.getLogger(__name__).info("ignoring arguments this job does not read: %s", " ".join(ignored))
     logging.basicConfig(level=logging.INFO)
 
     import hopsworks  # noqa: PLC0415 -- only inside a job

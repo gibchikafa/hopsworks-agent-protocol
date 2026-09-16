@@ -412,7 +412,12 @@ def main() -> None:
                         help="derive from the Stage 1 probe's trajectory-stable "
                              "p95 rather than accepting this default")
     parser.add_argument("--max-concurrency", type=int, default=4)
-    args = parser.parse_args()
+    # The scheduler appends "-start_time <fire time>" to every scheduled execution's arguments.
+    # This job reads its window off its run rows, not that flag, so it is tolerated and ignored
+    # rather than refused -- a refusal here is a scheduled job that never runs.
+    args, ignored = parser.parse_known_args()
+    if ignored:
+        logging.getLogger(__name__).info("ignoring arguments this job does not read: %s", " ".join(ignored))
     logging.basicConfig(level=logging.INFO)
 
     import hopsworks

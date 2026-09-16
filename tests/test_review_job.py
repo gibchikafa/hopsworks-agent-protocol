@@ -408,3 +408,18 @@ class TestOneExecution:
         assert rj._execute("run-1", session, "http://h/agent-evals", self.Project(Broken()), "http://h") is False
         url, params = session.puts[-1]
         assert params["status"] == "FAILED" and "no such feature group" in params["errorMessage"]
+
+
+class TestArguments:
+    def test_the_schedulers_start_time_is_tolerated(self, monkeypatch):
+        import sys
+
+        seen = {}
+        monkeypatch.setattr(rj, "_execute", lambda run_id, *a, **k: seen.setdefault("run", run_id) or True)
+        monkeypatch.setattr(rj, "hopsworks_session", lambda: object())
+        monkeypatch.setenv("HOPSWORKS_HOST", "https://h")
+        fake_hopsworks = type("H", (), {"login": staticmethod(lambda: type("P", (), {"id": 1, "name": "p"})())})
+        monkeypatch.setitem(sys.modules, "hopsworks", fake_hopsworks)
+        monkeypatch.setattr(sys, "argv", ["review", "--run-id", "r1", "-start_time", "2026-09-16T08:00:00Z"])
+        rj.main()
+        assert seen["run"] == "r1"
