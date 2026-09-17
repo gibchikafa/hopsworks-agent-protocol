@@ -218,6 +218,11 @@ class TestRuns:
         evals.runs.review_trial("r", trial, passed=False, reason="wrong")
         assert session.sent[3][3] == {"taskId": "t", "passed": False, "score": None, "reason": "wrong"}
 
+    def test_a_review_may_be_about_one_judge(self):
+        evals, session = client(Reply(None))
+        evals.runs.review_trial("r", "r/1", passed=True, evaluator="hallucination")
+        assert session.sent[0][3]["evaluatorName"] == "hallucination"
+
 
 class TestJobs:
     def test_the_eval_job_is_configured_with_suite_and_evaluator_references(self):

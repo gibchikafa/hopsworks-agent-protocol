@@ -371,14 +371,20 @@ class Runs:
                                                       limit=limit))
 
     def review_trial(self, run: Run | str, trial: Trial | str, *, passed: bool, score: float | None = None,
-                     reason: str = "", task_id: str | None = None) -> None:
-        """A person's verdict on a trial a human_review check left open."""
+                     reason: str = "", task_id: str | None = None, evaluator: str | None = None) -> None:
+        """A person's verdict on a trial: about one judge (``evaluator``), or the trial as a whole.
+
+        Per judge is how a suite with several judges is calibrated: saying the hallucination
+        judge was wrong about a trial says nothing about the helpfulness judge.
+        """
         run_id = run.run_id if isinstance(run, Run) else run
         trial_id = trial.trial_id if isinstance(trial, Trial) else trial
         if task_id is None and isinstance(trial, Trial):
             task_id = trial.task_id
-        self._http.post(f"{EVALS}/runs/{run_id}/trials/{trial_id}/review",
-                        {"taskId": task_id, "passed": passed, "score": score, "reason": reason})
+        body: dict[str, Any] = {"taskId": task_id, "passed": passed, "score": score, "reason": reason}
+        if evaluator:
+            body["evaluatorName"] = evaluator
+        self._http.post(f"{EVALS}/runs/{run_id}/trials/{trial_id}/review", body)
 
     def wait(self, run: Run | str, *, timeout_s: float = 1800, poll_s: float = 5) -> Run:
         """Poll until the run finishes. Raises AgentEvalsError on timeout; returns the final row."""
