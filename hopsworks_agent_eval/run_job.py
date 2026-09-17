@@ -24,17 +24,10 @@ from typing import Any
 
 from .api import hopsworks_session
 from .evaluator_spec import SpecError, evaluators_for_suite
-from .evaluators import (
-    ContainsEvaluator,
-    ExactMatchEvaluator,
-    Evaluator,
-    NoToolErrorEvaluator,
-    ToolCallEvaluator,
-    ToolOrderEvaluator,
-)
 from .judges import DEFAULT_MODEL, LlmJudgeEvaluator, anthropic_completer
 from .metrics import run_metrics
 from .models import ExecutionMode, PassPolicy, Suite, Task
+from .run_fields import run_trials
 from .runner import RunnerConfig, SuiteRefused, run_suite
 from .sample_job import evaluators_for, run_sample
 
@@ -372,7 +365,7 @@ def _execute(run_id: str, session, base: str, project, host: str, args) -> bool:
                 suite, judge_completer=completer, query=query
             ),
             config=RunnerConfig(
-                n_trials=run.get("nTrials", 1),
+                n_trials=run_trials(run, 1),
                 readiness_timeout_s=args.readiness_timeout_s,
                 max_concurrency=args.max_concurrency,
                 input_token_price_per_million=run.get("inputTokenPricePerMillion"),

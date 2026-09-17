@@ -28,6 +28,7 @@ from .agent_source import (
 from .api import hopsworks_session
 from .client import HopsworksAgentClient
 from .judge_config import JudgeConfig, api_key_for, api_key_source, completer_for, tool_calls_text
+from .run_fields import run_trials
 from .run_job import _api, _match_schema
 from .sample_job import conversation_before, question_and_answer, started_ns
 from .clusters import Cluster, assign_clusters, from_api, known_signatures
@@ -217,7 +218,7 @@ def review_feedback(session: Any, client: Any, otel_base: str, run: dict[str, An
     window short, the timestamp the next run should start from."""
     from_ms = _ms(run.get("sampleFrom"))
     to_ms = _ms(run.get("sampleTo")) or datetime.now(tz=timezone.utc).timestamp() * 1000
-    budget = min(int(run.get("nTrials") or 0) or MAX_BUDGET, MAX_BUDGET)
+    budget = min(run_trials(run, 0) or MAX_BUDGET, MAX_BUDGET)
 
     trace_id = trace_of(run)
     pending = feedback_in_window(session, otel_base, from_ms, to_ms, trace_id)

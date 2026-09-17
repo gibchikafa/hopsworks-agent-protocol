@@ -35,8 +35,9 @@ import random
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from .evaluators import Evaluator, NoToolErrorEvaluator, Trace, verdict
+from .evaluators import Evaluator, Trace, verdict
 from .models import PassPolicy, Task, TraceStatus, Trial, TrialStatus
+from .run_fields import run_trials
 from .runner import RunResult, _transcript
 
 log = logging.getLogger(__name__)
@@ -306,7 +307,7 @@ def run_sample(client: Any, session: Any, api_base: str, project_id: int,
         return RunResult(run_id=run["runId"], suite_id="", deployment_id=deployment_id,
                          started_at=started, completed_at=datetime.now(tz=timezone.utc))
 
-    graded_limit = int(run.get("nTrials") or 0)
+    graded_limit = run_trials(run, 0)
     sampled = oldest_first(recent, graded_limit)
     if len(sampled) < len(recent):
         # Said plainly, because the alternative reading -- that this is all the

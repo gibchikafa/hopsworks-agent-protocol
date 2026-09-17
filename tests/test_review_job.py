@@ -423,3 +423,13 @@ class TestArguments:
         monkeypatch.setattr(sys, "argv", ["review", "--run-id", "r1", "-start_time", "2026-09-16T08:00:00Z"])
         rj.main()
         assert seen["run"] == "r1"
+
+
+class TestTheBudgetField:
+    def test_is_read_however_the_server_spelled_it(self):
+        from hopsworks_agent_eval.run_fields import run_trials
+
+        assert run_trials({"nTrials": 7}, 0) == 7
+        assert run_trials({"ntrials": 7}, 0) == 7
+        assert run_trials({}, 3) == 3
+        assert run_trials({"nTrials": "x"}, 3) == 3
