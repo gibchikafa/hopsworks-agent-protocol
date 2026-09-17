@@ -1,5 +1,12 @@
 # hopsworks-agent-protocol
 
+> **Moved.** This code now lives in [hopsworks-api](https://github.com/logicalclocks/hopsworks-api)
+> under `python/hopsworks_agent_protocol` and `python/hopsworks_agent_eval`, shipped inside the
+> `hopsworks` package. Install `hopsworks` for the client (talking to a deployed agent, the
+> evaluation and tracing API), `hopsworks[agents]` to serve an agent, `hopsworks[agents-eval]` for
+> the evaluation job's judges and `hopsworks[agents-memory]` for durable memory. The import paths
+> are unchanged. This repository is kept for history and receives no further changes.
+
 Server helpers for the **Hopsworks Agent Protocol**: make any Python agent chat-ready in the Hopsworks UI with a few lines. `AgentApp` is a FastAPI subclass that automatically exposes:
 
 | Route | Purpose |
